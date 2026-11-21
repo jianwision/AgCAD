@@ -1,0 +1,27 @@
+[package]
+name = "agcad-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Headless MCP (JSON-RPC 2.0 over stdio) server."
+
+[dependencies]
+agcad-ir = { workspace = true }
+agcad-runtime = { workspace = true }
+agcad-harness = { workspace = true }
+agcad-model = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+agcad-std = { workspace = true }
+agcad-geo = { workspace = true }
+agcad-trace = { workspace = true }
+agcad-dops = { workspace = true }
+bytemuck = { workspace = true }
+agcad-driver = { workspace = true }
+agcad-driver-cpu = { workspace = true }
+agcad-driver-cuda = { workspace = true }
+
+[dev-dependencies]
+agcad-geo-occt = { workspace = true }

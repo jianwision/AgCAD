@@ -1,0 +1,23 @@
+[package]
+name = "agcad-dops"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Device operations: registry-driven GPU feature tapes, edits, rigorous evaluators, mock GPU policy and the device-resident rollout loop."
+
+[dependencies]
+agcad-driver = { workspace = true }
+agcad-ir = { workspace = true }
+agcad-kernels = { workspace = true }
+agcad-kernels-cuda = { workspace = true }
+agcad-harness = { workspace = true }
+agcad-geo = { workspace = true }
+agcad-runtime = { workspace = true }
+bytemuck = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+agcad-driver-cpu = { workspace = true }
+agcad-driver-cuda = { workspace = true }

@@ -1,0 +1,28 @@
+[package]
+name = "agcad-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "`agcad` command-line tool."
+
+[[bin]]
+name = "agcad"
+path = "src/main.rs"
+
+[dependencies]
+agcad-ir = { workspace = true }
+agcad-runtime = { workspace = true }
+agcad-harness = { workspace = true }
+agcad-model = { workspace = true }
+agcad-server = { workspace = true }
+agcad-improve = { workspace = true }
+agcad-conformance = { workspace = true }
+agcad-trace = { workspace = true }
+serde_json = { workspace = true }
+agcad-std = { workspace = true }
+agcad-geo = { workspace = true }
+agcad-driver = { workspace = true }
+agcad-dops = { workspace = true }
+agcad-driver-cpu = { workspace = true }
+agcad-driver-cuda = { workspace = true }

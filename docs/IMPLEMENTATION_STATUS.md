@@ -97,6 +97,10 @@ This is the loop **LLM observes → sets a goal → GPU model plans and executes
   - **Parity:** OptiX ≡ CPU on hit / miss and distance (1e-4) for 20k random rays.
   - **Speed:** 4 M rays in about 130–150 ms on the RTX 2000 Ada, including transfers.
   - **Analyses** (MCP tool `dfm`): tool access for 3-axis (fixture face excluded), 3+2 and 5-axis direction sets; wall thickness and clearance along normals.
+  - **Survivor escalation:** with `set_goal` `machining` (3ax / 3+2 / 5ax), `min_wall` or `min_clearance`, `device_rollout` ray-checks the survivors (top-k, or up to 16 Pareto candidates).
+    - Failures get `goal_met: false` and are excluded from `apply_best` and from the Pareto set.
+    - `ray_undercut` is available as a Pareto objective; `ray_check: false` turns the check off.
+    - Catches what the device's +z probe cannot: sealed cavities, and 3+2 / 5-axis reach.
   - **Renders:** ray-traced, shadowed renders (`render {mode: "raytraced"}`, Pareto candidates).
 - **Stiffness proxy** (`fea`): voxel hex8 elasticity solved by matrix-free Jacobi-PCG on the device. Fixed-shape reductions make it bit-identical CUDA ≡ CPU, and it matches `agcad_std::physics` to 1e-6. It runs on survivors.
 - **Measured** on an RTX 2000 Ada laptop GPU (`agcad bench-device`; eval is ≥ 99.9 % of each round):

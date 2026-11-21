@@ -25,6 +25,8 @@ pub struct Server {
     pub goal: Option<(agcad_dops::abi::Goal, Vec<String>)>,
     /// Stiffness requirement checked on survivors.
     pub load: Option<device::LoadSpec>,
+    /// Ray-cast DFM requirement checked on survivors.
+    pub dfm: Option<device::DfmSpec>,
     /// Rollouts run so far (names the result branches).
     pub rollouts: u32,
     /// Certified implicit bodies of branches whose survivor has device-only ops (no B-rep).
@@ -81,32 +83,50 @@ fn example_statement(o: &agcad_ir::OpManifest) -> Value {
     json!({ "id": o.name.rsplit('.').next().unwrap_or("s"), "op": o.name, "args": args })
 }
 
-/// DFM report of a body's tessellation (see the `dfm` tool).
-pub fn dfm_report(m: &agcad_geo::tessellate::Mesh, args: &Value) -> Result<Value, String> {
+/// Ray-cast DFM numbers of a body's tessellation.
+pub struct Dfm { pub tracer: &'static str, pub fallback: Option<String>, pub samples: usize, pub area: f64, pub unreachable: Vec<(String, f64, f64, usize)>, pub wall: agcad_raytrace::analysis::Distances, pub gap: agcad_raytrace::analysis::Distances, pub ms: f64 }
+
+impl Dfm {
+    pub fn unreachable(&self, set: &str) -> Option<f64> { self.unreachable.iter().find(|u| u.0 == set).map(|u| u.1) }
+}
+
+/// Tool access for `sets` (3ax excludes the fixture face), wall thickness and clearance.
+pub fn dfm_analyse(m: &agcad_geo::tessellate::Mesh, sets: &[String]) -> Result<Dfm, String> {
     use agcad_raytrace::analysis::{access, along_normal, directions, samples};
     let (t, why) = agcad_raytrace::best(m);
     let t0 = std::time::Instant::now();
-    let sets: Vec<String> = match args.get("sets").and_then(Value::as_array) { Some(a) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(), None => vec!["3ax".into(), "3+2".into(), "5ax".into()] };
     // the fixture face: downward-facing samples on the part's lowest plane (held by the vise)
     let s = samples(m);
     let zmin = m.positions.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
     let base: f64 = s.c.iter().zip(&s.n).zip(&s.a).filter(|((c, n), _)| n.z < -1.0 + 1e-6 && (c.z - zmin).abs() < 1e-6).map(|(_, a)| a).sum();
-    let mut acc = serde_json::Map::new();
-    for set in &sets {
+    let mut unreachable = Vec::new();
+    for set in sets {
         let dirs = directions(set).ok_or(format!("unknown direction set '{set}' (3ax, 3+2, 5ax)"))?;
         let a = access(&*t, m, &dirs)?;
         let fixture = if set == "3ax" { base } else { 0.0 };
-        let unreachable = (a.unreachable - fixture).max(0.0);
-        acc.insert(set.clone(), json!({ "unreachable_area": (unreachable * 100.0).round() / 100.0, "unreachable_fraction": unreachable / a.area, "directions": a.dirs.len(), "fixture_area_excluded": fixture }));
+        unreachable.push((set.clone(), (a.unreachable - fixture).max(0.0), fixture, a.dirs.len()));
     }
     let wall = along_normal(&*t, m, true)?;
     let gap = along_normal(&*t, m, false)?;
+    Ok(Dfm { tracer: t.name(), fallback: why, samples: s.c.len(), area: s.area, unreachable, wall, gap, ms: t0.elapsed().as_secs_f64() * 1e3 })
+}
+
+/// JSON of a DFM result (limits add the areas below them).
+pub fn dfm_json(d: &Dfm, min_wall: Option<f64>, min_clearance: Option<f64>) -> Value {
     let fin = |x: f64| if x.is_finite() { json!((x * 1e4).round() / 1e4) } else { Value::Null };
-    let mut out = json!({ "tracer": t.name(), "fallback_reason": why, "samples": s.c.len(), "surface_area": s.area, "access": acc,
-        "min_wall": fin(wall.min()), "min_clearance": fin(gap.min()), "ms": (t0.elapsed().as_secs_f64() * 1e4).round() / 10.0, "evidence": "sampled" });
-    if let Some(l) = args.get("min_wall").and_then(Value::as_f64) { out["thin_wall_area"] = json!(wall.area_below(l)); }
-    if let Some(l) = args.get("min_clearance").and_then(Value::as_f64) { out["narrow_gap_area"] = json!(gap.area_below(l)); }
-    Ok(out)
+    let acc: serde_json::Map<String, Value> = d.unreachable.iter().map(|(set, u, fx, n)| (set.clone(), json!({ "unreachable_area": (u * 100.0).round() / 100.0, "unreachable_fraction": u / d.area, "directions": n, "fixture_area_excluded": fx }))).collect();
+    let mut out = json!({ "tracer": d.tracer, "fallback_reason": d.fallback, "samples": d.samples, "surface_area": d.area, "access": acc,
+        "min_wall": fin(d.wall.min()), "min_clearance": fin(d.gap.min()), "ms": (d.ms * 10.0).round() / 10.0, "evidence": "sampled" });
+    if let Some(l) = min_wall { out["thin_wall_area"] = json!(d.wall.area_below(l)); }
+    if let Some(l) = min_clearance { out["narrow_gap_area"] = json!(d.gap.area_below(l)); }
+    out
+}
+
+/// DFM report of a body's tessellation (see the `dfm` tool).
+pub fn dfm_report(m: &agcad_geo::tessellate::Mesh, args: &Value) -> Result<Value, String> {
+    let sets: Vec<String> = match args.get("sets").and_then(Value::as_array) { Some(a) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(), None => vec!["3ax".into(), "3+2".into(), "5ax".into()] };
+    let d = dfm_analyse(m, &sets)?;
+    Ok(dfm_json(&d, args.get("min_wall").and_then(Value::as_f64), args.get("min_clearance").and_then(Value::as_f64)))
 }
 
 fn b64(data: &[u8]) -> String {
@@ -121,7 +141,7 @@ fn b64(data: &[u8]) -> String {
 
 impl Server {
     pub fn new(requirements: Requirements, part: &str) -> Self {
-        Server { session: HarnessSession::new(requirements, part), branch: "main".into(), goal: None, load: None, rollouts: 0, implicit: Default::default(), candidates: Vec::new(), device_cache: Default::default() }
+        Server { session: HarnessSession::new(requirements, part), branch: "main".into(), goal: None, load: None, dfm: None, rollouts: 0, implicit: Default::default(), candidates: Vec::new(), device_cache: Default::default() }
     }
 
     fn current_mesh(&self) -> Option<agcad_geo::tessellate::Mesh> {
@@ -283,12 +303,14 @@ impl Server {
                 device::freeze_fixed(&mut g, &design.params);
                 if g.objective != 0 { g.obj_scale = device::exact_volume(&design).unwrap_or(1.0).max(1.0); }
                 let load = device::parse_load(args)?;
+                self.dfm = device::parse_dfm(args, &g);
                 self.goal = Some((g, design.names.clone()));
                 self.load = load;
                 json!({ "ok": true, "parameters": design.names, "device_features": design.nodes.len(), "notes": notes, "raise_warnings": warnings,
                         "goal": { "objective": (["satisfy", "min_volume", "max_volume"][g.objective as usize]), "target_volume": (g.vol_hi > g.vol_lo).then_some([g.vol_lo, g.vol_hi]), "max_extent": g.max_ext, "domain": { "min": g.domain_lo, "max": g.domain_hi },
                                   "min_wall": (g.min_wall > 0.0).then_some(g.min_wall), "min_clearance": (g.min_gap > 0.0).then_some(g.min_gap), "machining_3ax": g.machining_3ax == 1,
                                   "stiffness": load.map(|l| json!({ "support_axis": l.support_axis, "force": l.force, "max_compliance": l.max_compliance })),
+                                  "ray_check": self.dfm.as_ref().map(|d| json!({ "machining": d.set, "min_wall": d.min_wall, "min_clearance": d.min_clearance, "on": "survivors" })),
                                   "centroid": (g.centroid_hi.iter().zip(&g.centroid_lo).any(|(h, l)| h > l)).then(|| json!({ "min": g.centroid_lo, "max": g.centroid_hi })) } })
             }
             "device_rollout" => {
@@ -349,10 +371,43 @@ impl Server {
                         }
                     }
                 }
+                // ray-cast DFM escalation on the survivors (OptiX on RTX GPUs, CPU reference otherwise)
+                let mut dfm_ok = vec![self.dfm.is_none(); run.summary.top.len()];
+                let mut ray_undercut: Vec<Option<f64>> = vec![None; run.summary.top.len()];
+                if let Some(spec) = self.dfm.clone() {
+                    let n_check = if pareto.is_some() { read_k.min(16) } else { top_k }.min(run.summary.top.len());
+                    let sets: Vec<String> = spec.set.iter().cloned().collect();
+                    for i in 0..n_check {
+                        let sv = &run.summary.top[i];
+                        if !(stiff_ok[i] && sv.obs[ob::MET] == 1.0) { continue; }
+                        let r = device::survivor_mesh(&sv.design, &g, prefer_cuda).and_then(|m| dfm_analyse(&m, &sets));
+                        let v = match r {
+                            Ok(d) => {
+                                // facets of curved walls: 0.01 mm tolerance on distances
+                                let un = spec.set.as_deref().and_then(|s| d.unreachable(s)).unwrap_or(0.0);
+                                let ok = un <= spec.undercut_tol + 1e-6 * d.area
+                                    && (!(spec.min_wall > 0.0) || d.wall.min() >= spec.min_wall - 0.01)
+                                    && (!(spec.min_clearance > 0.0) || d.gap.min() >= spec.min_clearance - 0.01);
+                                dfm_ok[i] = ok;
+                                ray_undercut[i] = Some(un);
+                                let mut j = dfm_json(&d, (spec.min_wall > 0.0).then_some(spec.min_wall), (spec.min_clearance > 0.0).then_some(spec.min_clearance));
+                                j["ok"] = json!(ok);
+                                j
+                            }
+                            Err(e) => json!({ "error": e }),
+                        };
+                        if i < top_k {
+                            out["top"][i]["dfm"] = v;
+                            if !dfm_ok[i] { out["top"][i]["goal_met"] = json!(false); }
+                        }
+                    }
+                    out["dfm_checked"] = json!(n_check);
+                }
                 if let Some((objs, k)) = &pareto {
                     // feasible survivors → objective vectors (minimization) → trade-off set
-                    let feas: Vec<usize> = (0..run.summary.top.len()).filter(|&i| run.summary.top[i].obs[ob::MET] == 1.0 && stiff_ok[i] && objs.iter().all(|o| pareto::value(&run.summary.top[i], &o.key, compliance[i]).is_some())).collect();
-                    let pts: Vec<Vec<f64>> = feas.iter().map(|&i| objs.iter().map(|o| o.sign * pareto::value(&run.summary.top[i], &o.key, compliance[i]).unwrap()).collect()).collect();
+                    let val = |i: usize, key: &str| if key == "ray_undercut" { ray_undercut[i] } else { pareto::value(&run.summary.top[i], key, compliance[i]) };
+                    let feas: Vec<usize> = (0..run.summary.top.len()).filter(|&i| run.summary.top[i].obs[ob::MET] == 1.0 && stiff_ok[i] && dfm_ok[i] && objs.iter().all(|o| val(i, &o.key).is_some())).collect();
+                    let pts: Vec<Vec<f64>> = feas.iter().map(|&i| objs.iter().map(|o| o.sign * val(i, &o.key).unwrap()).collect()).collect();
                     let uniq = pareto::dedupe(&pts);
                     let upts: Vec<Vec<f64>> = uniq.iter().map(|&u| pts[u].clone()).collect();
                     let pick = pareto::select(&upts, *k);
@@ -378,7 +433,7 @@ impl Server {
                                             "note": "non-dominated, diverse (crowding distance); apply one with device_apply {candidate}" });
                 }
                 if args.get("apply_best").and_then(Value::as_bool).unwrap_or(pareto.is_none()) {
-                    let pick = run.summary.top.iter().enumerate().find(|(i, s)| s.obs[10] == 1.0 && stiff_ok[*i]).map(|(_, s)| s);
+                    let pick = run.summary.top.iter().enumerate().find(|(i, s)| s.obs[10] == 1.0 && stiff_ok[*i] && dfm_ok[*i]).map(|(_, s)| s);
                     if let Some(best) = pick.or(run.summary.top.first()) {
                         let best = best.clone();
                         out["applied"] = self.apply_survivor(&best, &g, prefer_cuda, catalog)?;

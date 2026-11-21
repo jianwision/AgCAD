@@ -77,8 +77,10 @@ pub fn parse_goal(args: &Value, names: &[String], body_bbox: Option<([f64; 3], [
     if let Some(v) = args.get("min_clearance") { g.min_gap = num(v).filter(|x| *x > 0.0).ok_or("min_clearance: gap > 0 (mm)")?; }
     match args.get("machining").and_then(Value::as_str) {
         Some("3ax") => g.machining_3ax = 1,
+        // checked by ray casting on survivors only (the device probe is +z)
+        Some("3+2") | Some("5ax") => notes.push("machining checked by ray casting on survivors (dfm escalation)".into()),
         Some("none") => {}
-        Some(o) => return Err(format!("machining: \"3ax\" or \"none\" (got {o})")),
+        Some(o) => return Err(format!("machining: \"3ax\" | \"3+2\" | \"5ax\" | \"none\" (got {o})")),
         None => if process_3ax { g.machining_3ax = 1; notes.push("requirements process machining_3ax: 3-axis tool access is checked".into()); },
     }
     if let Some(v) = args.get("undercut_tolerance") { g.undercut_tol = num(v).ok_or("undercut_tolerance (mm²)")?; }
@@ -251,6 +253,27 @@ pub fn exact_part(d: &agcad_dops::Design) -> agcad_dops::Design {
         m
     }).collect();
     agcad_dops::Design { nodes, ..d.clone() }
+}
+
+/// Ray-cast DFM requirement checked on survivors (escalation step, evidence `sampled`).
+#[derive(Clone, Debug)]
+pub struct DfmSpec { pub set: Option<String>, pub min_wall: f64, pub min_clearance: f64, pub undercut_tol: f64 }
+
+/// From `set_goal`: machining (3ax / 3+2 / 5ax), min_wall, min_clearance (and the
+/// requirements' 3-axis process); `ray_check: false` disables it.
+pub fn parse_dfm(args: &Value, g: &Goal) -> Option<DfmSpec> {
+    if args.get("ray_check").and_then(Value::as_bool) == Some(false) { return None; }
+    let set = match args.get("machining").and_then(Value::as_str) { Some("none") => None, Some(s) => Some(s.to_string()), None => (g.machining_3ax != 0).then(|| "3ax".to_string()) };
+    if set.is_none() && !(g.min_wall > 0.0) && !(g.min_gap > 0.0) { return None; }
+    Some(DfmSpec { set, min_wall: g.min_wall, min_clearance: g.min_gap, undercut_tol: g.undercut_tol })
+}
+
+/// The survivor's surface mesh: its exact solid, or the certified implicit mesh.
+pub fn survivor_mesh(d: &agcad_dops::Design, goal: &Goal, prefer_cuda: bool) -> Result<agcad_geo::tessellate::Mesh, String> {
+    match to_layered(d) {
+        Ok(s) => Ok(agcad_geo::tessellate::tessellate(&s.brep(), &Default::default())),
+        Err(_) => Ok(deliver_implicit(d, goal, "dfm", prefer_cuda)?.mesh.mesh),
+    }
 }
 
 /// Iso render (PNG) of a design: its exact solid, or the certified implicit mesh for

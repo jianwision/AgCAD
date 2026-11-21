@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 #[derive(Clone, Debug)]
 pub struct Objective { pub key: String, pub sign: f64 }
 
-pub const KEYS: &[&str] = &["volume", "surface_area", "extent", "undercut", "thin_wall", "centroid_z", "compliance"];
+pub const KEYS: &[&str] = &["volume", "surface_area", "extent", "undercut", "thin_wall", "centroid_z", "compliance", "ray_undercut"];
 
 pub fn parse(v: &Value) -> Result<(Vec<Objective>, usize), String> {
     let list = v.get("objectives").and_then(Value::as_array).ok_or("pareto.objectives: [\"volume\", \"compliance\", …] (prefix \"-\" to maximize)")?;

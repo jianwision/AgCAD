@@ -126,7 +126,7 @@ fn engineering_constraints_flow_from_requirements_and_goal_to_survivors() {
     assert_eq!(e["undercut_area_3ax"], 0.0, "{e}");
     assert_eq!(e["min_wall_sampled"], 4.0, "no wall below 4 mm: {e}");
     assert!(e["centroid"][2].as_f64().unwrap() > 2.0 && e["surface_area"].as_f64().unwrap() > 1e4, "{e}");
-    assert!(tool(&mut s, "set_goal", json!({"target_volume": [1, 2], "parameters": {}, "machining": "5ax"})).is_err());
+    assert!(tool(&mut s, "set_goal", json!({"target_volume": [1, 2], "parameters": {}, "machining": "7ax"})).is_err());
 }
 
 #[test]
@@ -316,4 +316,42 @@ fn llm_asks_for_a_dfm_report() {
     assert!(r["narrow_gap_area"].as_f64().unwrap() > 0.0);
     let img = tool(&mut s, "render", json!({"mode": "raytraced"})).unwrap();
     assert!(img["png_base64"].as_str().unwrap().len() > 100, "{img}");
+}
+
+#[test]
+fn ray_checks_on_survivors_catch_what_the_device_probe_cannot() {
+    let req = Requirements::parse(r#"{"id":"r","rev":1,"deliver":{"body_type":"SolidBody"}}"#).unwrap();
+    let mut s = Server::new(req, "plate");
+    s.session.out_dir = std::env::temp_dir().join(format!("agcad-raydfm-{}", std::process::id()));
+    // plate with a sealed internal cavity (z 4..8): no tool reaches it from any direction
+    let prog = json!({"requirements_rev": 1, "expected_revision": 0, "program": [
+        {"id": "pt", "op": "knowledge.parameter", "args": {"name": "t", "value": "12 mm"}},
+        {"id": "s1", "op": "sketch.create", "args": {"support": "xy"}},
+        {"id": "r1", "op": "sketch.rectangle", "args": {"sketch": "%s1", "mode": "corners", "pts": [["0 mm", "0 mm"], ["100 mm", "60 mm"]]}},
+        {"id": "g1", "op": "sketch.regions", "args": {"sketch": "%r1"}},
+        {"id": "pad", "op": "part.pad", "args": {"profile": "%g1", "limits": "$t"}},
+        {"id": "s2", "op": "sketch.create", "args": {"support": "xy"}},
+        {"id": "r2", "op": "sketch.rectangle", "args": {"sketch": "%s2", "mode": "corners", "pts": [["30 mm", "20 mm"], ["70 mm", "40 mm"]]}},
+        {"id": "g2", "op": "sketch.regions", "args": {"sketch": "%r2"}},
+        {"id": "pk", "op": "part.pocket", "args": {"profile": "%g2", "limits": {"type": "two_sided", "d": "8 mm", "d2": "-4 mm"}}}
+    ]});
+    assert_eq!(tool(&mut s, "run_program", json!({"program": prog})).unwrap()["report"]["status"], "ACCEPTED");
+    let goal = |extra: Value| { let mut g = json!({"target_volume": [55_000, 90_000], "max_extent": [120, 80, 30], "min_wall": 3, "parameters": {"t": {"min": 10, "max": 16}}}); for (k, v) in extra.as_object().unwrap() { g[k] = v.clone(); } g };
+    let roll = json!({"configurations": 16, "rounds": 4, "device": "cpu", "resolution": 32, "apply_best": false});
+    // 5-axis: the device has no probe for it; the survivor ray check catches the cavity
+    let g = tool(&mut s, "set_goal", goal(json!({"machining": "5ax"}))).unwrap();
+    assert_eq!(g["goal"]["ray_check"]["machining"], "5ax", "{g}");
+    let r = tool(&mut s, "device_rollout", roll.clone()).unwrap();
+    let d = &r["top"][0]["dfm"];
+    assert_eq!(d["ok"], false, "sealed cavity: {d}");
+    let cavity = 2.0 * 40.0 * 20.0 + 2.0 * (40.0 + 20.0) * 4.0;
+    assert!((d["access"]["5ax"]["unreachable_area"].as_f64().unwrap() - cavity).abs() < 1.0, "{d}");
+    assert_eq!(r["top"][0]["goal_met"], false);
+    // walls only: the 4 mm cavity walls satisfy min_wall 3
+    tool(&mut s, "set_goal", goal(json!({}))).unwrap();
+    let r = tool(&mut s, "device_rollout", roll).unwrap();
+    let d = &r["top"][0]["dfm"];
+    assert_eq!(d["ok"], true, "{d}");
+    assert!(d["min_wall"].as_f64().unwrap() >= 3.99, "{d}");
+    assert_eq!(r["top"][0]["goal_met"], true, "{}", r["top"][0]);
 }

@@ -1,0 +1,17 @@
+[package]
+name = "agcad-rtc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Runtime compiler (cf. NVRTC): AgLang (strict Rust subset) -> AgIR -> CUDA C++."
+
+[dependencies]
+agcad-ir = { workspace = true }
+agcad-driver = { workspace = true }
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

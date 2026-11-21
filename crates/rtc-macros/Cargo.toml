@@ -1,0 +1,15 @@
+[package]
+name = "agcad-rtc-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "#[udf] / #[implicit] / #[wrangle] / #[check] proc-macros."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }

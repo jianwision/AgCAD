@@ -1,0 +1,28 @@
+[package]
+name = "agcad-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Conformance suites keyed by requirement IDs, CAD fuzzer, baseline runner."
+
+[dependencies]
+agcad-driver = { workspace = true }
+agcad-driver-cpu = { workspace = true }
+agcad-ir = { workspace = true }
+agcad-rtc = { workspace = true }
+agcad-vm = { workspace = true }
+agcad-solver = { workspace = true }
+agcad-geo = { workspace = true }
+agcad-geo-occt = { workspace = true }
+agcad-runtime = { workspace = true }
+agcad-std = { workspace = true }
+agcad-harness = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+agcad-driver-cuda = { workspace = true }
+agcad-kernels = { workspace = true }
+agcad-kernels-cuda = { workspace = true }
+agcad-model = { workspace = true }
+bytemuck = { workspace = true }

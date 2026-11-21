@@ -1,0 +1,16 @@
+[package]
+name = "agcad-vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Expression bytecode VM: device interpreter + host reference."
+
+[dependencies]
+agcad-ir = { workspace = true }
+agcad-driver = { workspace = true }
+agcad-rtc = { workspace = true }
+agcad-kernels = { workspace = true }
+agcad-kernels-cuda = { workspace = true }
+bytemuck = { workspace = true }
+serde = { workspace = true }

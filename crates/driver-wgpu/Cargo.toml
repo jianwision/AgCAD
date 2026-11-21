@@ -1,0 +1,10 @@
+[package]
+name = "agcad-driver-wgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "wgpu/CubeCL driver (Tier P). Feature-gated placeholder until the CubeCL pass."
+
+[dependencies]
+agcad-driver = { workspace = true }

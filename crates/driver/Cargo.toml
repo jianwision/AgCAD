@@ -1,0 +1,12 @@
+[package]
+name = "agcad-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Driver API (cf. libcuda): AgDevice + extension traits, AgStatus, ABI, arenas, batch layouts."
+
+[dependencies]
+thiserror = { workspace = true }
+bytemuck = { workspace = true }
+serde = { workspace = true }

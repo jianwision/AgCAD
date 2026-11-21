@@ -1,0 +1,16 @@
+[package]
+name = "agcad-kernels-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Tier N CUDA C++ sources (embedded) and launch wrappers."
+
+[dependencies]
+agcad-driver = { workspace = true }
+agcad-kernels = { workspace = true }
+
+[dev-dependencies]
+bytemuck = { workspace = true }
+agcad-driver-cpu = { workspace = true }
+agcad-driver-cuda = { workspace = true }

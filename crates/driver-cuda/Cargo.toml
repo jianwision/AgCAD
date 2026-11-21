@@ -1,0 +1,16 @@
+[package]
+name = "agcad-driver-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CUDA driver implementation (cudarc + NVRTC + nvJitLink), Tier N."
+
+[dependencies]
+agcad-driver = { workspace = true }
+cudarc = { workspace = true }
+thiserror = { workspace = true }
+bytemuck = { workspace = true }
+
+[dev-dependencies]
+bytemuck = { workspace = true }

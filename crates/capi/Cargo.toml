@@ -1,0 +1,17 @@
+[package]
+name = "agcad-capi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "C ABI (include/agcad.h), post-MVP."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+agcad-driver = { workspace = true }
+agcad-runtime = { workspace = true }
+agcad-harness = { workspace = true }
+agcad-ir = { workspace = true }
+serde_json = { workspace = true }

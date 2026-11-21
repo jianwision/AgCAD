@@ -1,0 +1,24 @@
+[package]
+name = "agcad-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Requirements, Design Checker, transactions, GPU-resident harness, reports."
+
+[dependencies]
+agcad-driver = { workspace = true }
+agcad-ir = { workspace = true }
+agcad-kernels = { workspace = true }
+agcad-kernels-cuda = { workspace = true }
+agcad-runtime = { workspace = true }
+agcad-std = { workspace = true }
+agcad-proc = { workspace = true }
+agcad-trace = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+agcad-geo = { workspace = true }
+agcad-driver-cpu = { workspace = true }
+bytemuck = { workspace = true }
+agcad-solver = { workspace = true }

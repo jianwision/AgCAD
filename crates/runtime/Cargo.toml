@@ -1,0 +1,21 @@
+[package]
+name = "agcad-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Runtime API (cf. cudart): sessions, documents, scheduler, naming, representation cache."
+
+[dependencies]
+agcad-driver = { workspace = true }
+agcad-ir = { workspace = true }
+agcad-rtc = { workspace = true }
+agcad-vm = { workspace = true }
+agcad-solver = { workspace = true }
+agcad-geo = { workspace = true }
+agcad-trace = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+agcad-driver-cpu = { workspace = true }
+agcad-driver-cuda = { workspace = true }

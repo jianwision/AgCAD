@@ -1,0 +1,11 @@
+[package]
+name = "agcad-geo-occt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Test-only ExactKernel oracle via OCCT subprocess."
+
+[dependencies]
+agcad-geo = { workspace = true }
+serde_json = { workspace = true }

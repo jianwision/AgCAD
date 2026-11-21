@@ -1,0 +1,36 @@
+[package]
+name = "agcad-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ModelAdaptor: Llm, CuModel (Candle-trained), ReplayModel; geometry encoder."
+
+[dependencies]
+agcad-driver = { workspace = true }
+agcad-ir = { workspace = true }
+agcad-runtime = { workspace = true }
+agcad-harness = { workspace = true }
+agcad-trace = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+agcad-kernels = { workspace = true }
+agcad-kernels-cuda = { workspace = true }
+agcad-geo = { workspace = true }
+bytemuck = { workspace = true }
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+
+[features]
+# Candle training runs in a separate process (spec 08; review F15).
+train = ["dep:candle-core", "dep:candle-nn"]
+cuda-train = ["train", "candle-core/cuda", "candle-nn/cuda"]
+
+[[bin]]
+name = "agcad-train"
+path = "src/bin/train.rs"
+required-features = ["train"]
+
+[dev-dependencies]
+agcad-driver-cpu = { workspace = true }

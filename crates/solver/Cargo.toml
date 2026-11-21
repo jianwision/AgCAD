@@ -1,0 +1,18 @@
+[package]
+name = "agcad-solver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Batched numerical solvers (cf. cuSOLVER/cuDSS)."
+
+[dependencies]
+agcad-driver = { workspace = true }
+agcad-ir = { workspace = true }
+agcad-kernels = { workspace = true }
+agcad-kernels-cuda = { workspace = true }
+thiserror = { workspace = true }
+agcad-rtc = { workspace = true }
+agcad-vm = { workspace = true }
+bytemuck = { workspace = true }
+serde = { workspace = true }

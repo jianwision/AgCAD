@@ -1,0 +1,15 @@
+[package]
+name = "agcad-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Kernel registry and shared repr(C) argument structs (Tier P/N common)."
+
+[dependencies]
+agcad-driver = { workspace = true }
+agcad-ir = { workspace = true }
+bytemuck = { workspace = true }
+
+[dev-dependencies]
+agcad-driver-cpu = { workspace = true }

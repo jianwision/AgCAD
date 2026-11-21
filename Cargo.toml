@@ -1,0 +1,88 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/driver",
+    "crates/driver-cuda",
+    "crates/driver-wgpu",
+    "crates/driver-cpu",
+    "crates/optix-sys",
+    "crates/ir",
+    "crates/rtc",
+    "crates/rtc-macros",
+    "crates/vm",
+    "crates/solver",
+    "crates/geo",
+    "crates/geo-occt",
+    "crates/kernels",
+    "crates/kernels-cuda",
+    "crates/runtime",
+    "crates/std",
+    "crates/proc",
+    "crates/harness",
+    "crates/dops",
+    "crates/model",
+    "crates/improve",
+    "crates/server",
+    "crates/cli",
+    "crates/trace",
+    "crates/conformance",
+    "crates/capi",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+rust-version = "1.92"
+repository = "https://example.invalid/agcad"
+description = "AgCAD: agentic GPU-native CAD (see docs/spec)"
+
+[workspace.dependencies]
+# Internal crates
+agcad-driver = { path = "crates/driver" }
+agcad-driver-cuda = { path = "crates/driver-cuda" }
+agcad-driver-wgpu = { path = "crates/driver-wgpu" }
+agcad-driver-cpu = { path = "crates/driver-cpu" }
+agcad-optix-sys = { path = "crates/optix-sys" }
+agcad-ir = { path = "crates/ir" }
+agcad-rtc = { path = "crates/rtc" }
+agcad-rtc-macros = { path = "crates/rtc-macros" }
+agcad-vm = { path = "crates/vm" }
+agcad-solver = { path = "crates/solver" }
+agcad-geo = { path = "crates/geo" }
+agcad-geo-occt = { path = "crates/geo-occt" }
+agcad-kernels = { path = "crates/kernels" }
+agcad-kernels-cuda = { path = "crates/kernels-cuda" }
+agcad-runtime = { path = "crates/runtime" }
+agcad-std = { path = "crates/std" }
+agcad-proc = { path = "crates/proc" }
+agcad-harness = { path = "crates/harness" }
+agcad-model = { path = "crates/model" }
+agcad-dops = { path = "crates/dops" }
+agcad-improve = { path = "crates/improve" }
+agcad-server = { path = "crates/server" }
+agcad-trace = { path = "crates/trace" }
+agcad-conformance = { path = "crates/conformance" }
+
+# External: only APIs proven in docs/Demo or long-stable (build deferred; see plan).
+cudarc = { version = "=0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "cuda-12080", "dynamic-loading"] }
+candle-core = "=0.9.2"
+candle-nn = "=0.9.2"
+syn = { version = "2", features = ["full", "extra-traits", "visit"] }
+quote = "1"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+thiserror = "2"
+bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
+half = "2"
+
+[profile.release]
+debug = 1
+
+# Numeric device-reference crates are exercised heavily by tests; optimize them in dev.
+[profile.dev.package.agcad-dops]
+opt-level = 2
+[profile.dev.package.agcad-geo]
+opt-level = 2

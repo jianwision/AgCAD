@@ -1,0 +1,19 @@
+[package]
+name = "agcad-proc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Houdini-style procedural networks: attributes, groups, wrangles, cook."
+
+[dependencies]
+agcad-driver = { workspace = true }
+agcad-ir = { workspace = true }
+agcad-rtc = { workspace = true }
+agcad-vm = { workspace = true }
+agcad-geo = { workspace = true }
+agcad-runtime = { workspace = true }
+thiserror = { workspace = true }
+agcad-std = { workspace = true }
+agcad-solver = { workspace = true }
+serde_json = { workspace = true }

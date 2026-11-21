@@ -1,0 +1,19 @@
+[package]
+name = "agcad-std"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Standard features (CATIA Part Design / GSD / Sketcher / Knowledgeware ...)."
+
+[dependencies]
+agcad-driver = { workspace = true }
+agcad-ir = { workspace = true }
+agcad-rtc = { workspace = true }
+agcad-solver = { workspace = true }
+agcad-geo = { workspace = true }
+agcad-runtime = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+agcad-vm = { workspace = true }
+agcad-driver-cpu = { workspace = true }

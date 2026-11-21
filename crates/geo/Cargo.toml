@@ -1,0 +1,19 @@
+[package]
+name = "agcad-geo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Exact geometry kernel (GPU-native): curves, surfaces, B-rep, SSI, topology builders, STEP/3MF."
+
+[dependencies]
+agcad-driver = { workspace = true }
+agcad-ir = { workspace = true }
+agcad-kernels = { workspace = true }
+agcad-kernels-cuda = { workspace = true }
+agcad-solver = { workspace = true }
+thiserror = { workspace = true }
+agcad-rtc = { workspace = true }
+bytemuck = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

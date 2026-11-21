@@ -1,0 +1,12 @@
+[package]
+name = "agcad-optix-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Thin OptiX C++ shim bindings (feature `optix`)."
+
+[dependencies]
+
+[features]
+optix = []

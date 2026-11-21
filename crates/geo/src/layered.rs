@@ -411,3 +411,22 @@ impl LayeredSolid {
         Ok(LayeredSolid { frame: self.frame, layers })
     }
 }
+
+impl LayeredSolid {
+    /// Closed shell (no faces removed) of a single-slab solid: the solid minus its erosion by
+    /// a ball of radius `t`, i.e. minus the 2D inward offset of every region extruded over
+    /// [z0 + t, z1 − t] (exact: the distance to a prism's boundary is the minimum of the 2D
+    /// distance to its walls and the distances to its caps).
+    pub fn shell_closed(&self, t: f64) -> Result<LayeredSolid, String> {
+        if !(t > 0.0) { return Err("shell thickness must be > 0".into()); }
+        let [layer] = self.layers.as_slice() else {
+            return Err(format!("exact shell implemented for single-slab prismatic bodies (this body has {} slabs)", self.layers.len()));
+        };
+        if layer.z1 - layer.z0 <= 2.0 * t { return Ok(self.clone()); }
+        let mut core = Vec::new();
+        for r in &layer.regions { core.extend(region2d::offset_inward(r, t)?); }
+        if core.is_empty() { return Ok(self.clone()); }
+        let core = LayeredSolid { frame: self.frame, layers: vec![Layer { z0: layer.z0 + t, z1: layer.z1 - t, regions: core }] };
+        Ok(self.boolean(&core, BoolOp2::Difference))
+    }
+}

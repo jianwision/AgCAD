@@ -264,7 +264,7 @@ impl Server {
                             Err(e) => Some(device::deliver_implicit(&best.design, &g, e, prefer_cuda)?),
                             Ok(_) => None,
                         };
-                        let doc_design = device::exact_part(&best.design);
+                        let doc_design = if implicit.is_some() { device::exact_part(&best.design) } else { best.design.clone() };
                         let prog = device::lower_program(&doc_design, self.session.requirements.rev, 0);
                         let p = agcad_ir::json::decode_program(&prog.to_string(), catalog).map_err(|e| e.to_string())?;
                         let o = self.session.run_program(&branch, &p, catalog).map_err(|(s, m)| format!("{}: {m}", s.name()))?;

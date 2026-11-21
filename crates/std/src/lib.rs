@@ -30,7 +30,7 @@ pub fn standard_registry() -> Registry {
     for op in ["constraint.coincidence", "constraint.horizontal", "constraint.vertical", "constraint.parallelism", "constraint.perpendicularity", "constraint.equal", "constraint.distance", "constraint.radius", "constraint.diameter", "constraint.fix", "constraint.concentricity", "constraint.tangency"] {
         r.register(Arc::new(sketch::ConstraintOp(op)));
     }
-    for op in ["part.pad", "part.pocket", "part.shaft", "part.groove", "part.primitive", "part.hole", "part.implicit_body", "part.lattice", "part.edge_fillet", "part.chamfer"] {
+    for op in ["part.pad", "part.pocket", "part.shaft", "part.groove", "part.primitive", "part.hole", "part.implicit_body", "part.lattice", "part.edge_fillet", "part.chamfer", "part.shell"] {
         r.register(Arc::new(part::PartOp(op)));
     }
     for op in ["boolean.add", "boolean.remove", "boolean.intersect", "boolean.smooth_boolean"] {

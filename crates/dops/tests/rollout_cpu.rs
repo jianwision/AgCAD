@@ -162,8 +162,9 @@ fn body_booleans_sound_and_round_trip() {
 }
 
 #[test]
-fn shell_is_sound_and_honestly_device_only() {
-    use agcad_dops::examples::{box_goal, shelled_box};
+fn shell_is_exact_sound_and_round_trips() {
+    use agcad_dops::abi::{fop, nflags, profile, Node, NO_PARAM, NVALS};
+    use agcad_dops::examples::{box_goal, feature, shelled_box};
     let dev = CpuDevice::new();
     for t in [1.0, 2.0, 3.5] {
         let d = shelled_box(t);
@@ -171,9 +172,36 @@ fn shell_is_sound_and_honestly_device_only() {
         let o = agcad_dops::studio::certify(dev.clone(), &d, &box_goal(), 7, 1 << 17).unwrap();
         assert!(o[0] <= want && want <= o[1], "t {t}: analytic {want} ∉ [{}, {}]", o[0], o[1]);
         assert!((o[12] - want).abs() / want < 0.02, "t {t}: estimate {} vs {want}", o[12]);
-        let e = to_layered(&d).unwrap_err();
-        assert!(e.contains("device-only"), "{e}");
+        // exact B-rep path (2D inward offset): volume exact, inside the device bounds
+        let v = exact_volume(&d);
+        assert!((v - want).abs() < 1e-6, "t {t}: exact shell {v} vs {want}");
+        // document round trip: part.shell in the standard library builds the same solid
+        let req = agcad_harness::Requirements::parse(r#"{"id":"r","rev":1,"deliver":{"body_type":"SolidBody"}}"#).unwrap();
+        let mut sess = agcad_harness::HarnessSession::new(req, "shell");
+        let prog = agcad_ir::json::decode_program(&to_program(&d, 1, 0).to_string(), agcad_ir::Catalog::global()).unwrap();
+        let out = sess.run_program("main", &prog, agcad_ir::Catalog::global()).unwrap();
+        assert_eq!(out.report.status, "ACCEPTED", "{:?}", out.report.features);
+        let (raised, warnings) = raise(&sess.doc.workspace("main").unwrap().state).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!((exact_volume(&raised) - want).abs() < 1e-6);
     }
+    // plate with a through hole: the hole wall is offset too (ring of radius r + t)
+    let plate = feature(profile::RECT, fop::ADD, [(NO_PARAM, 0.0), (NO_PARAM, 0.0), (NO_PARAM, 100.0), (NO_PARAM, 60.0), (NO_PARAM, 0.0), (NO_PARAM, 10.0)]);
+    let hole = feature(profile::CIRCLE, fop::REMOVE, [(NO_PARAM, 50.0), (NO_PARAM, 30.0), (NO_PARAM, 8.0), (NO_PARAM, 0.0), (NO_PARAM, -1.0), (NO_PARAM, 11.0)]);
+    let mut sh = Node { kind: profile::SHELL, op: fop::ADD, flags: nflags::ACTIVE, src: 0, pref: [NO_PARAM; NVALS], val: [0.0; NVALS] };
+    sh.val[0] = 1.5;
+    let d = Design { nodes: vec![plate, hole, sh], params: vec![], names: vec![] };
+    let pi = core::f64::consts::PI;
+    let want = (6000.0 - pi * 64.0) * 10.0 - (97.0 * 57.0 - pi * 9.5 * 9.5) * 7.0;
+    let v = exact_volume(&d);
+    assert!((v - want).abs() / want < 1e-3, "{v} vs {want}");
+    let o = agcad_dops::studio::certify(dev.clone(), &d, &box_goal(), 7, 1 << 17).unwrap();
+    assert!(o[0] <= v && v <= o[1], "exact {v} ∉ device [{}, {}]", o[0], o[1]);
+    // a union body: the device field is not an exact interior distance → honestly device-only
+    let pad2 = feature(profile::RECT, fop::ADD, [(NO_PARAM, 50.0), (NO_PARAM, 0.0), (NO_PARAM, 100.0), (NO_PARAM, 60.0), (NO_PARAM, 0.0), (NO_PARAM, 10.0)]);
+    let u = Design { nodes: vec![plate, pad2, sh], params: vec![], names: vec![] };
+    let e = to_layered(&u).unwrap_err();
+    assert!(e.contains("device-only"), "{e}");
 }
 
 #[test]

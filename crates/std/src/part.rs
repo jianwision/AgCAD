@@ -148,6 +148,14 @@ impl FeatureImpl for PartOp {
                     Err((_, p, max)) => Err(FeatureError::new(AgStatus::GeometryCheckFailed, format!("{} {} = {size} infeasible at corner ({:.3}, {:.3}): adjacent edges allow at most ≈ {max:.3}", n.op, if self.0 == "part.edge_fillet" { "r" } else { "a" }, p[0], p[1])).with_elements(vec![format!("{}/corner({:.3},{:.3})", n.feature_ref(), p[0], p[1])]).suggest(format!("use ≤ {max:.3}, or part.variable_fillet"))),
                 }
             }
+            "part.shell" => {
+                let body = ctx.bodies.get(&n.container).cloned().ok_or_else(|| FeatureError::new(AgStatus::InvalidBaseline, "shell needs an existing body"))?;
+                if arg(n, "remove").is_some_and(|v| !list(v).is_empty()) { return Err(FeatureError::new(AgStatus::TopologyFailed, "open shells (faces removed) need the general offset path (P11); use remove: [] for a closed hollow")); }
+                if arg(n, "outer").is_some() || arg(n, "per_face").is_some() { return Err(FeatureError::new(AgStatus::TopologyFailed, "outer / per-face thickness need the general offset path (P11)")); }
+                let t = num(ctx, n, "inner")?;
+                let Solid::Layered(l) = &body else { return Err(FeatureError::new(AgStatus::TopologyFailed, "shell of a non-prismatic body needs the general offset path (P11)")) };
+                l.shell_closed(t).map(|s| Product::Solid(Solid::Layered(s))).map_err(|m| FeatureError::new(AgStatus::GeometryCheckFailed, format!("part.shell: {m}")).suggest("thinner walls, or a single-slab body"))
+            }
             "part.implicit_body" => {
                 let src = match req(n, "source")? { Value::String(s) => s.clone(), _ => return Err(bad("implicit_body source must be AgLang text")) };
                 let m = agcad_rtc::compile_module(&src, agcad_ir::Catalog::global()).map_err(|d| FeatureError::new(AgStatus::CompileFailed, d.iter().map(|x| x.render("implicit_body", &src)).collect::<Vec<_>>().join("\n")))?;

@@ -536,3 +536,106 @@ mod corner_tests {
         assert!((ch.area() - 99.5).abs() < 1e-9);
     }
 }
+
+// ------------------------------------------------------------------------------------
+// Inward offset (erosion by a disk): the exact boundary of {p ∈ R : dist(p, ∂R) ≥ t}
+// ------------------------------------------------------------------------------------
+
+fn seg_dir(s: &Seg2, at_end: bool) -> [f64; 2] {
+    match *s {
+        Seg2::Line { a, b } => { let d = sub(b, a); let l = (d[0] * d[0] + d[1] * d[1]).sqrt(); [d[0] / l, d[1] / l] }
+        Seg2::Arc { a0, a1, .. } => {
+            let th = if at_end { a1 } else { a0 };
+            if a1 > a0 { [-th.sin(), th.cos()] } else { [th.sin(), -th.cos()] }
+        }
+        Seg2::Circle { .. } => [1.0, 0.0],
+    }
+}
+
+fn left(d: [f64; 2]) -> [f64; 2] { [-d[1], d[0]] }
+
+/// Offset one closed loop by `t` to its left (the region's interior side for normalized
+/// profiles: outer loops CCW, holes CW). Lines shift, arcs change radius, convex corners
+/// between lines are trimmed, reflex corners get an arc of radius `t`. `Ok(None)`: the loop
+/// vanishes (a circle or arc collapses); `Err`: the thickness exceeds a feature, or a convex
+/// line/arc corner (not supported exactly).
+pub fn offset_loop(lp: &[Seg2], t: f64) -> Result<Option<Vec<Seg2>>, String> {
+    if let [Seg2::Circle { c, r, ccw }] = lp {
+        let r2 = if *ccw { r - t } else { r + t };
+        return Ok(if r2 > EPS { Some(vec![Seg2::Circle { c: *c, r: r2, ccw: *ccw }]) } else { None });
+    }
+    let n = lp.len();
+    let mut off: Vec<Seg2> = Vec::with_capacity(n);
+    for s in lp {
+        off.push(match *s {
+            Seg2::Line { a, b } => { let nl = left(seg_dir(s, false)); Seg2::Line { a: [a[0] + t * nl[0], a[1] + t * nl[1]], b: [b[0] + t * nl[0], b[1] + t * nl[1]] } }
+            Seg2::Arc { c, r, a0, a1 } => {
+                let r2 = if a1 > a0 { r - t } else { r + t };
+                if r2 <= EPS { return Ok(None); }
+                Seg2::Arc { c, r: r2, a0, a1 }
+            }
+            Seg2::Circle { .. } => return Err("a full circle must be alone in its loop".into()),
+        });
+    }
+    // corners: corner i joins segment i and i + 1
+    let mut corner_arc: Vec<Option<Seg2>> = vec![None; n];
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let (d1, d2) = (seg_dir(&lp[i], true), seg_dir(&lp[j], false));
+        let cr = d1[0] * d2[1] - d1[1] * d2[0];
+        let dt = d1[0] * d2[0] + d1[1] * d2[1];
+        if cr.abs() < 1e-9 && dt > 0.0 { continue; } // tangent: offset endpoints coincide
+        let p = lp[i].end();
+        if cr > 0.0 {
+            // convex: trim both offset lines to their intersection
+            let (Seg2::Line { a: a1, b: b1 }, Seg2::Line { a: a2, b: b2 }) = (off[i], off[j]) else {
+                return Err(format!("convex corner between a line and an arc at ({:.4}, {:.4}): exact offset unsupported", p[0], p[1]));
+            };
+            let (u, v) = (sub(b1, a1), sub(b2, a2));
+            let den = u[0] * v[1] - u[1] * v[0];
+            let w = sub(a2, a1);
+            let s = (w[0] * v[1] - w[1] * v[0]) / den;
+            let x = [a1[0] + s * u[0], a1[1] + s * u[1]];
+            off[i] = Seg2::Line { a: a1, b: x };
+            off[j] = Seg2::Line { a: x, b: b2 };
+        } else {
+            // reflex (or a cusp): arc around the corner, turning clockwise
+            let (n1, n2) = (left(d1), left(d2));
+            let a0 = n1[1].atan2(n1[0]);
+            let mut a1 = n2[1].atan2(n2[0]);
+            while a1 >= a0 { a1 -= TAU; }
+            while a0 - a1 > TAU { a1 += TAU; }
+            corner_arc[i] = Some(Seg2::Arc { c: p, r: t, a0, a1 });
+        }
+    }
+    // validity: offset lines keep their direction and a positive length
+    for (s, o) in lp.iter().zip(&off) {
+        if let (Seg2::Line { a, b }, Seg2::Line { a: a2, b: b2 }) = (s, o) {
+            let (u, v) = (sub(*b, *a), sub(*b2, *a2));
+            if u[0] * v[0] + u[1] * v[1] <= EPS * EPS { return Err(format!("offset {t} exceeds the feature at ({:.4}, {:.4})", a[0], a[1])); }
+        }
+    }
+    let mut out = Vec::with_capacity(2 * n);
+    for i in 0..n {
+        out.push(off[i]);
+        if let Some(c) = corner_arc[i] { out.push(c); }
+    }
+    if (Profile::loop_area(&out) > 0.0) != (Profile::loop_area(lp) > 0.0) { return Err(format!("offset {t} inverts a loop")); }
+    Ok(Some(out))
+}
+
+/// Erosion of a region by a disk of radius `t`: inward offset of the outer loop minus the
+/// grown holes (exact lines and arcs; overlaps between grown holes and the outer loop are
+/// resolved by the exact booleans).
+pub fn offset_inward(p: &Profile, t: f64) -> Result<Vec<Profile>, String> {
+    let p = p.clone().normalize();
+    let Some(outer) = p.loops.first() else { return Ok(vec![]) };
+    let Some(o) = offset_loop(outer, t)? else { return Ok(vec![]) };
+    let mut acc = vec![Profile { loops: vec![o] }.normalize()];
+    for h in &p.loops[1..] {
+        let Some(g) = offset_loop(h, t)? else { continue };
+        let hole = Profile { loops: vec![g] }.normalize();
+        acc = acc.iter().flat_map(|x| boolean(x, &hole, BoolOp2::Difference)).collect();
+    }
+    Ok(acc)
+}

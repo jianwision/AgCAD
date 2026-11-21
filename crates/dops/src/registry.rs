@@ -25,7 +25,7 @@ pub const DEVICE_OPS: &[DeviceOp] = &[
     DeviceOp { name: "transform.rectangular_pattern", semantics: "pattern feature args[0] along x / y: arena v6 = count₁, v7 = spacing₁, v8 = count₂, v9 = spacing₂ (≤ 64 instances)", exact: true },
     DeviceOp { name: "part.edge_fillet", semantics: "round the vertical edges of rectangle feature args[0]: arena v10 = radius", exact: true },
     DeviceOp { name: "part.chamfer", semantics: "chamfer the vertical edges of rectangle feature args[0]: arena v10 = length", exact: true },
-    DeviceOp { name: "part.shell", semantics: "hollow the current body inward: arena v0 = wall thickness (device-only: no exact layered offset yet)", exact: false },
+    DeviceOp { name: "part.shell", semantics: "hollow the current body inward (closed): arena v0 = wall thickness. Exact (2D inward offset) for a single convex pad minus cuts; otherwise device-only → certified implicit body", exact: false },
     DeviceOp { name: "document.body", semantics: "start a new body (the current body is pushed; depth ≤ 4)", exact: true },
     DeviceOp { name: "boolean.add", semantics: "combine the pushed body (target) with the current body (tool): union", exact: true },
     DeviceOp { name: "boolean.remove", semantics: "target minus tool", exact: true },

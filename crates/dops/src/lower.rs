@@ -122,12 +122,24 @@ pub fn to_layered(d: &Design) -> Result<Solid, String> {
     let k = &NativeKernel;
     let mut body: Option<Solid> = None;
     let mut stack: Vec<Option<Solid>> = Vec::new();
+    // the device shell is max(f, −f − t): the geometric shell exactly when the body's field is
+    // an exact interior distance — one convex unpatterned pad followed only by cuts
+    let mut exact_interior = false;
     for (i, n) in d.nodes.iter().enumerate() {
         if n.flags & nflags::ACTIVE == 0 { continue; }
         match n.kind {
-            profile::SHELL => return Err(format!("feature {i}: part.shell is device-only (no exact layered offset yet); certify it with studio::certify instead")),
-            profile::BODY => { if stack.len() < MAX_BODIES { stack.push(body.take()); } continue; }
+            profile::SHELL => {
+                let t = value(n, &d.params, 0);
+                let why = |m: String| format!("feature {i}: part.shell is device-only here ({m}); certify it and deliver the certified implicit body");
+                if !exact_interior { return Err(why("the body is not a single convex pad minus cuts, so the device field is not an exact interior distance".into())); }
+                let Some(Solid::Layered(l)) = &body else { return Err(why("no prismatic body".into())) };
+                body = Some(Solid::Layered(l.shell_closed(t).map_err(why)?));
+                exact_interior = false;
+                continue;
+            }
+            profile::BODY => { exact_interior = false; if stack.len() < MAX_BODIES { stack.push(body.take()); } continue; }
             profile::COMBINE => {
+                exact_interior = false;
                 if let Some(target) = stack.pop() {
                     let tool = body.take();
                     body = match (target, tool) {
@@ -158,6 +170,8 @@ pub fn to_layered(d: &Design) -> Result<Solid, String> {
             tool = Some(match tool { None => inst, Some(t) => k.boolean(&t, &inst, BoolOp2::Union).map_err(|e| format!("feature {i}: {}", e.message))? });
         }
         let Some(tool) = tool else { continue };
+        if n.op == fop::ADD { exact_interior = body.is_none() && n.flags & (nflags::PATTERN | nflags::PATTERN_RECT) == 0; }
+        else if n.op != fop::REMOVE { exact_interior = false; }
         body = match (body.take(), n.op) {
             (None, fop::ADD) => Some(tool),
             (None, _) => None, // removing from nothing (as on the device: no material)

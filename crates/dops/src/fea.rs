@@ -195,6 +195,7 @@ pub fn stiffness<D: KernelExt>(dev: Arc<D>, design: &Design, lc: &LoadCase) -> D
     };
     d.launch(&s, lib, "ag_fea_voxelize", &lin(nv), &a.buffer)?;
     d.launch(&s, lib, "ag_fea_nodes", &lin(nn), &a.buffer)?;
+    d.launch(&s, lib, "ag_fea_flags", &lin(nn), &a.buffer)?;
     d.launch(&s, lib, "ag_fea_init", &lin(nd), &a.buffer)?;
     run_dot(&d_init_rz)?;
     run_dot(&d_init_bb)?;
@@ -278,14 +279,29 @@ pub unsafe fn ag_fea_nodes(params: *const u8, _: &LaunchConfig) {
             if i >= 0 && j >= 0 && k >= 0 && (i as usize) < d[0] && (j as usize) < d[1] && (k as usize) < d[2] && solid[(k as usize * d[1] + j as usize) * d[0] + i as usize] != 0 { used = true; }
         }}}
         let ax = a.axis as usize;
-        let mut f = 0u32;
+        nf[n] = if used { N_USED } else { 0 };
         if used {
-            f |= N_USED;
-            if c[ax] == 0 { f |= N_FIXED; }
-            if c[ax] == d[ax] { f |= N_LOADED; stat[0] += 1; }
-            if c[ax] != 0 { stat[3] += 3; }
+            // extent of the part along the support axis (the voxel box may be larger)
+            stat[4] = stat[4].max(c[ax] as u64);
+            stat[5] = stat[5].max((d[ax] - c[ax]) as u64);
         }
-        nf[n] = f;
+    }
+}
+
+/// Supports on the part's lowest node layer along the axis, loads on its highest.
+pub unsafe fn ag_fea_flags(params: *const u8, _: &LaunchConfig) {
+    let a = unsafe { fargs(params) };
+    let (_, nn, d) = sizes(&a);
+    let nf = unsafe { slm::<u32>(a.nflag, nn) };
+    let stat = unsafe { slm::<u64>(a.stat, 8) };
+    let ax = a.axis as usize;
+    let (hi, lo) = (stat[4] as usize, d[ax] - stat[5] as usize);
+    for n in 0..nn {
+        if nf[n] & N_USED == 0 { continue; }
+        let c = [n % (d[0] + 1), (n / (d[0] + 1)) % (d[1] + 1), n / ((d[0] + 1) * (d[1] + 1))];
+        if c[ax] == lo { nf[n] |= N_FIXED; }
+        if c[ax] == hi && hi != lo { nf[n] |= N_LOADED; stat[0] += 1; }
+        if c[ax] != lo { stat[3] += 3; }
     }
 }
 

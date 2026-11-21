@@ -1861,7 +1861,7 @@ __device__ Judge judge(const Goal& goal, bool empty, bool dom, double ve, const 
     j.met = !empty && !dom && in_iv && eh[0] <= goal.max_ext[0] && eh[1] <= goal.max_ext[1] && eh[2] <= goal.max_ext[2] && en.violation == 0.0 && en.centroid_ok;
     double pen = ((en.area > 0.0) ? en.violation / en.area : 0.0) + (en.centroid_ok ? 0.0 : 1.0);
     double scale = (goal.obj_scale > 0.0) ? goal.obj_scale : 1.0;
-    j.sc = !j.met ? 1000.0 + fabs(j.err) + pen : (goal.objective == 1u ? ve / scale : (goal.objective == 2u ? -(ve / scale) : fabs(j.err)));
+    j.sc = !j.met ? 1000.0 + fabs(j.err) + pen : (goal.objective == 1u ? ve / scale : (goal.objective == 2u ? -(ve / scale) : (goal.objective == 3u ? 0.0 : fabs(j.err))));
     return j;
 }
 
@@ -1910,7 +1910,7 @@ AG_KERNEL void ag_dop_decide(const DopsArgs* a) {
         if (cma) ag_ptr<double>(a->tscore)[c] = geometry_ok ? jd.sc : 1.0e30;
         bool structural = false;
         for (u32 r = 0; r < rn; ++r) { u32 o = (u32)cmds[r].opcode; if (o != a->ops.update && o != a->ops.parameter && status[r].status == AG_ACCEPTED) structural = true; }
-        bool commit = geometry_ok && acc > 0u && (!cma || jd.sc < score[c] || structural);
+        bool commit = geometry_ok && acc > 0u && (!cma || jd.sc < score[c] || structural || (goal.objective == 3u && jd.sc <= score[c]));
         if (!geometry_ok && acc > 0u) {
             unsigned short code = empty ? AG_TOPOLOGY_FAILED : (dom != 0u ? AG_CAPACITY_EXCEEDED : AG_REQUIREMENT_FAILED);
             for (u32 r = 0; r < rn; ++r) if ((u32)cmds[r].opcode != a->ops.update && status[r].status == AG_ACCEPTED) status[r].status = code;
@@ -2039,13 +2039,28 @@ AG_KERNEL void ag_fea_nodes(const FeaArgs* a) {
             if (i >= 0 && j >= 0 && k >= 0 && (u64)i < d[0] && (u64)j < d[1] && (u64)k < d[2] && solid[((u64)k * d[1] + (u64)j) * d[0] + (u64)i] != 0u) used = true;
         }
         u32 ax = a->axis;
-        u32 f = 0u;
+        nf[n] = used ? N_USED : 0u;
         if (used) {
-            f |= N_USED;
-            if (c[ax] == 0ull) f |= N_FIXED;
-            if (c[ax] == d[ax]) { f |= N_LOADED; atomicAdd((unsigned long long*)&stat[0], 1ull); }
-            if (c[ax] != 0ull) atomicAdd((unsigned long long*)&stat[3], 3ull);
+            atomicMax((unsigned long long*)&stat[4], (unsigned long long)c[ax]);
+            atomicMax((unsigned long long*)&stat[5], (unsigned long long)(d[ax] - c[ax]));
         }
+    }
+}
+
+AG_KERNEL void ag_fea_flags(const FeaArgs* a) {
+    u64 d[3] = {a->dims[0], a->dims[1], a->dims[2]};
+    u32* nf = ag_ptr<u32>(a->nflag);
+    u64* stat = ag_ptr<u64>(a->stat);
+    u64 nx = d[0] + 1, ny = d[1] + 1;
+    u32 ax = a->axis;
+    u64 hi = stat[4], lo = d[ax] - stat[5];
+    GRID_STRIDE(n, nx * ny * (d[2] + 1)) {
+        if ((nf[n] & N_USED) == 0u) continue;
+        u64 c[3] = {n % nx, (n / nx) % ny, n / (nx * ny)};
+        u32 f = nf[n];
+        if (c[ax] == lo) f |= N_FIXED;
+        if (c[ax] == hi && hi != lo) { f |= N_LOADED; atomicAdd((unsigned long long*)&stat[0], 1ull); }
+        if (c[ax] != lo) atomicAdd((unsigned long long*)&stat[3], 3ull);
         nf[n] = f;
     }
 }

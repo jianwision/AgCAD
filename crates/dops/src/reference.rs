@@ -1068,7 +1068,9 @@ pub fn judge(goal: &Goal, empty: bool, dom: bool, ve: f64, eh: [f64; 3], en: &En
     let met = !empty && !dom && in_iv && eh[0] <= goal.max_ext[0] && eh[1] <= goal.max_ext[1] && eh[2] <= goal.max_ext[2] && en.violation == 0.0 && en.centroid_ok;
     let pen = if en.area > 0.0 { en.violation / en.area } else { 0.0 } + if en.centroid_ok { 0.0 } else { 1.0 };
     let scale = if goal.obj_scale > 0.0 { goal.obj_scale } else { 1.0 };
-    let sc = if !met { 1000.0 + err.abs() + pen } else if goal.objective == 1 { ve / scale } else if goal.objective == 2 { -(ve / scale) } else { err.abs() };
+    // objective 3 (explore, for trade-off sets): every feasible design is equally good, so
+    // elitist search keeps the population spread over the feasible region
+    let sc = if !met { 1000.0 + err.abs() + pen } else if goal.objective == 1 { ve / scale } else if goal.objective == 2 { -(ve / scale) } else if goal.objective == 3 { 0.0 } else { err.abs() };
     (met, err, sc)
 }
 
@@ -1122,7 +1124,7 @@ pub unsafe fn ag_dop_decide(params: *const u8, _: &LaunchConfig) {
             let geometry_ok = !empty && dom[c] == 0 && !hard && !worse;
             if cma { tscore[c] = if geometry_ok { sc } else { 1.0e30 }; }
             let structural = (0..rn).any(|r| { let o = cmds[c * rn + r].opcode as u32; o != a.ops.update && o != a.ops.parameter && status[c * rn + r].status == ACCEPTED });
-            let commit = geometry_ok && acc > 0 && (!cma || sc < score[c] || structural);
+            let commit = geometry_ok && acc > 0 && (!cma || sc < score[c] || structural || (goal.objective == 3 && sc <= score[c]));
             if !geometry_ok && acc > 0 {
                 let code = if empty { AgStatus::TopologyFailed } else if dom[c] != 0 { AgStatus::CapacityExceeded } else { AgStatus::RequirementFailed }.value();
                 for r in 0..rn {
@@ -1210,6 +1212,7 @@ pub const DOPS_CPU: &[(&str, CpuKernelFn)] = &[
     ("ag_opt_update", ag_opt_update),
     ("ag_fea_voxelize", crate::fea::ag_fea_voxelize),
     ("ag_fea_nodes", crate::fea::ag_fea_nodes),
+    ("ag_fea_flags", crate::fea::ag_fea_flags),
     ("ag_fea_init", crate::fea::ag_fea_init),
     ("ag_fea_dot_part", crate::fea::ag_fea_dot_part),
     ("ag_fea_dot_final", crate::fea::ag_fea_dot_final),

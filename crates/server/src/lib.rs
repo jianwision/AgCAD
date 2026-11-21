@@ -9,10 +9,12 @@ use agcad_harness::render::{png, rasterize, Mode, View};
 use agcad_harness::{HarnessSession, Requirements};
 use agcad_ir::Catalog;
 use agcad_runtime::rebuild::Product;
+use agcad_dops::abi::ob;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
 pub mod device;
+pub mod pareto;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -29,6 +31,8 @@ pub struct Server {
     pub implicit: std::collections::HashMap<String, device::Implicit>,
     /// Cached device rollout graphs.
     pub device_cache: device::DeviceCache,
+    /// Pareto candidates of the last rollout (`device_apply` picks one).
+    pub candidates: Vec<agcad_dops::Survivor>,
 }
 
 fn tool(name: &str, description: &str, schema: Value) -> Value {
@@ -48,7 +52,8 @@ pub fn tools() -> Vec<Value> {
         tool("render", "Offscreen render (PNG, base64) of the current body: views iso/top/front/right, mode shaded/face_ids.", json!({ "type": "object", "properties": { "view": { "type": "string" }, "mode": { "type": "string" } } })),
         tool("export", "Export the current body (step_ap242 | stl | 3mf); returns path written by the control plane.", json!({ "type": "object", "properties": { "format": { "type": "string" } } })),
         tool("set_goal", "Goal for the GPU model: target_volume [min, max] mm³, optional max_extent [x, y, z] mm, parameters {name: {min, max, volume_effect: \"+\"|\"-\"}} it may vary, optional new_holes {r, region [x0, y0, x1, y1]} it may add, optional domain {min, max}. objective \"satisfy\" (default: reach target_volume) | \"min_volume\" | \"max_volume\" (optimize subject to every constraint; target_volume optional). Engineering constraints (sampled on the device; a survivor must satisfy them and edits may not worsen them): min_wall (mm), min_clearance (mm), machining \"3ax\" (tool access from +z; defaults from the requirements' process) with undercut_tolerance (mm²), centroid {min, max}. Stiffness: load {support: \"x_min\"|\"y_min\"|\"z_min\", force [N], voxel mm, E MPa, nu} with max_compliance (N·mm), checked on survivors by a voxel FEA solve on the device. The GPU model then plans and executes edits on many configurations (device_rollout).", json!({ "type": "object", "properties": { "target_volume": { "type": "array" }, "max_extent": { "type": "array" }, "parameters": { "type": "object" }, "new_holes": { "type": "object" }, "domain": { "type": "object" }, "min_wall": { "type": "number" }, "min_clearance": { "type": "number" }, "machining": { "type": "string", "enum": ["3ax", "none"] }, "undercut_tolerance": { "type": "number" }, "centroid": { "type": "object" }, "load": { "type": "object" }, "max_compliance": { "type": "number" }, "objective": { "type": "string", "enum": ["satisfy", "min_volume", "max_volume"] } }, "required": ["parameters"] })),
-        tool("device_rollout", "Run the GPU model on the current design: `configurations` variants × up to `rounds` rounds of plan → edit → evaluate → check → decide, entirely on the device (CUDA graph) or the CPU reference. policy \"cmaes\" (default when parameters are free and no new_holes: islands of `island` configurations run CMA-ES on the device) or \"mock\" (sign-prior controller with structural moves). Returns the top survivors; with apply_best (default true) the best becomes the active branch as Part Design features (then render / describe / export it).", json!({ "type": "object", "properties": { "configurations": { "type": "integer" }, "rounds": { "type": "integer" }, "top_k": { "type": "integer" }, "apply_best": { "type": "boolean" }, "resolution": { "type": "integer" }, "device": { "type": "string", "enum": ["cuda", "cpu"] }, "policy": { "type": "string", "enum": ["cmaes", "mock"] }, "island": { "type": "integer" } } })),
+        tool("device_apply", "Apply Pareto candidate `candidate` (index into the last device_rollout's pareto list) as a new branch of Part Design features, with exact / certified evidence.", json!({ "type": "object", "properties": { "candidate": { "type": "integer" } }, "required": ["candidate"] })),
+        tool("device_rollout", "Run the GPU model on the current design: `configurations` variants × up to `rounds` rounds of plan → edit → evaluate → check → decide, entirely on the device (CUDA graph) or the CPU reference. policy \"cmaes\" (default when parameters are free and no new_holes: islands of `island` configurations run CMA-ES on the device) or \"mock\" (sign-prior controller with structural moves). Returns the top survivors; with apply_best (default true) the best becomes the active branch as Part Design features (then render / describe / export it). With pareto {objectives: [\"volume\", \"compliance\", …] (\"-\" prefix maximizes; keys volume, surface_area, extent, undercut, thin_wall, centroid_z, compliance), k} it returns up to k feasible designs trading the objectives off (non-dominated, diverse), each with a render; pick one with device_apply.", json!({ "type": "object", "properties": { "configurations": { "type": "integer" }, "rounds": { "type": "integer" }, "top_k": { "type": "integer" }, "apply_best": { "type": "boolean" }, "pareto": { "type": "object" }, "resolution": { "type": "integer" }, "device": { "type": "string", "enum": ["cuda", "cpu"] }, "policy": { "type": "string", "enum": ["cmaes", "mock"] }, "island": { "type": "integer" } } })),
         tool("finish", "Run delivery checks and produce the DeliveryReport (stop/execution/requirements/delivery).", json!({ "type": "object" })),
     ]
 }
@@ -87,7 +92,7 @@ fn b64(data: &[u8]) -> String {
 
 impl Server {
     pub fn new(requirements: Requirements, part: &str) -> Self {
-        Server { session: HarnessSession::new(requirements, part), branch: "main".into(), goal: None, load: None, rollouts: 0, implicit: Default::default(), device_cache: Default::default() }
+        Server { session: HarnessSession::new(requirements, part), branch: "main".into(), goal: None, load: None, rollouts: 0, implicit: Default::default(), candidates: Vec::new(), device_cache: Default::default() }
     }
 
     fn current_mesh(&self) -> Option<agcad_geo::tessellate::Mesh> {
@@ -98,6 +103,37 @@ impl Server {
             Product::Mesh(m) => Some(m.clone()),
             _ => None,
         })
+    }
+
+    /// Escalate a survivor to a new branch of Part Design features: deep certification on its
+    /// own (low-priority) stream overlapped with the exact solid; device-only ops get the exact
+    /// part in the document plus a certified implicit body.
+    fn apply_survivor(&mut self, best: &agcad_dops::Survivor, g: &agcad_dops::abi::Goal, prefer_cuda: bool, catalog: &Catalog) -> Result<Value, String> {
+        let (exact, cert) = std::thread::scope(|sc| {
+            let h = sc.spawn(|| agcad_dops::studio::certify(agcad_driver_cpu::CpuDevice::new(), &best.design, g, 7, 1 << 18).ok());
+            let exact = device::exact_volume(&best.design);
+            (exact, h.join().ok().flatten())
+        });
+        self.rollouts += 1;
+        let branch = format!("device-{}", self.rollouts);
+        self.session.doc.branch(0, std::slice::from_ref(&branch));
+        let implicit = match &exact {
+            Err(e) => Some(device::deliver_implicit(&best.design, g, e, prefer_cuda)?),
+            Ok(_) => None,
+        };
+        let doc_design = if implicit.is_some() { device::exact_part(&best.design) } else { best.design.clone() };
+        let prog = device::lower_program(&doc_design, self.session.requirements.rev, 0);
+        let p = agcad_ir::json::decode_program(&prog.to_string(), catalog).map_err(|e| e.to_string())?;
+        let o = self.session.run_program(&branch, &p, catalog).map_err(|(s, m)| format!("{}: {m}", s.name()))?;
+        self.branch = branch.clone();
+        let mut out = json!({ "branch": branch, "configuration": best.configuration, "status": o.report.status, "exact_volume": exact.as_ref().ok(), "exact_error": exact.as_ref().err(),
+            "exact_within_device_bounds": exact.as_ref().map(|v| *v >= best.obs[0] && *v <= best.obs[1]).unwrap_or(false), "checks": o.report.checks,
+            "certified_volume_bounds": cert.map(|c| json!([c[0], c[1]])), "certified_evidence": "bounded" });
+        if let Some(im) = implicit {
+            out["implicit"] = im.summary();
+            self.implicit.insert(branch, im);
+        }
+        Ok(out)
     }
 
     pub fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value, String> {
@@ -226,6 +262,11 @@ impl Server {
                 let res = args.get("resolution").and_then(Value::as_u64).unwrap_or(128).clamp(8, 1024) as u32;
                 let levels = 1 + (res / 8).max(1).ilog2();
                 let top_k = args.get("top_k").and_then(Value::as_u64).unwrap_or(4).clamp(1, 64) as usize;
+                let pareto = match args.get("pareto") { Some(v) => Some(pareto::parse(v)?), None => None };
+                let wants_compliance = pareto.as_ref().is_some_and(|(o, _)| o.iter().any(|x| x.key == "compliance"));
+                if wants_compliance && self.load.is_none() { return Err("pareto objective compliance needs a load in set_goal".into()); }
+                // candidates read back: more than top_k when a trade-off set is requested
+                let read_k = if pareto.is_some() { (if wants_compliance { 16 } else { 64 }).max(top_k) } else { top_k };
                 // policy: CMA-ES islands over the free parameters unless structural moves are wanted
                 let free = (0..g.n_params as usize).filter(|&j| g.param_hi[j] > g.param_lo[j]).count();
                 let pol = match args.get("policy").and_then(Value::as_str) {
@@ -239,60 +280,78 @@ impl Server {
                 let records = if pol == 1 && g.hole_r > 0.0 { 2 + agcad_dops::abi::MAX_PARAMS as u32 } else { (g.n_params + 2).max(4) };
                 let cfg = agcad_dops::StudioConfig { configs, records, max_rounds: rounds, coarse: 8, levels, cap: 4096, nodes: (design.nodes.len() as u32 + 8).max(8), budget: records * rounds, tighten: 0, max_cells: 0, policy: pol, island };
                 let prefer_cuda = match args.get("device").and_then(Value::as_str) { Some("cpu") => false, Some(_) => true, None => std::env::var("AGCAD_DEVICE").map(|v| v != "cpu").unwrap_or(true) };
-                let run = device::run(&mut self.device_cache, &design, &g, cfg, top_k, prefer_cuda)?;
-                let mut out = device::summarize(&run, &names);
+                // a trade-off set needs a spread population: explore instead of stopping at the
+                // first design that satisfies the goal
+                let mut g = g;
+                if pareto.is_some() && g.objective == 0 { g.objective = 3; }
+                let run = device::run(&mut self.device_cache, &design, &g, cfg, read_k, prefer_cuda)?;
+                let mut out = device::summarize(&device::RolloutRun { summary: agcad_dops::RolloutSummary { top: run.summary.top.iter().take(top_k).cloned().collect(), ..run.summary.clone() }, ..run }, &run.summary.top.first().map(|s| s.design.names.clone()).unwrap_or(names.clone()));
                 out["policy"] = json!(if pol == 1 { "cmaes" } else { "mock" });
-                out["objective"] = json!(["satisfy", "min_volume", "max_volume"][g.objective as usize]);
+                out["objective"] = json!(["satisfy", "min_volume", "max_volume", "explore"][g.objective as usize]);
                 out["raise_warnings"] = json!(warnings);
                 // stiffness escalation on the survivors (voxel PCG on the device)
                 let mut stiff_ok = vec![true; run.summary.top.len()];
+                let mut compliance: Vec<Option<f64>> = vec![None; run.summary.top.len()];
                 if let Some(spec) = self.load {
                     for (i, sv) in run.summary.top.iter().enumerate() {
+                        if i >= top_k && !wants_compliance { break; }
                         let v = match device::stiffness(&sv.design, &sv.obs, &spec, prefer_cuda) {
                             Ok((r, h)) => {
                                 stiff_ok[i] = r.converged && spec.max_compliance.is_none_or(|m| r.compliance <= m);
+                                compliance[i] = r.converged.then_some(r.compliance);
                                 json!({ "compliance": r.compliance, "max_displacement": r.max_disp, "converged": r.converged, "iterations": r.iterations, "voxel": h, "voxels": r.voxels, "ok": stiff_ok[i], "evidence": "sampled" })
                             }
                             Err(e) => { stiff_ok[i] = false; json!({ "error": e }) }
                         };
-                        out["top"][i]["stiffness"] = v;
-                        if !stiff_ok[i] { out["top"][i]["goal_met"] = json!(false); }
-                    }
-                }
-                if args.get("apply_best").and_then(Value::as_bool).unwrap_or(true) {
-                    let pick = run.summary.top.iter().enumerate().find(|(i, s)| s.obs[10] == 1.0 && stiff_ok[*i]).map(|(_, s)| s);
-                    if let Some(best) = pick.or(run.summary.top.first()) {
-                        // escalation, overlapped: deep certification of the survivor runs on its
-                        // own (low-priority) device stream while the host builds the exact solid
-                        let (exact, cert) = std::thread::scope(|sc| {
-                            let h = sc.spawn(|| agcad_dops::studio::certify(agcad_driver_cpu::CpuDevice::new(), &best.design, &g, 7, 1 << 18).ok());
-                            let exact = device::exact_volume(&best.design);
-                            (exact, h.join().ok().flatten())
-                        });
-                        self.rollouts += 1;
-                        let branch = format!("device-{}", self.rollouts);
-                        self.session.doc.branch(0, std::slice::from_ref(&branch));
-                        // device-only ops (no exact B-rep path): the document gets the exact
-                        // features, the body is delivered as a certified implicit mesh
-                        let implicit = match &exact {
-                            Err(e) => Some(device::deliver_implicit(&best.design, &g, e, prefer_cuda)?),
-                            Ok(_) => None,
-                        };
-                        let doc_design = if implicit.is_some() { device::exact_part(&best.design) } else { best.design.clone() };
-                        let prog = device::lower_program(&doc_design, self.session.requirements.rev, 0);
-                        let p = agcad_ir::json::decode_program(&prog.to_string(), catalog).map_err(|e| e.to_string())?;
-                        let o = self.session.run_program(&branch, &p, catalog).map_err(|(s, m)| format!("{}: {m}", s.name()))?;
-                        self.branch = branch.clone();
-                        out["applied"] = json!({ "branch": branch, "configuration": best.configuration, "status": o.report.status, "exact_volume": exact.as_ref().ok(), "exact_error": exact.as_ref().err(),
-                            "exact_within_device_bounds": exact.as_ref().map(|v| *v >= best.obs[0] && *v <= best.obs[1]).unwrap_or(false), "checks": o.report.checks,
-                            "certified_volume_bounds": cert.map(|c| json!([c[0], c[1]])), "certified_evidence": "bounded" });
-                        if let Some(im) = implicit {
-                            out["applied"]["implicit"] = im.summary();
-                            self.implicit.insert(branch.clone(), im);
+                        if i < top_k {
+                            out["top"][i]["stiffness"] = v;
+                            if !stiff_ok[i] { out["top"][i]["goal_met"] = json!(false); }
                         }
                     }
                 }
+                if let Some((objs, k)) = &pareto {
+                    // feasible survivors → objective vectors (minimization) → trade-off set
+                    let feas: Vec<usize> = (0..run.summary.top.len()).filter(|&i| run.summary.top[i].obs[ob::MET] == 1.0 && stiff_ok[i] && objs.iter().all(|o| pareto::value(&run.summary.top[i], &o.key, compliance[i]).is_some())).collect();
+                    let pts: Vec<Vec<f64>> = feas.iter().map(|&i| objs.iter().map(|o| o.sign * pareto::value(&run.summary.top[i], &o.key, compliance[i]).unwrap()).collect()).collect();
+                    let uniq = pareto::dedupe(&pts);
+                    let upts: Vec<Vec<f64>> = uniq.iter().map(|&u| pts[u].clone()).collect();
+                    let pick = pareto::select(&upts, *k);
+                    self.candidates.clear();
+                    self.rollouts += 1;
+                    let mut list = Vec::new();
+                    for (ci, &pi) in pick.iter().enumerate() {
+                        let sv = &run.summary.top[feas[uniq[pi]]];
+                        let render = device::render_design(&sv.design, &sv.obs, &g, prefer_cuda).map(|png| {
+                            let _ = std::fs::create_dir_all(&self.session.out_dir);
+                            let path = self.session.out_dir.join(format!("pareto-{}-{ci}.png", self.rollouts));
+                            let _ = std::fs::write(&path, &png);
+                            json!({ "path": path.display().to_string(), "png_base64": b64(&png), "view": "iso" })
+                        });
+                        let params: serde_json::Map<String, Value> = sv.design.names.iter().zip(&sv.design.params).map(|(n, v)| (n.clone(), json!((v * 1e6).round() / 1e6))).collect();
+                        list.push(json!({ "candidate": ci, "configuration": sv.configuration, "objectives": pareto::summary_row(objs, &upts[pi]), "parameters": params,
+                                          "features": sv.design.nodes.len(), "engineering": device::engineering(&sv.obs), "volume_bounds": [sv.obs[0], sv.obs[1]],
+                                          "compliance": compliance[feas[uniq[pi]]], "render": render.unwrap_or_else(|e| json!({ "error": e })) }));
+                        self.candidates.push(sv.clone());
+                    }
+                    out["pareto"] = json!({ "objectives": objs.iter().map(|o| if o.sign < 0.0 { format!("-{}", o.key) } else { o.key.clone() }).collect::<Vec<_>>(),
+                                            "feasible": feas.len(), "distinct": uniq.len(), "candidates": list,
+                                            "note": "non-dominated, diverse (crowding distance); apply one with device_apply {candidate}" });
+                }
+                if args.get("apply_best").and_then(Value::as_bool).unwrap_or(pareto.is_none()) {
+                    let pick = run.summary.top.iter().enumerate().find(|(i, s)| s.obs[10] == 1.0 && stiff_ok[*i]).map(|(_, s)| s);
+                    if let Some(best) = pick.or(run.summary.top.first()) {
+                        let best = best.clone();
+                        out["applied"] = self.apply_survivor(&best, &g, prefer_cuda, catalog)?;
+                    }
+                }
                 out
+            }
+            "device_apply" => {
+                let i = args.get("candidate").and_then(Value::as_u64).ok_or("candidate: index into the last pareto list")? as usize;
+                let sv = self.candidates.get(i).cloned().ok_or(format!("no candidate {i} (last rollout has {})", self.candidates.len()))?;
+                let (g, _) = self.goal.clone().ok_or("no goal")?;
+                let prefer_cuda = std::env::var("AGCAD_DEVICE").map(|v| v != "cpu").unwrap_or(true);
+                json!({ "applied": self.apply_survivor(&sv, &g, prefer_cuda, catalog)? })
             }
             "finish" => serde_json::to_value(self.session.finish(&self.branch)).map_err(|e| e.to_string())?,
             other => return Err(format!("unknown tool '{other}'")),

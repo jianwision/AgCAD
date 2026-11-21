@@ -190,7 +190,8 @@ pub struct Goal {
     pub centroid_lo: [f64; 3],
     pub centroid_hi: [f64; 3],
     /// 0 = satisfy (done when met); 1 = minimize / 2 = maximize the volume estimate subject
-    /// to every constraint (never done; runs all rounds).
+    /// to every constraint (never done; runs all rounds); 3 = explore (never done, every
+    /// feasible design scores 0: keeps a spread population for trade-off sets).
     pub objective: u32,
     pub _pad2: u32,
     /// Objective normalization (mm³; 0 → 1).

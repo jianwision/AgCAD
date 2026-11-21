@@ -250,3 +250,41 @@ fn llm_sketches_slots_mirrors_and_shafts_reach_the_device() {
     assert_eq!(out["applied"]["status"], "ACCEPTED", "{}", out["applied"]);
     assert_eq!(out["applied"]["exact_within_device_bounds"], true, "{}", out["applied"]);
 }
+
+#[test]
+fn llm_gets_a_pareto_front_with_renders_and_picks_one() {
+    let req = Requirements::parse(r#"{"id":"r","rev":1,"deliver":{"body_type":"SolidBody"}}"#).unwrap();
+    let mut s = Server::new(req, "flange");
+    s.session.out_dir = std::env::temp_dir().join(format!("agcad-pareto-{}", std::process::id()));
+    let prog = json!({"requirements_rev": 1, "expected_revision": 0, "program": [
+        {"id": "pr", "op": "knowledge.parameter", "args": {"name": "r", "value": "60 mm"}},
+        {"id": "pt", "op": "knowledge.parameter", "args": {"name": "t", "value": "12 mm"}},
+        {"id": "sk", "op": "sketch.create", "args": {"support": "xy"}},
+        {"id": "c", "op": "sketch.circle", "args": {"sketch": "%sk", "mode": "center_radius", "pts": [["0 mm", "0 mm"]], "r": "$r"}},
+        {"id": "rg", "op": "sketch.regions", "args": {"sketch": "%c"}},
+        {"id": "pad", "op": "part.pad", "args": {"profile": "%rg", "limits": "$t"}}
+    ]});
+    assert_eq!(tool(&mut s, "run_program", json!({"program": prog})).unwrap()["report"]["status"], "ACCEPTED");
+    // light vs stiff: any volume in a wide band, bending load on the rim
+    tool(&mut s, "set_goal", json!({"target_volume": [40_000, 200_000], "max_extent": [170, 170, 25], "load": {"support": "z_min", "force": [1000, 0, 0], "voxel": 6},
+        "parameters": {"r": {"min": 40, "max": 80}, "t": {"min": 6, "max": 20}}})).unwrap();
+    let r = tool(&mut s, "device_rollout", json!({"configurations": 64, "rounds": 2, "device": "cpu", "resolution": 32, "pareto": {"objectives": ["volume", "compliance"], "k": 4}})).unwrap();
+    let p = &r["pareto"];
+    let c = p["candidates"].as_array().unwrap();
+    assert!(c.len() >= 2, "{p}");
+    assert!(r.get("applied").is_none(), "with a Pareto set the LLM picks");
+    // a real trade-off: sorted by volume, compliance must not also improve
+    let mut v: Vec<(f64, f64)> = c.iter().map(|x| (x["objectives"]["volume"].as_f64().unwrap(), x["objectives"]["compliance"].as_f64().unwrap())).collect();
+    v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    for w in v.windows(2) { assert!(w[1].1 <= w[0].1 + 1e-12, "non-dominated: lighter must be more compliant {v:?}"); }
+    for x in c {
+        let path = x["render"]["path"].as_str().unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(&bytes[1..4], b"PNG", "render {path}");
+        assert!(x["render"]["png_base64"].as_str().unwrap().len() > 100);
+    }
+    let a = tool(&mut s, "device_apply", json!({"candidate": 1})).unwrap();
+    assert_eq!(a["applied"]["status"], "ACCEPTED", "{a}");
+    assert_eq!(a["applied"]["exact_within_device_bounds"], true, "{a}");
+    assert!(tool(&mut s, "device_apply", json!({"candidate": 99})).is_err());
+}

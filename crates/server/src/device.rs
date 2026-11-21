@@ -253,6 +253,18 @@ pub fn exact_part(d: &agcad_dops::Design) -> agcad_dops::Design {
     agcad_dops::Design { nodes, ..d.clone() }
 }
 
+/// Iso render (PNG) of a design: its exact solid, or the certified implicit mesh for
+/// device-only designs.
+pub fn render_design(d: &agcad_dops::Design, obs: &[f64], goal: &Goal, prefer_cuda: bool) -> Result<Vec<u8>, String> {
+    use agcad_harness::render::{png, rasterize, Mode, View};
+    let mesh = match to_layered(d) {
+        Ok(s) => agcad_geo::tessellate::tessellate(&s.brep(), &Default::default()),
+        Err(reason) => { let _ = (obs, reason); deliver_implicit(d, goal, "render", prefer_cuda)?.mesh.mesh }
+    };
+    let (w, h) = (256, 256);
+    Ok(png(&rasterize(&mesh, View::Iso, Mode::Shaded, w, h), w, h))
+}
+
 /// Exact check of a survivor (escalation) without touching the document.
 pub fn exact_volume(d: &agcad_dops::Design) -> Result<f64, String> {
     let s = to_layered(d)?;

@@ -50,10 +50,13 @@ pub struct StudioConfig {
     pub cap: u32,
     /// Accepted (non-no-op) edits per configuration.
     pub budget: u32,
+    /// Interval evaluations per terminal boundary cell to tighten the rigorous volume
+    /// bounds (0 = boundary cells count as [0, 1]).
+    pub tighten: u32,
 }
 
 impl Default for StudioConfig {
-    fn default() -> Self { StudioConfig { configs: 64, nodes: 16, records: 4, max_rounds: 32, coarse: 8, levels: 5, cap: 4096, budget: 64 } }
+    fn default() -> Self { StudioConfig { configs: 64, nodes: 16, records: 4, max_rounds: 32, coarse: 8, levels: 5, cap: 4096, budget: 64, tighten: 0 } }
 }
 
 /// One configuration's result after a rollout.
@@ -190,7 +193,7 @@ impl<D: KernelExt> Studio<D> {
             obs: b.obs.device_ptr(), score: b.score.device_ptr(), trace: b.trace.device_ptr(), round: b.round.device_ptr(), active: b.active.device_ptr(), compiled: b.compiled.device_ptr(), tables: b.tables.device_ptr(),
             wl0: b.wl0.device_ptr(), wl1: b.wl1.device_ptr(), cls: b.cls.device_ptr(), flag: b.flag.device_ptr(), offs: b.offs.device_ptr(), crank: b.crank.device_ptr(), start: b.start.device_ptr(), lvl: b.lvl.device_ptr(),
             cond_handle: handle, configs: cfg.configs, nodes: cfg.nodes, params: k as u32, records: cfg.records, coarse: cfg.coarse, levels: cfg.levels,
-            eval_trial, max_rounds: cfg.max_rounds, level, capacity: capacity as u32, cap: cfg.cap, cfg_offset, ops: crate::registry::op_table(agcad_ir::Catalog::global()),
+            eval_trial, max_rounds: cfg.max_rounds, level, capacity: capacity as u32, cap: cfg.cap, cfg_offset, tighten: cfg.tighten, _pad: 0, ops: crate::registry::op_table(agcad_ir::Catalog::global()),
         };
         let a_observe = upload_params(d, &s, &mk(0, 0, 0))?;
         let host_args = mk(1, 0, 0);
@@ -430,8 +433,13 @@ impl<D: KernelExt + ConditionalExt> GraphRollout<D> {
 /// Escalation step of the evidence chain (spec 14): re-evaluate one design alone with a deep,
 /// high-capacity adaptive pass. Returns its observation row (rigorous volume / extent bounds,
 /// sampled estimate). Memory is O(cap) for one configuration instead of configs × cap.
-pub fn certify<D: KernelExt>(dev: Arc<D>, design: &Design, goal: &Goal, levels: u32, cap: u32) -> DriverResult<[f64; OBS]> {
-    let cfg = StudioConfig { configs: 1, nodes: design.nodes.len().max(1) as u32, records: 1, max_rounds: 1, coarse: 8, levels, cap, budget: 1 };
+pub fn certify<D: KernelExt>(dev: Arc<D>, design: &Design, goal: &Goal, levels: u32, cap: u32) -> DriverResult<[f64; OBS]> { certify_with(dev, design, goal, levels, cap, CERTIFY_TIGHTEN) }
+
+/// Interval evaluations per boundary cell used by [`certify`].
+pub const CERTIFY_TIGHTEN: u32 = 96;
+
+pub fn certify_with<D: KernelExt>(dev: Arc<D>, design: &Design, goal: &Goal, levels: u32, cap: u32, tighten: u32) -> DriverResult<[f64; OBS]> {
+    let cfg = StudioConfig { configs: 1, nodes: design.nodes.len().max(1) as u32, records: 1, max_rounds: 1, coarse: 8, levels, cap, budget: 1, tighten };
     let st = Studio::new_with(dev, design, goal, cfg, 0, Priority::Low)?;
     st.observe()?;
     let o: Vec<f64> = st.read(&st.b.obs, 0, OBS)?;

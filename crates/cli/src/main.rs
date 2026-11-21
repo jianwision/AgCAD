@@ -79,7 +79,7 @@ fn main() {
         }
         Some("bench-device") => {
             let num = |k: &str, d: u32| flag(&args, k).and_then(|s| s.parse().ok()).unwrap_or(d);
-            let cfg = agcad_dops::StudioConfig { configs: num("--configs", 4096), records: 4, max_rounds: num("--rounds", 16), coarse: 8, levels: num("--levels", 5), cap: num("--cap", 4096), nodes: 8, budget: 64 };
+            let cfg = agcad_dops::StudioConfig { configs: num("--configs", 4096), records: 4, max_rounds: num("--rounds", 16), coarse: 8, levels: num("--levels", 5), cap: num("--cap", 4096), nodes: 8, budget: 64, tighten: 0 };
             let base = agcad_dops::examples::flange(60.0, 12.0, 6.0);
             let goal = agcad_dops::examples::goal(60_000.0, 66_000.0);
             let want_cpu = flag(&args, "--device").as_deref() == Some("cpu");

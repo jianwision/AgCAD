@@ -20,7 +20,7 @@ pub const NVALS: usize = 12;
 /// 12 volume estimate (sampled).
 pub const OBS: usize = 32;
 /// u64 accumulators per configuration (see `cnt`).
-pub const CS: usize = 16;
+pub const CS: usize = 20;
 /// Maximum parameters per configuration.
 pub const MAX_PARAMS: usize = 8;
 /// Maximum pattern instances evaluated per feature.
@@ -176,7 +176,15 @@ pub mod cnt {
     pub const AREA: usize = 14;
     /// Σ q6·w (normalizer of M2).
     pub const V6: usize = 15;
+    /// Boundary cells: certified-inside / inside-or-ambiguous fractions, Σ w·q24.
+    pub const BLO: usize = 16;
+    pub const BHI: usize = 17;
 }
+
+/// Fixed-point bits of tightened boundary-cell fractions.
+pub const TQ: u32 = 24;
+/// Sub-box slots of the per-cell tightening.
+pub const TK: usize = 32;
 
 /// Observation row layout (`OBS` f64 per configuration).
 pub mod ob {
@@ -305,6 +313,9 @@ pub struct DopsArgs {
     /// Global id of local configuration 0 (multi-device shards): the policy hashes and
     /// alternates on global ids, so trajectories do not depend on the sharding.
     pub cfg_offset: u32,
+    /// Interval evaluations per terminal boundary cell for bound tightening (0 = off).
+    pub tighten: u32,
+    pub _pad: u32,
     pub ops: OpTable,
 }
 

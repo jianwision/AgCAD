@@ -8,7 +8,11 @@ extern "C" __device__ __attribute__((cudart_builtin)) void cudaGraphSetCondition
 
 #define NVALS 12
 #define OBS 32
-#define CS 16
+#define CS 20
+#define C_BLO 16
+#define C_BHI 17
+#define TQ 24u
+#define TK 32
 #define C_INSIDE 0
 #define C_BOUNDARY 1
 #define C_FILL 2
@@ -65,7 +69,7 @@ struct DopsArgs {
     u64 goal, cur_nodes, cur_count, cur_params, tr_nodes, tr_count, tr_params, rev, budget, done,
         cmds, arena, status, counts, domain_hit, bbox, obs, score, trace, round, active, compiled, tables,
         wl0, wl1, cls, flag, offs, crank, start, lvl, cond_handle;
-    u32 configs, nodes, params, records, coarse, levels, eval_trial, max_rounds, level, capacity, cap, cfg_offset;
+    u32 configs, nodes, params, records, coarse, levels, eval_trial, max_rounds, level, capacity, cap, cfg_offset, tighten, _pad;
     OpTable ops;
 };
 struct CommandRecord { unsigned short opcode, flags; u32 configuration, dst, args[6], expected_revision, configuration_mask_slot, reserved; double imm[2]; };
@@ -778,6 +782,49 @@ __device__ Probe probe(const CNode* nodes, u32 cnt, const float* tabs, const Goa
     return pr;
 }
 
+__device__ void tighten_cell(const CNode* nodes, u32 cnt, const float* tabs, const Iv* b, const float* g, float e, u32 budget, u64* olo, u64* ohi) {
+    u64 full = 1ull << TQ;
+    *olo = 0ull; *ohi = full;
+    if (budget < 2u) return;
+    double cd[3] = {(double)(b[0].hi - b[0].lo), (double)(b[1].hi - b[1].lo), (double)(b[2].hi - b[2].lo)};
+    double cv = cd[0] * cd[1] * cd[2];
+    if (!(cv > 0.0)) return;
+    Iv bx[TK][3];
+    double vol[TK];
+    bx[0][0] = b[0]; bx[0][1] = b[1]; bx[0][2] = b[2];
+    vol[0] = (double)full;
+    u32 n = 1u;
+    u64 lo = 0ull, hi = 0ull;
+    u32 evals = 0u;
+    while (n > 0u && evals + 2u <= budget && n < (u32)TK) {
+        u32 k = 0u;
+        for (u32 i = 1u; i < n; ++i) if (vol[i] > vol[k]) k = i;
+        Iv pb[3] = {bx[k][0], bx[k][1], bx[k][2]};
+        int ax = 0;
+        float best = -1.0f;
+        for (int j = 0; j < 3; ++j) { float v = fabsf(g[j]) * (pb[j].hi - pb[j].lo); if (v > best) { best = v; ax = j; } }
+        float mid = 0.5f * (pb[ax].lo + pb[ax].hi);
+        if (!(mid > pb[ax].lo && mid < pb[ax].hi) || (double)(pb[ax].hi - pb[ax].lo) < 1e-4 * cd[ax]) break;
+        n -= 1u;
+        bx[k][0] = bx[n][0]; bx[k][1] = bx[n][1]; bx[k][2] = bx[n][2];
+        vol[k] = vol[n];
+        for (int half = 0; half < 2; ++half) {
+            Iv c[3] = {pb[0], pb[1], pb[2]};
+            if (half == 0) c[ax].hi = mid; else c[ax].lo = mid;
+            evals += 1u;
+            Iv r = tape_iv(nodes, cnt, tabs, c[0], c[1], c[2]);
+            if (r.lo - e > 0.0f) continue;
+            double v = (double)(c[0].hi - c[0].lo) * (double)(c[1].hi - c[1].lo) * (double)(c[2].hi - c[2].lo) / cv * (double)full;
+            if (r.hi + e < 0.0f) { lo += (u64)floor(v); hi += (u64)ceil(v); continue; }
+            bx[n][0] = c[0]; bx[n][1] = c[1]; bx[n][2] = c[2];
+            vol[n] = v;
+            n += 1u;
+        }
+    }
+    for (u32 i = 0u; i < n; ++i) hi += (u64)ceil(vol[i]);
+    *olo = lo; *ohi = (hi < full) ? hi : full;
+}
+
 __device__ void acc_moments(u64* cc, u32 ix, u32 iy, u32 iz, u32 sh, u64 q20) {
     u64 w = 1ull << (3u * sh);
     u64 q6 = q20 >> 14;
@@ -916,7 +963,13 @@ AG_KERNEL void ag_ad_resolve(const DopsArgs* a) {
         float d[3] = {b[0].hi - b[0].lo, b[1].hi - b[1].lo, b[2].hi - b[2].lo};
         float cxyz[3] = {0.5f * (b[0].lo + b[0].hi), 0.5f * (b[1].lo + b[1].hi), 0.5f * (b[2].lo + b[2].hi)};
         Surface sf = surface(tape, c, tb, cxyz[0], cxyz[1], cxyz[2], d);
+        u64 tlo, thi;
+        tighten_cell(tape, c, tb, b, sf.g, (float)gr.eps, a->tighten, &tlo, &thi);
+        atomicAdd((unsigned long long*)&cc[C_BLO], (unsigned long long)(tlo * w));
+        atomicAdd((unsigned long long*)&cc[C_BHI], (unsigned long long)(thi * w));
         u64 fq = fill_of(sf);
+        if (fq < (tlo >> 4)) fq = tlo >> 4;
+        if (fq > ((thi + 15ull) >> 4)) fq = (thi + 15ull) >> 4;
         atomicAdd((unsigned long long*)&cc[C_FILL], (unsigned long long)(fq * w));
         acc_moments(cc, ix, iy, iz, sh, fq);
         Probe pr = probe(tape, c, tb, goal, sf, cxyz, d);
@@ -1032,8 +1085,9 @@ AG_KERNEL void ag_dop_decide(const DopsArgs* a) {
     const u32* bb = ag_ptr<const u32>(a->bbox) + 12u * c;
     u32 dom = ag_ptr<const u32>(a->domain_hit)[c];
     double vc = gr.fine[0] * gr.fine[1] * gr.fine[2];
-    double vl = (double)counts[0] * vc;
-    double vh = (double)(counts[0] + counts[1]) * vc;
+    double tq = 1.0 / 16777216.0;
+    double vl = ((double)counts[0] + (double)counts[C_BLO] * tq) * vc;
+    double vh = ((double)counts[0] + (double)counts[C_BHI] * tq) * vc;
     double ve = ((double)counts[0] + (double)counts[2] * (1.0 / 1048576.0)) * vc;
     double el[3], eh[3];
     for (int k = 0; k < 3; ++k) {

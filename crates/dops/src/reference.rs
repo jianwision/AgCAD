@@ -305,6 +305,60 @@ pub fn fill_of(s: &Surface) -> u64 {
 
 pub fn fill_q(nodes: &[CNode], tabs: &[f32], x: f32, y: f32, z: f32, d: [f32; 3]) -> u64 { fill_of(&surface(nodes, tabs, [x, y, z], d)) }
 
+/// Rigorous inside fraction of an ambiguous cell `b` (units 2⁻²⁴): repeatedly split the
+/// largest ambiguous sub-box along the axis where the field varies most (|g_k|·width_k,
+/// effectively anisotropic: a planar face converges geometrically) and classify the halves
+/// by interval evaluation, within `budget` evaluations. Volumes use the actual f32 box
+/// widths (lower bound floored, upper bound ceiled). Returns (certified inside, inside or
+/// ambiguous).
+pub fn tighten(nodes: &[CNode], tabs: &[f32], b: &[Iv; 3], g: [f32; 3], e: f32, budget: u32) -> (u64, u64) {
+    let full = 1u64 << TQ;
+    if budget < 2 { return (0, full); }
+    let cd = [(b[0].hi - b[0].lo) as f64, (b[1].hi - b[1].lo) as f64, (b[2].hi - b[2].lo) as f64];
+    let cv = cd[0] * cd[1] * cd[2];
+    if !(cv > 0.0) { return (0, full); }
+    let q = |x: &[Iv; 3]| -> f64 { (x[0].hi - x[0].lo) as f64 * (x[1].hi - x[1].lo) as f64 * (x[2].hi - x[2].lo) as f64 / cv * full as f64 };
+    let mut bx = [[iv(0.0, 0.0); 3]; TK];
+    let mut vol = [0.0f64; TK];
+    bx[0] = *b;
+    vol[0] = full as f64;
+    let mut n = 1usize;
+    let (mut lo, mut hi) = (0u64, 0u64);
+    let mut evals = 0u32;
+    while n > 0 && evals + 2 <= budget && n < TK {
+        // largest ambiguous sub-box (first on ties)
+        let mut k = 0;
+        for i in 1..n { if vol[i] > vol[k] { k = i; } }
+        let pb = bx[k];
+        // split axis: largest |g|·width; stop when the box is near f32 resolution
+        let mut ax = 0;
+        let mut best = -1.0f32;
+        for j in 0..3 {
+            let v = g[j].abs() * (pb[j].hi - pb[j].lo);
+            if v > best { best = v; ax = j; }
+        }
+        let mid = 0.5f32 * (pb[ax].lo + pb[ax].hi);
+        if !(mid > pb[ax].lo && mid < pb[ax].hi) || ((pb[ax].hi - pb[ax].lo) as f64) < 1e-4 * cd[ax] { break; }
+        n -= 1;
+        bx[k] = bx[n];
+        vol[k] = vol[n];
+        for half in 0..2 {
+            let mut c = pb;
+            if half == 0 { c[ax].hi = mid; } else { c[ax].lo = mid; }
+            evals += 1;
+            let r = tape_iv(nodes, tabs, c[0], c[1], c[2]);
+            if r.lo - e > 0.0 { continue; }
+            let v = q(&c);
+            if r.hi + e < 0.0 { lo += v.floor() as u64; hi += v.ceil() as u64; continue; }
+            bx[n] = c;
+            vol[n] = v;
+            n += 1;
+        }
+    }
+    for i in 0..n { hi += vol[i].ceil() as u64; }
+    (lo, hi.min(full))
+}
+
 /// Area quantization: 2⁻¹⁰ mm².
 pub fn qarea(a: f32) -> u64 { (a as f64 * 1024.0 + 0.5).floor() as u64 }
 
@@ -499,6 +553,7 @@ pub unsafe fn ag_ad_resolve(params: *const u8, _: &LaunchConfig) {
     let start = unsafe { sl::<u32>(a.start, cn) };
     let mut acc = Acc { counts: unsafe { slm::<u64>(a.counts, CS * cn) }, dom: unsafe { slm::<u32>(a.domain_hit, cn) }, bb: unsafe { slm::<u32>(a.bbox, 12 * cn) } };
     let sh = a.levels - 1 - l;
+    let e = gr.eps as f32;
     for i in 0..cap {
         flag[i] = 0;
         if i >= n || cls[i] != 1 { continue; }
@@ -513,7 +568,13 @@ pub unsafe fn ag_ad_resolve(params: *const u8, _: &LaunchConfig) {
         let d = [b[0].hi - b[0].lo, b[1].hi - b[1].lo, b[2].hi - b[2].lo];
         let c = [0.5f32 * (b[0].lo + b[0].hi), 0.5f32 * (b[1].lo + b[1].hi), 0.5f32 * (b[2].lo + b[2].hi)];
         let sf = surface(tape, tb, c, d);
-        let fq = fill_of(&sf);
+        let (tlo, thi) = tighten(tape, tb, &b, sf.g, e, a.tighten);
+        acc.counts[CS * cfg + cnt::BLO] += tlo * w;
+        acc.counts[CS * cfg + cnt::BHI] += thi * w;
+        // sampled fill, kept inside the certified fraction interval
+        let mut fq = fill_of(&sf);
+        if fq < tlo >> 4 { fq = tlo >> 4; }
+        if fq > (thi + 15) >> 4 { fq = (thi + 15) >> 4; }
         acc.counts[CS * cfg + cnt::FILL] += fq * w;
         acc.moments(cfg, [ix, iy, iz], sh, fq);
         let pr = probe(tape, tb, &goal, &sf, c, d);
@@ -568,8 +629,9 @@ pub unsafe fn ag_ad_total(params: *const u8, _: &LaunchConfig) {
 /// ext_hi). The interval is rigorous (bounded evidence); the estimate is sampled.
 pub fn bounds(gr: &Grid, counts: &[u64], bb: &[u32]) -> (f64, f64, f64, [f64; 3], [f64; 3]) {
     let vc = gr.fine[0] * gr.fine[1] * gr.fine[2];
-    let vol_lo = counts[0] as f64 * vc;
-    let vol_hi = (counts[0] + counts[1]) as f64 * vc;
+    let q = 1.0 / (1u64 << TQ) as f64;
+    let vol_lo = (counts[0] as f64 + counts[cnt::BLO] as f64 * q) * vc;
+    let vol_hi = (counts[0] as f64 + counts[cnt::BHI] as f64 * q) * vc;
     let vol_est = (counts[0] as f64 + counts[2] as f64 * (1.0 / 1048576.0)) * vc;
     let mut el = [0.0; 3];
     let mut eh = [0.0; 3];

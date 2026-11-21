@@ -10,7 +10,7 @@ use agcad_dops::lower::to_layered;
 use agcad_dops::{Studio, StudioConfig};
 use std::time::Instant;
 
-fn cfg(configs: u32, rounds: u32) -> StudioConfig { StudioConfig { configs, records: 4, max_rounds: rounds, coarse: 8, levels: 5, cap: 4096, nodes: 8, budget: 64 } }
+fn cfg(configs: u32, rounds: u32) -> StudioConfig { StudioConfig { configs, records: 4, max_rounds: rounds, coarse: 8, levels: 5, cap: 4096, nodes: 8, budget: 64, tighten: 0 } }
 
 #[test]
 #[ignore = "requires NVIDIA GPU"]
@@ -18,8 +18,10 @@ fn cuda_host_loop_matches_cpu_reference_bitwise() {
     let (base, goal) = (cpu::flange(60.0, 12.0, 6.0), cpu::goal(60_000.0, 66_000.0));
     let cuda = agcad_driver_cuda::CudaDevice::open(0).unwrap();
     let cpu_dev = agcad_driver_cpu::CpuDevice::new();
-    let g = Studio::new(cuda, &base, &goal, cfg(48, 10)).unwrap();
-    let c = Studio::new(cpu_dev, &base, &goal, cfg(48, 10)).unwrap();
+    // tightened bounds on (per-cell interval refinement is part of the bit-parity contract)
+    let tc = StudioConfig { tighten: 8, ..cfg(48, 10) };
+    let g = Studio::new(cuda, &base, &goal, tc).unwrap();
+    let c = Studio::new(cpu_dev, &base, &goal, tc).unwrap();
     let (rg, rc) = (g.run_host_loop().unwrap(), c.run_host_loop().unwrap());
     assert_eq!(rg, rc);
     let (a, b) = (g.state_bytes().unwrap(), c.state_bytes().unwrap());
@@ -49,7 +51,7 @@ fn graph_while_rollout_equals_host_loop_without_round_trips() {
 fn rollout_4096_configurations_throughput_and_soundness() {
     let (base, goal) = (cpu::flange(60.0, 12.0, 6.0), cpu::goal(60_000.0, 66_000.0));
     let cuda = agcad_driver_cuda::CudaDevice::open(0).unwrap();
-    let c = StudioConfig { configs: 4096, records: 4, max_rounds: 24, coarse: 8, levels: 6, cap: 8192, nodes: 8, budget: 64 };
+    let c = StudioConfig { configs: 4096, records: 4, max_rounds: 24, coarse: 8, levels: 6, cap: 8192, nodes: 8, budget: 64, tighten: 0 };
     let st = Studio::new(cuda, &base, &goal, c).unwrap();
     let t0 = Instant::now();
     st.run_graph().unwrap();

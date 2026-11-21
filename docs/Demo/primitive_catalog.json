@@ -1,0 +1,2222 @@
+{
+  "version": 4,
+  "operators": [
+    {
+      "name": "line",
+      "family": "curve",
+      "source": "cuda/curve_ops.cuh",
+      "entry": "line_point(a,b,t)",
+      "limits": "Finite points; t in [0,1].",
+      "backend": "CUDA + independent CAD evaluator",
+      "pass": true,
+      "test_scope": "degree<=5, poles<=32 for NURBS; polyline parameter is by segment index",
+      "evidence": {
+        "samples": 33,
+        "max_cad_error_mm": 0.0
+      }
+    },
+    {
+      "name": "polyline",
+      "family": "curve",
+      "source": "cuda/curve_ops.cuh",
+      "entry": "polyline_point(points,count,t)",
+      "limits": "At least 2 points; t is normalized segment index, not arc length.",
+      "backend": "CUDA + independent CAD evaluator",
+      "pass": true,
+      "test_scope": "degree<=5, poles<=32 for NURBS; polyline parameter is by segment index",
+      "evidence": {
+        "samples": 33,
+        "max_cad_error_mm": 2.220446049250313e-16
+      }
+    },
+    {
+      "name": "circle_arc",
+      "family": "curve",
+      "source": "cuda/curve_ops.cuh",
+      "entry": "ellipse_point(origin,x,y,r,r,angle)",
+      "limits": "Caller supplies orthonormal plane axes and positive radius; angles in radians.",
+      "backend": "CUDA + independent CAD evaluator",
+      "pass": true,
+      "test_scope": "degree<=5, poles<=32 for NURBS; polyline parameter is by segment index",
+      "evidence": {
+        "samples": 33,
+        "max_cad_error_mm": 1.1102230246251565e-16
+      }
+    },
+    {
+      "name": "ellipse",
+      "family": "curve",
+      "source": "cuda/curve_ops.cuh",
+      "entry": "ellipse_point(origin,x,y,a,b,angle)",
+      "limits": "Caller supplies orthonormal plane axes and positive radii; angles in radians.",
+      "backend": "CUDA + independent CAD evaluator",
+      "pass": true,
+      "test_scope": "degree<=5, poles<=32 for NURBS; polyline parameter is by segment index",
+      "evidence": {
+        "samples": 33,
+        "max_cad_error_mm": 5.551115123125783e-17
+      }
+    },
+    {
+      "name": "bezier_curve",
+      "family": "curve",
+      "source": "cuda/surface_primitives.cuh",
+      "entry": "bezier(poles,degree,t)",
+      "limits": "Degree 1..5; t in [0,1]; finite control points.",
+      "backend": "CUDA + independent CAD evaluator",
+      "pass": true,
+      "test_scope": "degree<=5, poles<=32 for NURBS; polyline parameter is by segment index",
+      "evidence": {
+        "samples": 33,
+        "max_cad_error_mm": 0.0
+      }
+    },
+    {
+      "name": "nurbs_curve",
+      "family": "curve",
+      "source": "cuda/curve_ops.cuh",
+      "entry": "nurbs_curve(xyzw,count,degree,knots,t)",
+      "limits": "Degree 1..5; poles <=32; ordinary XYZ plus positive weight; valid full knot vector required. Returns p,d,dd.",
+      "backend": "CUDA + independent CAD evaluator",
+      "pass": true,
+      "test_scope": "degree<=5, poles<=32 for NURBS; polyline parameter is by segment index",
+      "evidence": {
+        "samples": 33,
+        "max_cad_error_mm": 1.1102230246251565e-16
+      }
+    },
+    {
+      "name": "catmull_rom",
+      "family": "curve",
+      "source": "cuda/curve_ops.cuh",
+      "entry": "catmull_rom(p0,p1,p2,p3,t)",
+      "limits": "One uniform Catmull-Rom segment between p1 and p2; not centripetal parameterization.",
+      "backend": "CUDA + independent CAD evaluator",
+      "pass": true,
+      "test_scope": "degree<=5, poles<=32 for NURBS; polyline parameter is by segment index",
+      "evidence": {
+        "samples": 33,
+        "max_cad_error_mm": 0.0
+      }
+    },
+    {
+      "name": "curve_trim",
+      "family": "curve",
+      "source": "cuda/curve_ops.cuh",
+      "entry": "trimmed_parameter(start,end,t)",
+      "limits": "Parameter interval mapping for an existing curve; caller checks interval is in the curve domain.",
+      "backend": "CUDA + independent CAD evaluator",
+      "pass": true,
+      "test_scope": "degree<=5, poles<=32 for NURBS; polyline parameter is by segment index",
+      "evidence": {
+        "samples": 33,
+        "max_cad_error_mm": 2.220446049250313e-16
+      }
+    },
+    {
+      "name": "plane",
+      "family": "surface",
+      "source": "cuda/surface_builders.cuh",
+      "entry": "make_plane(record,origin,u,v)",
+      "limits": "Finite independent nonzero direction vectors; rectangular domain [0,1]^2.",
+      "backend": "CUDA control net/evaluation + CAD topology",
+      "pass": true,
+      "test_scope": "sweep: exact translation on GPU, native path sweep on CPU; loft: compatible sections on GPU; offset is an offset definition, not a fitted net",
+      "evidence": {
+        "samples": 81,
+        "max_cad_error_mm": 0.0,
+        "brep_valid": true
+      }
+    },
+    {
+      "name": "bezier_patch",
+      "family": "surface",
+      "source": "cuda/surface_builders.cuh",
+      "entry": "make_bezier_patch(record,poles,nu,nv)",
+      "limits": "Nonrational tensor patch, 2..6 poles per direction, row-major U then V.",
+      "backend": "CUDA control net/evaluation + CAD topology",
+      "pass": true,
+      "test_scope": "sweep: exact translation on GPU, native path sweep on CPU; loft: compatible sections on GPU; offset is an offset definition, not a fitted net",
+      "evidence": {
+        "samples": 81,
+        "max_cad_error_mm": 5.551115123125783e-17,
+        "brep_valid": true
+      }
+    },
+    {
+      "name": "nurbs_patch",
+      "family": "surface",
+      "source": "cuda/surface_builders.cuh",
+      "entry": "make_nurbs_patch(record,nu,nv,pu,pv,ku,kv,xyzw)",
+      "limits": "2..32 poles per axis, degree 1..5 below pole count; finite positive weights and monotonic full knots; caller ensures legal multiplicities.",
+      "backend": "CUDA control net/evaluation + CAD topology",
+      "pass": true,
+      "test_scope": "sweep: exact translation on GPU, native path sweep on CPU; loft: compatible sections on GPU; offset is an offset definition, not a fitted net",
+      "evidence": {
+        "samples": 81,
+        "max_cad_error_mm": 2.220446049250313e-16,
+        "brep_valid": true,
+        "invalid_builder_inputs_rejected": 5
+      }
+    },
+    {
+      "name": "ruled_surface",
+      "family": "surface",
+      "source": "cuda/surface_builders.cuh",
+      "entry": "make_ruled(record,a,b,n,degree,knots)",
+      "limits": "Two compatible nonrational B-spline curves sharing degree, knots and pole count <=32.",
+      "backend": "CUDA control net/evaluation + CAD topology",
+      "pass": true,
+      "test_scope": "sweep: exact translation on GPU, native path sweep on CPU; loft: compatible sections on GPU; offset is an offset definition, not a fitted net",
+      "evidence": {
+        "samples": 81,
+        "max_cad_error_mm": 1.1102230246251565e-16,
+        "brep_valid": true
+      }
+    },
+    {
+      "name": "extrude_surface",
+      "family": "surface",
+      "source": "cuda/surface_builders.cuh",
+      "entry": "make_extruded(record,xyzw,n,degree,knots,direction)",
+      "limits": "Rational profile <=32 poles, degree 1..5; nonzero finite extrusion; valid profile required.",
+      "backend": "CUDA control net/evaluation + CAD topology",
+      "pass": true,
+      "test_scope": "sweep: exact translation on GPU, native path sweep on CPU; loft: compatible sections on GPU; offset is an offset definition, not a fitted net",
+      "evidence": {
+        "samples": 81,
+        "max_cad_error_mm": 1.1102230246251565e-16,
+        "brep_valid": true
+      }
+    },
+    {
+      "name": "revolve_surface",
+      "family": "surface",
+      "source": "cuda/surface_builders.cuh",
+      "entry": "make_revolved(record,xyzw,n,degree,knots,start,end)",
+      "limits": "Exact rational rotation about Y; profile (radius,axial_y,0,weight); nonzero span <=2pi split into <=4 arcs. U is rational arc parameter, not linear angle.",
+      "backend": "CUDA control net/evaluation + CAD topology",
+      "pass": true,
+      "test_scope": "sweep: exact translation on GPU, native path sweep on CPU; loft: compatible sections on GPU; offset is an offset definition, not a fitted net",
+      "evidence": {
+        "samples": 81,
+        "max_cad_error_mm": 4.440892098500626e-16,
+        "brep_valid": true
+      }
+    },
+    {
+      "name": "sweep_surface",
+      "family": "surface",
+      "source": "cuda/surface_builders.cuh; scripts/cad_ops.py",
+      "entry": "make_translation_sweep(record,a,nu,pu,ku,b,nv,pv,kv); sweep(spine_wire,profile)",
+      "limits": "GPU exact translation surface A(u)+B(v), <=32 poles/axis; general path sweep uses CPU CAD kernel. No arbitrary GPU moving-frame sweep claim.",
+      "backend": "CUDA control net/evaluation + CAD topology",
+      "pass": true,
+      "test_scope": "sweep: exact translation on GPU, native path sweep on CPU; loft: compatible sections on GPU; offset is an offset definition, not a fitted net",
+      "evidence": {
+        "samples": 81,
+        "max_cad_error_mm": 2.220446049250313e-16,
+        "brep_valid": true,
+        "cad_path_sweep_valid": true
+      }
+    },
+    {
+      "name": "loft_surface",
+      "family": "surface",
+      "source": "cuda/surface_builders.cuh; scripts/cad_ops.py",
+      "entry": "make_loft(record,sections,rows,nv,degree,knots); loft(section_wires,solid=False,tolerance=1e-7)",
+      "limits": "GPU natural cubic interpolation through 2..11 uniformly spaced, compatible nonrational sections; <=32 poles/section. General wires use CPU CAD kernel.",
+      "backend": "CUDA control net/evaluation + CAD topology",
+      "pass": true,
+      "test_scope": "sweep: exact translation on GPU, native path sweep on CPU; loft: compatible sections on GPU; offset is an offset definition, not a fitted net",
+      "evidence": {
+        "samples": 81,
+        "max_cad_error_mm": 3.3306690738754696e-16,
+        "brep_valid": true,
+        "cad_general_loft_valid": true,
+        "interpolated_sections": 4
+      }
+    },
+    {
+      "name": "coons_fill",
+      "family": "surface",
+      "source": "cuda/surface_builders.cuh",
+      "entry": "make_coons(record,c0,c1,d0,d1)",
+      "limits": "Four cubic nonrational Bezier boundaries with matching corners; exact bicubic Coons construction.",
+      "backend": "CUDA control net/evaluation + CAD topology",
+      "pass": true,
+      "test_scope": "sweep: exact translation on GPU, native path sweep on CPU; loft: compatible sections on GPU; offset is an offset definition, not a fitted net",
+      "evidence": {
+        "samples": 81,
+        "max_cad_error_mm": 1.1102230246251565e-16,
+        "brep_valid": true
+      }
+    },
+    {
+      "name": "offset_surface",
+      "family": "surface",
+      "source": "cuda/surface_builders.cuh; cuda/surface_suite.cu",
+      "entry": "make_offset(record,base_id,distance); surface_point(arena,id,u,v)",
+      "limits": "One-level offset of a regular NURBS surface, sampled by its normal; current arena holds 14 objects. STEP retains native offset definition; no global self-intersection guarantee.",
+      "backend": "CUDA control net/evaluation + CAD topology",
+      "pass": true,
+      "test_scope": "sweep: exact translation on GPU, native path sweep on CPU; loft: compatible sections on GPU; offset is an offset definition, not a fitted net",
+      "evidence": {
+        "samples": 81,
+        "max_cad_error_mm": 1.1102230246251565e-16,
+        "brep_valid": true
+      }
+    },
+    {
+      "name": "fill_nside",
+      "family": "surface",
+      "source": "scripts/cad_ops.py",
+      "entry": "fill_nside(edges,orders=None,supports=None,tolerance=1e-7)",
+      "limits": "CPU variational CAD filling; C0/G1/G2 constraints need appropriate support faces. Batch verifies a warped five-edge C0 boundary.",
+      "backend": "CAD kernel",
+      "pass": true,
+      "test_scope": "native boundary constraints C0/G1/G2; five-edge C0 composition is the batch fixture",
+      "evidence": {
+        "boundary_edges": 5,
+        "edge_samples": 45,
+        "max_surface_distance_mm": 8.503608062463635e-08,
+        "valid": true
+      }
+    },
+    {
+      "name": "blend_g1",
+      "family": "continuity",
+      "source": "cuda/surface_builders.cuh",
+      "entry": "make_hermite_blend(record,1,a,b,da,db,dda,ddb,nv,degree,knots)",
+      "limits": "Cubic strip matching compatible rail positions and cross derivatives; derivatives supplied by caller, no automatic global shape optimization.",
+      "backend": "CUDA Hermite control net",
+      "pass": true,
+      "test_scope": "cubic strip with prescribed rail positions and cross derivatives",
+      "evidence": {
+        "samples_per_seam": 33,
+        "max_gap_mm": 0.0,
+        "max_angle_deg": 1.478779333471098e-06,
+        "max_curvature_jump": 0.9896761455934717
+      }
+    },
+    {
+      "name": "blend_g2",
+      "family": "continuity",
+      "source": "cuda/surface_builders.cuh",
+      "entry": "make_hermite_blend(record,2,a,b,da,db,dda,ddb,nv,degree,knots)",
+      "limits": "Quintic strip matching compatible rail positions and first/second cross derivatives; degree V <=5, poles V <=32.",
+      "backend": "CUDA quintic Hermite control net",
+      "pass": true,
+      "test_scope": "quintic strip with prescribed rail positions, first/second cross derivatives",
+      "evidence": {
+        "samples_per_seam": 33,
+        "max_gap_mm": 0.0,
+        "max_angle_deg": 1.478779333471098e-06,
+        "max_curvature_jump": 1.27675647831893e-15
+      }
+    },
+    {
+      "name": "continuity_check",
+      "family": "continuity",
+      "source": "cuda/curve_ops.cuh",
+      "entry": "continuity_metrics(jet_a,jet_b)",
+      "limits": "Regular coincident seam samples. Returns gap, unsigned tangent-plane angle and curvature mismatch in 3 tangent directions; sample evidence is not global Class-A certification.",
+      "backend": "CUDA differential geometry",
+      "pass": true,
+      "test_scope": "sampled geometry, not a global proof of Class-A quality",
+      "evidence": {
+        "distinguishes_G1_from_G2": true,
+        "detects_G0_gap_mm": 0.1,
+        "directions_for_curvature_comparison": 3
+      }
+    },
+    {
+      "name": "curvature",
+      "family": "continuity",
+      "source": "cuda/curve_ops.cuh",
+      "entry": "curvature(jet)",
+      "limits": "Returns Gaussian K, signed mean H and surface Jacobian. Zero Jacobian flags a singular/degenerate point where K/H are not valid.",
+      "backend": "CUDA differential geometry + CAD reference",
+      "pass": true,
+      "test_scope": "regular surface points; singular points require explicit handling",
+      "evidence": {
+        "gaussian": 0.0,
+        "mean": 0.5,
+        "jacobian": 1.6568542494923801
+      }
+    },
+    {
+      "name": "project_curve",
+      "family": "topology",
+      "source": "scripts/cad_ops.py",
+      "entry": "project_curve(curve,surface)",
+      "limits": "CPU normal projection of a native CAD curve; failure raises ValueError.",
+      "backend": "CAD kernel",
+      "pass": true,
+      "test_scope": "B-rep topology executes explicitly on CPU, after GPU batch readback",
+      "evidence": {
+        "samples": 33,
+        "max_plane_residual_mm": 0.0
+      }
+    },
+    {
+      "name": "intersect_surfaces",
+      "family": "topology",
+      "source": "scripts/cad_ops.py",
+      "entry": "intersect_surfaces(a,b,tolerance=1e-7)",
+      "limits": "CPU intersection of native untrimmed surfaces; returns native 3D curves; not a full solid Boolean operation.",
+      "backend": "CAD kernel",
+      "pass": true,
+      "test_scope": "B-rep topology executes explicitly on CPU, after GPU batch readback",
+      "evidence": {
+        "intersection_curves": 1,
+        "samples": 65,
+        "max_equation_residual": 2.220446049250313e-16
+      }
+    },
+    {
+      "name": "trim_surface",
+      "family": "topology",
+      "source": "scripts/cad_ops.py",
+      "entry": "trim_surface(surface,outer,holes=())",
+      "limits": "CPU B-rep construction from simple closed UV polygon loops; straight UV edges, optional holes; caller provides noncrossing loops within the parameter domain.",
+      "backend": "CAD kernel",
+      "pass": true,
+      "test_scope": "B-rep topology executes explicitly on CPU, after GPU batch readback",
+      "evidence": {
+        "plane_area_mm2": 0.6000000000000001,
+        "boundary_loops": 2,
+        "curved_trim_valid": true
+      }
+    },
+    {
+      "name": "split_surface",
+      "family": "topology",
+      "source": "scripts/cad_ops.py",
+      "entry": "split_surface(face,tools)",
+      "limits": "CPU native CAD splitter with caller-supplied tool shapes; result must be a valid B-rep.",
+      "backend": "CAD kernel",
+      "pass": true,
+      "test_scope": "B-rep topology executes explicitly on CPU, after GPU batch readback",
+      "evidence": {
+        "result_faces": 2,
+        "total_area_mm2": 1.0
+      }
+    },
+    {
+      "name": "join_curves",
+      "family": "topology",
+      "source": "scripts/cad_ops.py",
+      "entry": "join_curves(curves,tolerance=1e-7)",
+      "limits": "CPU composite B-spline conversion; ordered, connected compatible native curves; rejects disconnected input.",
+      "backend": "CAD kernel",
+      "pass": true,
+      "test_scope": "B-rep topology executes explicitly on CPU, after GPU batch readback",
+      "evidence": {
+        "degree": 1,
+        "poles": 2,
+        "disconnected_input_rejected": true
+      }
+    },
+    {
+      "name": "sew",
+      "family": "topology",
+      "source": "scripts/cad_ops.py",
+      "entry": "sew_surfaces(faces,tolerance=1e-7,solid=False)",
+      "limits": "CPU face sewing; solid=True requires one closed shell, followed by orientation/validity check; does not union overlapping solids.",
+      "backend": "CAD kernel",
+      "pass": true,
+      "test_scope": "B-rep topology executes explicitly on CPU, after GPU batch readback",
+      "evidence": {
+        "closed_solids": 1,
+        "volume_mm3": 1.0,
+        "G2_composition_faces": 3
+      }
+    },
+    {
+      "name": "box",
+      "family": "polygon",
+      "source": "cuda/polygon_ops.cuh",
+      "entry": "make_box(mesh,minimum,maximum)",
+      "limits": "Axis-aligned finite strict min/max; 8 vertices, 12 triangles.",
+      "backend": "CUDA indexed mesh",
+      "pass": true,
+      "test_scope": "ear clipping: planar simple polygon <=64 corners; inset is fractional; bevel: convex tri-valent polyhedron; welding uses representative tolerance",
+      "evidence": {
+        "vertices": 8,
+        "triangles": 12,
+        "boundary_edges": 0,
+        "euler": 2,
+        "area_mm2": 24.0,
+        "volume_mm3": 8.0,
+        "finite_unit_normals": true
+      }
+    },
+    {
+      "name": "uv_sphere",
+      "family": "polygon",
+      "source": "cuda/polygon_ops.cuh",
+      "entry": "make_uv_sphere(mesh,center,radius,segments,rings)",
+      "limits": "Positive radius; segments>=3, rings>=2; count must fit 4096 vertices/4096 triangles.",
+      "backend": "CUDA indexed mesh",
+      "pass": true,
+      "test_scope": "ear clipping: planar simple polygon <=64 corners; inset is fractional; bevel: convex tri-valent polyhedron; welding uses representative tolerance",
+      "evidence": {
+        "vertices": 266,
+        "triangles": 528,
+        "boundary_edges": 0,
+        "euler": 2,
+        "area_mm2": 12.387741219045768,
+        "volume_mm3": 4.070552360820166,
+        "finite_unit_normals": true
+      }
+    },
+    {
+      "name": "cylinder",
+      "family": "polygon",
+      "source": "cuda/polygon_ops.cuh",
+      "entry": "make_frustum(mesh,origin,r,r,height,segments)",
+      "limits": "Z-aligned closed faceted cylinder; positive radius/height; segments>=3.",
+      "backend": "CUDA indexed mesh",
+      "pass": true,
+      "test_scope": "ear clipping: planar simple polygon <=64 corners; inset is fractional; bevel: convex tri-valent polyhedron; welding uses representative tolerance",
+      "evidence": {
+        "vertices": 50,
+        "triangles": 96,
+        "boundary_edges": 0,
+        "euler": 2,
+        "area_mm2": 18.742171535585452,
+        "volume_mm3": 6.211657082460499,
+        "finite_unit_normals": true
+      }
+    },
+    {
+      "name": "cone",
+      "family": "polygon",
+      "source": "cuda/polygon_ops.cuh",
+      "entry": "make_frustum(mesh,origin,r,0,height,segments)",
+      "limits": "Z-aligned closed cone with one apex; positive bottom radius/height; segments>=3. Same function also supports truncated cones.",
+      "backend": "CUDA indexed mesh",
+      "pass": true,
+      "test_scope": "ear clipping: planar simple polygon <=64 corners; inset is fractional; bevel: convex tri-valent polyhedron; welding uses representative tolerance",
+      "evidence": {
+        "vertices": 26,
+        "triangles": 48,
+        "boundary_edges": 0,
+        "euler": 2,
+        "area_mm2": 10.098654796937861,
+        "volume_mm3": 2.0705523608201664,
+        "finite_unit_normals": true
+      }
+    },
+    {
+      "name": "torus",
+      "family": "polygon",
+      "source": "cuda/polygon_ops.cuh",
+      "entry": "make_torus(mesh,center,major,minor,u_segments,v_segments)",
+      "limits": "Z-axis ring torus; major>minor>0; both segment counts>=3; bounded mesh capacity.",
+      "backend": "CUDA indexed mesh",
+      "pass": true,
+      "test_scope": "ear clipping: planar simple polygon <=64 corners; inset is fractional; bevel: convex tri-valent polyhedron; welding uses representative tolerance",
+      "evidence": {
+        "vertices": 384,
+        "triangles": 768,
+        "boundary_edges": 0,
+        "euler": 0,
+        "area_mm2": 11.68385501214318,
+        "volume_mm3": 1.7115107421534501,
+        "finite_unit_normals": true
+      }
+    },
+    {
+      "name": "grid",
+      "family": "polygon",
+      "source": "cuda/polygon_ops.cuh",
+      "entry": "make_grid(mesh,origin,u,v,u_steps,v_steps,warp)",
+      "limits": "Independent plane vectors; steps>=1; optional sin(pi*u)sin(pi*v) displacement along the plane normal; open mesh.",
+      "backend": "CUDA indexed mesh",
+      "pass": true,
+      "test_scope": "ear clipping: planar simple polygon <=64 corners; inset is fractional; bevel: convex tri-valent polyhedron; welding uses representative tolerance",
+      "evidence": {
+        "vertices": 81,
+        "triangles": 128,
+        "boundary_edges": 32,
+        "euler": 1,
+        "area_mm2": 1.0530348528028046,
+        "volume_mm3": 0.05923627117755042,
+        "finite_unit_normals": true
+      }
+    },
+    {
+      "name": "triangulate_polygon",
+      "family": "polygon",
+      "source": "cuda/polygon_ops.cuh",
+      "entry": "triangulate_polygon(mesh,points,count)",
+      "limits": "Ear clipping of one planar simple convex/concave polygon, 3..64 distinct vertices, no holes or collinear overlaps; absolute geometric tolerances.",
+      "backend": "CUDA indexed mesh",
+      "pass": true,
+      "test_scope": "ear clipping: planar simple polygon <=64 corners; inset is fractional; bevel: convex tri-valent polyhedron; welding uses representative tolerance",
+      "evidence": {
+        "vertices": 6,
+        "triangles": 4,
+        "boundary_edges": 6,
+        "euler": 1,
+        "area_mm2": 3.0,
+        "volume_mm3": 0.0,
+        "finite_unit_normals": true
+      }
+    },
+    {
+      "name": "extrude_face",
+      "family": "polygon",
+      "source": "cuda/polygon_ops.cuh",
+      "entry": "extrude_polygon(mesh,points,count,direction)",
+      "limits": "Fresh destination; one planar simple polygon <=64 corners; positive extrusion dot polygon normal; creates caps and walls.",
+      "backend": "CUDA indexed mesh",
+      "pass": true,
+      "test_scope": "ear clipping: planar simple polygon <=64 corners; inset is fractional; bevel: convex tri-valent polyhedron; welding uses representative tolerance",
+      "evidence": {
+        "vertices": 12,
+        "triangles": 20,
+        "boundary_edges": 0,
+        "euler": 2,
+        "area_mm2": 22.049894254697023,
+        "volume_mm3": 6.0,
+        "finite_unit_normals": true
+      }
+    },
+    {
+      "name": "inset_face",
+      "family": "polygon",
+      "source": "cuda/polygon_ops.cuh",
+      "entry": "inset_polygon(mesh,points,count,fraction)",
+      "limits": "Fresh destination; strictly convex planar polygon <=64; fraction in (0,1); shrinks toward vertex centroid, not constant-distance edge offset.",
+      "backend": "CUDA indexed mesh",
+      "pass": true,
+      "test_scope": "ear clipping: planar simple polygon <=64 corners; inset is fractional; bevel: convex tri-valent polyhedron; welding uses representative tolerance",
+      "evidence": {
+        "vertices": 11,
+        "triangles": 15,
+        "boundary_edges": 5,
+        "euler": 1,
+        "area_mm2": 2.377641290737884,
+        "volume_mm3": 0.0,
+        "finite_unit_normals": true
+      }
+    },
+    {
+      "name": "subdivide",
+      "family": "polygon",
+      "source": "cuda/polygon_ops.cuh",
+      "entry": "subdivide_triangles(source,destination)",
+      "limits": "Fresh separate destination; linear 1-to-4 triangle subdivision and shared-midpoint welding; preserves shape, not Catmull-Clark smoothing.",
+      "backend": "CUDA indexed mesh",
+      "pass": true,
+      "test_scope": "ear clipping: planar simple polygon <=64 corners; inset is fractional; bevel: convex tri-valent polyhedron; welding uses representative tolerance",
+      "evidence": {
+        "vertices": 26,
+        "triangles": 48,
+        "boundary_edges": 0,
+        "euler": 2,
+        "area_mm2": 24.0,
+        "volume_mm3": 8.0,
+        "finite_unit_normals": true
+      }
+    },
+    {
+      "name": "weld",
+      "family": "polygon",
+      "source": "cuda/polygon_ops.cuh",
+      "entry": "weld_vertices(mesh,tolerance)",
+      "limits": "Positive finite tolerance; first representative within radius; O(n^2); does not remove degenerate faces created by a large tolerance.",
+      "backend": "CUDA indexed mesh",
+      "pass": true,
+      "test_scope": "ear clipping: planar simple polygon <=64 corners; inset is fractional; bevel: convex tri-valent polyhedron; welding uses representative tolerance",
+      "evidence": {
+        "vertices": 8,
+        "triangles": 12,
+        "boundary_edges": 0,
+        "euler": 2,
+        "area_mm2": 24.0,
+        "volume_mm3": 8.0,
+        "finite_unit_normals": true
+      }
+    },
+    {
+      "name": "normals",
+      "family": "polygon",
+      "source": "cuda/polygon_ops.cuh",
+      "entry": "mesh_normals(mesh)",
+      "limits": "Area-weighted vertex normals; valid oriented indexed triangles required; sharp edges require split vertices.",
+      "backend": "CUDA indexed mesh",
+      "pass": true,
+      "test_scope": "ear clipping: planar simple polygon <=64 corners; inset is fractional; bevel: convex tri-valent polyhedron; welding uses representative tolerance",
+      "evidence": {
+        "vertices": 384,
+        "triangles": 768,
+        "boundary_edges": 0,
+        "euler": 0,
+        "area_mm2": 11.68385501214318,
+        "volume_mm3": 1.7115107421534501,
+        "finite_unit_normals": true
+      }
+    },
+    {
+      "name": "bevel_vertices",
+      "family": "polygon",
+      "source": "cuda/polygon_ops.cuh",
+      "entry": "bevel_vertices(mesh,points,nv,face_indices,face_offsets,nf,fraction)",
+      "limits": "Vertex truncation of a closed convex tri-valent polyhedron: <=64 vertices, <=96 edges, convex faces <=16 corners; fraction in (0,0.5). Unsupported valence rejected; not general edge filleting.",
+      "backend": "CUDA indexed mesh",
+      "pass": true,
+      "test_scope": "ear clipping: planar simple polygon <=64 corners; inset is fractional; bevel: convex tri-valent polyhedron; welding uses representative tolerance",
+      "evidence": {
+        "vertices": 24,
+        "triangles": 44,
+        "boundary_edges": 0,
+        "euler": 2,
+        "area_mm2": 23.188512516844078,
+        "volume_mm3": 7.914666666666666,
+        "finite_unit_normals": true
+      }
+    },
+    {
+      "name": "translate",
+      "family": "transform",
+      "source": "cuda/surface_primitives.cuh",
+      "entry": "plus(point,translation); affine(point,matrix3x4)",
+      "limits": "Finite coordinates. Apply to control points or mesh vertices; vectors/derivatives omit translation.",
+      "backend": "CUDA point transform",
+      "pass": true,
+      "test_scope": "rotation/mirror accept arbitrary axes/planes; zero normal is outside the valid input domain",
+      "evidence": {
+        "max_reference_error_mm": 0.0
+      }
+    },
+    {
+      "name": "rotate",
+      "family": "transform",
+      "source": "cuda/curve_ops.cuh",
+      "entry": "rotate_axis(point,center,axis,angle)",
+      "limits": "Finite nonzero arbitrary axis; radians; Rodrigues rotation.",
+      "backend": "CUDA point transform",
+      "pass": true,
+      "test_scope": "rotation/mirror accept arbitrary axes/planes; zero normal is outside the valid input domain",
+      "evidence": {
+        "max_reference_error_mm": 4.440892098500626e-16
+      }
+    },
+    {
+      "name": "scale",
+      "family": "transform",
+      "source": "cuda/curve_ops.cuh",
+      "entry": "scale_about(point,center,scale_xyz)",
+      "limits": "Finite component scales; negative scales reflect orientation; caller updates face winding and normals for whole meshes.",
+      "backend": "CUDA point transform",
+      "pass": true,
+      "test_scope": "rotation/mirror accept arbitrary axes/planes; zero normal is outside the valid input domain",
+      "evidence": {
+        "max_reference_error_mm": 0.0
+      }
+    },
+    {
+      "name": "mirror",
+      "family": "transform",
+      "source": "cuda/curve_ops.cuh",
+      "entry": "mirror_plane(point,origin,normal)",
+      "limits": "Finite nonzero arbitrary plane normal; caller updates face winding and normals for whole meshes.",
+      "backend": "CUDA point transform",
+      "pass": true,
+      "test_scope": "rotation/mirror accept arbitrary axes/planes; zero normal is outside the valid input domain",
+      "evidence": {
+        "max_reference_error_mm": 3.3306690738754696e-16
+      }
+    },
+    {
+      "name": "hermite_curve",
+      "family": "curve",
+      "source": "cuda/extended_curves.cuh",
+      "entry": "make_hermite_curve(record,a,b,da,db)",
+      "limits": "Cubic curve with finite endpoint positions and parameter derivatives; ordinary XYZW control points.",
+      "backend": "CUDA construction/evaluation + independent CAD or analytic reference",
+      "pass": true,
+      "evidence": {
+        "gpu_samples": 513,
+        "max_position_error_mm": 1.1102230246251565e-16,
+        "max_derivative_error": 8.881784197001252e-16,
+        "step_representation": "native exact curve definition",
+        "max_step_curve_error_mm": 2.498001805406602e-16
+      }
+    },
+    {
+      "name": "parabola_curve",
+      "family": "curve",
+      "source": "cuda/extended_curves.cuh",
+      "entry": "make_conic_curve(record,1,origin,x,y,focal,0,0,first,last)",
+      "limits": "Positive focal distance; local coordinates (t^2/(4*focal),t); caller supplies orthonormal axes and finite bounded domain.",
+      "backend": "CUDA construction/evaluation + independent CAD or analytic reference",
+      "pass": true,
+      "evidence": {
+        "gpu_samples": 513,
+        "max_position_error_mm": 4.440892098500626e-16,
+        "max_derivative_error": 1.1102230246251565e-16,
+        "step_representation": "native exact curve definition",
+        "max_step_curve_error_mm": 0.0
+      }
+    },
+    {
+      "name": "hyperbola_curve",
+      "family": "curve",
+      "source": "cuda/extended_curves.cuh",
+      "entry": "make_conic_curve(record,2,origin,x,y,a,b,0,first,last)",
+      "limits": "Positive semi-axes; one hyperbola branch (a*cosh(t),b*sinh(t)); bounded parameters must avoid floating-point overflow.",
+      "backend": "CUDA construction/evaluation + independent CAD or analytic reference",
+      "pass": true,
+      "evidence": {
+        "gpu_samples": 513,
+        "max_position_error_mm": 4.440892098500626e-16,
+        "max_derivative_error": 4.440892098500626e-16,
+        "step_representation": "native exact curve definition",
+        "max_step_curve_error_mm": 0.0
+      }
+    },
+    {
+      "name": "helix_curve",
+      "family": "curve",
+      "source": "cuda/extended_curves.cuh",
+      "entry": "make_conic_curve(record,3,origin,x,y,radius,0,pitch,first,last)",
+      "limits": "Circular helix; pitch is axial distance per full turn; finite bounded angle domain; STEP uses a separately error-checked spline approximation.",
+      "backend": "CUDA construction/evaluation + independent CAD or analytic reference",
+      "pass": true,
+      "evidence": {
+        "gpu_samples": 513,
+        "max_position_error_mm": 2.7755575615628914e-16,
+        "max_derivative_error": 2.220446049250313e-16,
+        "step_representation": "interpolated B-spline approximation",
+        "off_grid_samples": 512,
+        "max_step_approximation_error_mm": 9.39293287750256e-10,
+        "step_tolerance_mm": 1e-05
+      }
+    },
+    {
+      "name": "spiral_curve",
+      "family": "curve",
+      "source": "cuda/extended_curves.cuh",
+      "entry": "make_conic_curve(record,4,origin,x,y,r0,slope,0,first,last)",
+      "limits": "Planar Archimedean spiral r=r0+slope*t; strictly positive radius over the domain; STEP spline approximation has measured error.",
+      "backend": "CUDA construction/evaluation + independent CAD or analytic reference",
+      "pass": true,
+      "evidence": {
+        "gpu_samples": 513,
+        "max_position_error_mm": 4.440892098500626e-16,
+        "max_derivative_error": 4.440892098500626e-16,
+        "step_representation": "interpolated B-spline approximation",
+        "off_grid_samples": 512,
+        "max_step_approximation_error_mm": 1.2771765688931787e-09,
+        "step_tolerance_mm": 1e-05
+      }
+    },
+    {
+      "name": "three_point_arc",
+      "family": "curve",
+      "source": "cuda/extended_curves.cuh",
+      "entry": "make_three_point_arc(record,a,middle,b)",
+      "limits": "Three distinct noncollinear 3D points; arc passes through the middle point; absolute degeneracy threshold 1e-20 on squared cross product.",
+      "backend": "CUDA construction/evaluation + independent CAD or analytic reference",
+      "pass": true,
+      "evidence": {
+        "gpu_samples": 513,
+        "max_position_error_mm": 8.881784197001252e-16,
+        "max_derivative_error": 5.551115123125783e-16,
+        "step_representation": "native exact curve definition",
+        "max_step_curve_error_mm": 9.930136612989092e-16
+      }
+    },
+    {
+      "name": "interpolate_curve",
+      "family": "curve",
+      "source": "cuda/extended_curves.cuh",
+      "entry": "make_interpolating_curve(record,points,count)",
+      "limits": "Natural cubic interpolation through 2..11 finite points, uniform parameters; <=31 poles; not chord-length or periodic interpolation.",
+      "backend": "CUDA construction/evaluation + independent CAD or analytic reference",
+      "pass": true,
+      "evidence": {
+        "gpu_samples": 513,
+        "max_position_error_mm": 4.440892098500626e-16,
+        "max_derivative_error": 5.062616992290714e-14,
+        "step_representation": "native exact curve definition",
+        "max_step_curve_error_mm": 4.440892098500626e-16,
+        "interpolation_points": 5
+      }
+    },
+    {
+      "name": "curve_reverse",
+      "family": "curve_operation",
+      "source": "cuda/extended_curves.cuh",
+      "entry": "reverse_curve_jet(base,t)",
+      "limits": "Reverses parameter domain and first derivative; second derivative is preserved; base kinds 0..6.",
+      "backend": "CUDA curve jet reversal",
+      "pass": true,
+      "evidence": {
+        "gpu_samples": 513,
+        "max_position_error_mm": 4.440892098500626e-16,
+        "max_derivative_error": 5.062616992290714e-14,
+        "step_representation": "native exact curve definition",
+        "max_step_curve_error_mm": 4.440892098500626e-16
+      }
+    },
+    {
+      "name": "curve_length",
+      "family": "curve_operation",
+      "source": "cuda/extended_curves.cuh",
+      "entry": "curve_arc_length(record,first,last,panels)",
+      "limits": "Composite five-point Gaussian quadrature of speed; positive panel count and regular finite base curve required; numerical estimate, not certified adaptive integration.",
+      "backend": "CUDA quadrature + independent CAD/analytic lengths",
+      "pass": true,
+      "evidence": {
+        "curves": 8,
+        "max_independent_length_error_mm": 4.014566457044566e-13,
+        "invalid_inputs_rejected": 8
+      }
+    },
+    {
+      "name": "resample_curve",
+      "family": "curve_operation",
+      "source": "cuda/extended_curves.cuh",
+      "entry": "curve_distance_parameter(record,fraction)",
+      "limits": "Numerical arc-length inversion by bisection, fraction in [0,1]; regular nonzero-length base curve; fixed integration work bounds accuracy.",
+      "backend": "CUDA arc-length inversion",
+      "pass": true,
+      "evidence": {
+        "points": 65,
+        "max_arc_length_spacing_error_mm": 4.1744385725905886e-13,
+        "nonuniform_parameters_confirmed": true
+      }
+    },
+    {
+      "name": "closest_point_curve",
+      "family": "curve_operation",
+      "source": "cuda/extended_curves.cuh",
+      "entry": "closest_curve_parameter(record,query)",
+      "limits": "128-interval coarse basin selection plus golden-section refinement and endpoint checks; approximate nearest point, not a global proof for arbitrary oscillatory/self-crossing curves.",
+      "backend": "CUDA bounded search + CAD projector",
+      "pass": true,
+      "evidence": {
+        "max_cad_point_error_mm": 1.4284976534995053e-09,
+        "distance_mm": 0.2910351839531674,
+        "parameter": -0.7592107227427038
+      }
+    },
+    {
+      "name": "planar_offset_curve",
+      "family": "curve_operation",
+      "source": "cuda/extended_curves.cuh",
+      "entry": "planar_curve_offset(jet,normal,distance)",
+      "limits": "Regular planar curve with nonzero plane normal; left offset normal=cross(normal,tangent); returns a point, not offset derivatives; no self-intersection cleanup.",
+      "backend": "CUDA point offset + native CAD offset",
+      "pass": true,
+      "evidence": {
+        "gpu_samples": 513,
+        "max_position_error_mm": 4.440892098500626e-16,
+        "step_representation": "interpolated B-spline approximation",
+        "off_grid_samples": 512,
+        "max_step_approximation_error_mm": 4.767770012771998e-10,
+        "step_tolerance_mm": 1e-05
+      }
+    },
+    {
+      "name": "solid_sphere",
+      "family": "solid",
+      "source": "cuda/extended_solids.cuh; scripts/cad_solids.py",
+      "entry": "make_solid_definition(record,0,r,0,0,0,origin,x,y); solid_from_definition(record)",
+      "limits": "Positive radius; GPU definition/mesh and exact analytic CPU B-rep topology; orthonormal right-handed frame.",
+      "backend": "CUDA definition/mesh + native CPU CAD solid",
+      "pass": true,
+      "evidence": {
+        "brep_valid": true,
+        "closed_solids": 1,
+        "faces": 1,
+        "vertices": 1106,
+        "mesh_triangles": 2208,
+        "analytic_volume_mm3": 7.238229473870882,
+        "cad_volume_mm3": 7.238229473870887,
+        "cad_relative_volume_error": 7.362395095980364e-16,
+        "mesh_relative_volume_error": 0.007118706592496643,
+        "cad_area_mm2": 18.095573684677195
+      }
+    },
+    {
+      "name": "solid_ellipsoid",
+      "family": "solid",
+      "source": "cuda/extended_solids.cuh; scripts/cad_solids.py",
+      "entry": "make_solid_definition(record,1,rx,ry,rz,0,origin,x,y); solid_from_definition(record)",
+      "limits": "Three positive radii; affine-transformed exact spherical B-rep represented as rational surfaces; GPU faceted preview is separate.",
+      "backend": "CUDA definition/mesh + native CPU CAD solid",
+      "pass": true,
+      "evidence": {
+        "brep_valid": true,
+        "closed_solids": 1,
+        "faces": 1,
+        "vertices": 1106,
+        "mesh_triangles": 2208,
+        "analytic_volume_mm3": 5.160589532296834,
+        "cad_volume_mm3": 5.160589611572276,
+        "cad_relative_volume_error": 1.536170271140989e-08,
+        "mesh_relative_volume_error": 0.007118706592496895,
+        "cad_area_mm2": 15.061816738075066
+      }
+    },
+    {
+      "name": "solid_cylinder",
+      "family": "solid",
+      "source": "cuda/extended_solids.cuh; scripts/cad_solids.py",
+      "entry": "make_solid_definition(record,2,r,height,0,0,origin,x,y); solid_from_definition(record)",
+      "limits": "Positive radius/height; closed analytic side and planar caps; local axis Z=cross(X,Y).",
+      "backend": "CUDA definition/mesh + native CPU CAD solid",
+      "pass": true,
+      "evidence": {
+        "brep_valid": true,
+        "closed_solids": 1,
+        "faces": 3,
+        "vertices": 98,
+        "mesh_triangles": 192,
+        "analytic_volume_mm3": 4.624424386084176,
+        "cad_volume_mm3": 4.624424386084176,
+        "cad_relative_volume_error": 0.0,
+        "mesh_relative_volume_error": 0.002853342650362861,
+        "cad_area_mm2": 15.582299561805371
+      }
+    },
+    {
+      "name": "solid_cone",
+      "family": "solid",
+      "source": "cuda/extended_solids.cuh; scripts/cad_solids.py",
+      "entry": "make_solid_definition(record,3,r,height,0,0,origin,x,y); solid_from_definition(record)",
+      "limits": "Positive base radius/height, one apex; closed exact conical B-rep.",
+      "backend": "CUDA definition/mesh + native CPU CAD solid",
+      "pass": true,
+      "evidence": {
+        "brep_valid": true,
+        "closed_solids": 1,
+        "faces": 2,
+        "vertices": 50,
+        "mesh_triangles": 96,
+        "analytic_volume_mm3": 2.5132741228718345,
+        "cad_volume_mm3": 2.513274122871834,
+        "cad_relative_volume_error": 1.7669748230352872e-16,
+        "mesh_relative_volume_error": 0.0028533426503630607,
+        "cad_area_mm2": 11.309733552923255
+      }
+    },
+    {
+      "name": "solid_frustum",
+      "family": "solid",
+      "source": "cuda/extended_solids.cuh; scripts/cad_solids.py",
+      "entry": "make_solid_definition(record,4,r_bottom,r_top,height,0,origin,x,y); solid_from_definition(record)",
+      "limits": "Positive radii/height; fixture uses unequal radii; equal radii should use cylinder rather than OCCT cone builder.",
+      "backend": "CUDA definition/mesh + native CPU CAD solid",
+      "pass": true,
+      "evidence": {
+        "brep_valid": true,
+        "closed_solids": 1,
+        "faces": 3,
+        "vertices": 98,
+        "mesh_triangles": 192,
+        "analytic_volume_mm3": 3.999247448019807,
+        "cad_volume_mm3": 3.999247448019807,
+        "cad_relative_volume_error": 0.0,
+        "mesh_relative_volume_error": 0.0028533426503628938,
+        "cad_area_mm2": 14.602051701729682
+      }
+    },
+    {
+      "name": "solid_torus",
+      "family": "solid",
+      "source": "cuda/extended_solids.cuh; scripts/cad_solids.py",
+      "entry": "make_solid_definition(record,5,major,minor,0,0,origin,x,y); solid_from_definition(record)",
+      "limits": "Ring torus major>minor>0; exact native toroidal B-rep, separate GPU preview mesh.",
+      "backend": "CUDA definition/mesh + native CPU CAD solid",
+      "pass": true,
+      "evidence": {
+        "brep_valid": true,
+        "closed_solids": 1,
+        "faces": 1,
+        "vertices": 1152,
+        "mesh_triangles": 2304,
+        "analytic_volume_mm3": 3.3852743095736493,
+        "cad_volume_mm3": 3.3852743095736506,
+        "cad_relative_volume_error": 3.9354791007112724e-16,
+        "mesh_relative_volume_error": 0.014204930531002576,
+        "cad_area_mm2": 19.344424626135147
+      }
+    },
+    {
+      "name": "solid_capsule",
+      "family": "solid",
+      "source": "cuda/extended_solids.cuh; scripts/cad_solids.py",
+      "entry": "make_solid_definition(record,6,r,cylinder_height,0,0,origin,x,y); solid_from_definition(record)",
+      "limits": "Positive radius/cylinder height; hemispherical ends, exact revolved CAD profile and bounded GPU latitude mesh.",
+      "backend": "CUDA definition/mesh + native CPU CAD solid",
+      "pass": true,
+      "evidence": {
+        "brep_valid": true,
+        "closed_solids": 1,
+        "faces": 3,
+        "vertices": 770,
+        "mesh_triangles": 1536,
+        "analytic_volume_mm3": 3.1413308542019944,
+        "cad_volume_mm3": 3.1413308542019935,
+        "cad_relative_volume_error": 2.82739533313422e-16,
+        "mesh_relative_volume_error": 0.00636149214940257,
+        "cad_area_mm2": 11.435397259066846
+      }
+    },
+    {
+      "name": "solid_prism",
+      "family": "solid",
+      "source": "cuda/extended_solids.cuh; scripts/cad_solids.py",
+      "entry": "make_solid_definition(record,7,circumradius,height,0,sides,origin,x,y); solid_from_definition(record)",
+      "limits": "Regular polygon prism, integer sides 3..64; positive circumradius/height; exact planar CAD faces.",
+      "backend": "CUDA definition/mesh + native CPU CAD solid",
+      "pass": true,
+      "evidence": {
+        "brep_valid": true,
+        "closed_solids": 1,
+        "faces": 8,
+        "vertices": 12,
+        "mesh_triangles": 20,
+        "analytic_volume_mm3": 4.676537180435969,
+        "cad_volume_mm3": 4.67653718043597,
+        "cad_relative_volume_error": 1.8992224063047544e-16,
+        "mesh_relative_volume_error": 1.8992224063047544e-16,
+        "cad_area_mm2": 15.996152422706633
+      }
+    },
+    {
+      "name": "solid_pyramid",
+      "family": "solid",
+      "source": "cuda/extended_solids.cuh; scripts/cad_solids.py",
+      "entry": "make_solid_definition(record,8,circumradius,height,0,sides,origin,x,y); solid_from_definition(record)",
+      "limits": "Regular polygon base with centered apex, sides 3..64; exact planar CAD faces; not a general arbitrary-base pyramid.",
+      "backend": "CUDA definition/mesh + native CPU CAD solid",
+      "pass": true,
+      "evidence": {
+        "brep_valid": true,
+        "closed_solids": 1,
+        "faces": 6,
+        "vertices": 6,
+        "mesh_triangles": 8,
+        "analytic_volume_mm3": 1.6302693783492757,
+        "cad_volume_mm3": 1.6302693783492754,
+        "cad_relative_volume_error": 1.3620117501677048e-16,
+        "mesh_relative_volume_error": 4.0860352505031146e-16,
+        "cad_area_mm2": 9.080215178238646
+      }
+    },
+    {
+      "name": "solid_wedge",
+      "family": "solid",
+      "source": "cuda/extended_solids.cuh; scripts/cad_solids.py",
+      "entry": "make_solid_definition(record,9,width,depth,height,top_width,origin,x,y); solid_from_definition(record)",
+      "limits": "Positive sizes and 0<top_width<width; one sloped side, rectangular bottom/top and trapezoidal end faces.",
+      "backend": "CUDA definition/mesh + native CPU CAD solid",
+      "pass": true,
+      "evidence": {
+        "brep_valid": true,
+        "closed_solids": 1,
+        "faces": 6,
+        "vertices": 8,
+        "mesh_triangles": 12,
+        "analytic_volume_mm3": 2.5920000000000005,
+        "cad_volume_mm3": 2.592,
+        "cad_relative_volume_error": 1.7133071367672166e-16,
+        "mesh_relative_volume_error": 0.0,
+        "cad_area_mm2": 11.953863375370599
+      }
+    },
+    {
+      "name": "bend",
+      "family": "deformation",
+      "source": "cuda/modeling_operations.cuh",
+      "entry": "bend_point(point,radius)",
+      "limits": "Local X bends into XZ about Y; radius>0 and radius+Z>0; caller constrains angle to avoid overlaps. STEP mesh fixture is faceted, not an exact deformed NURBS claim.",
+      "backend": "CUDA point deformation + independent invariants",
+      "pass": true,
+      "evidence": {
+        "vertices": 258,
+        "triangles": 512,
+        "max_mapping_error_mm": 4.440892098500626e-16,
+        "mesh_volume_mm3": 1.4399194957752164,
+        "analytic_deformation_volume_mm3": 1.44,
+        "representation": "faceted B-rep at sampled stations"
+      }
+    },
+    {
+      "name": "twist",
+      "family": "deformation",
+      "source": "cuda/modeling_operations.cuh",
+      "entry": "twist_point(point,radians_per_length)",
+      "limits": "Rotation about local Z by rate*Z; geometry may self-intersect for excessive deformation. Mesh STEP is faceted.",
+      "backend": "CUDA point deformation + independent invariants",
+      "pass": true,
+      "evidence": {
+        "vertices": 258,
+        "triangles": 512,
+        "max_mapping_error_mm": 4.440892098500626e-16,
+        "mesh_volume_mm3": 1.4181372388770166,
+        "analytic_deformation_volume_mm3": 1.44,
+        "representation": "faceted B-rep at sampled stations"
+      }
+    },
+    {
+      "name": "taper",
+      "family": "deformation",
+      "source": "cuda/modeling_operations.cuh",
+      "entry": "taper_point(point,rate)",
+      "limits": "Local XY scale=1+rate*Z; strictly positive scale required; mesh STEP is faceted.",
+      "backend": "CUDA point deformation + independent invariants",
+      "pass": true,
+      "evidence": {
+        "vertices": 258,
+        "triangles": 512,
+        "max_mapping_error_mm": 4.440892098500626e-16,
+        "mesh_volume_mm3": 1.474992,
+        "analytic_deformation_volume_mm3": 1.474992,
+        "representation": "faceted B-rep at sampled stations"
+      }
+    },
+    {
+      "name": "sweep_path",
+      "family": "surface",
+      "source": "cuda/modeling_operations.cuh",
+      "entry": "make_path_sweep(record,mesh,path,tangents,count,profile,sides,initial_normal)",
+      "limits": "2..32 stations; convex origin-containing CCW profile with 3..31 corners; discrete parallel transport, no antiparallel tangents. Exact piecewise bilinear GPU net exported to CAD; not a certified continuous RMF solver.",
+      "backend": "CUDA discrete parallel transport and control net + CPU caps/sew",
+      "pass": true,
+      "evidence": {
+        "stations": 17,
+        "profile_corners": 8,
+        "max_gpu_cad_error_mm": 0.0,
+        "native_closed_solids": 1,
+        "cad_volume_mm3": 0.7424129270663699
+      }
+    },
+    {
+      "name": "loft_chordal",
+      "family": "surface",
+      "source": "cuda/modeling_operations.cuh",
+      "entry": "make_chordal_loft(record,sections,rows,nv,degree,knots)",
+      "limits": "2..11 compatible nonrational sections; centroid chord parameters, natural cubic C2 interpolation. Coincident adjacent centroids rejected.",
+      "backend": "CUDA nonuniform natural cubic solve + independent dense solve",
+      "pass": true,
+      "evidence": {
+        "sections": 4,
+        "centroid_chord_parameters": [
+          0.0,
+          0.1991193166358952,
+          0.666051686279767,
+          1.0
+        ],
+        "C2_internal_seams": 2,
+        "max_reference_error_mm": 8.881784197001252e-16,
+        "max_gpu_cad_error_mm": 6.661338147750939e-16
+      }
+    },
+    {
+      "name": "catmull_clark",
+      "family": "mesh_operation",
+      "source": "cuda/modeling_operations.cuh",
+      "entry": "catmull_clark(destination,points,nv,quad_indices,nf)",
+      "limits": "One step on closed consistently oriented manifold quads, <=128 vertices/faces, <=256 edges; fresh destination; boundary/crease rules are separate operations.",
+      "backend": "CUDA quad smoothing subdivision",
+      "pass": true,
+      "evidence": {
+        "vertices": 26,
+        "triangles": 48,
+        "matches_original_Catmull_Clark_rules": true
+      }
+    },
+    {
+      "name": "loop_subdivide",
+      "family": "mesh_operation",
+      "source": "cuda/modeling_operations.cuh",
+      "entry": "loop_subdivide(destination,points,nv,triangle_indices,nt)",
+      "limits": "One original Loop step, closed consistently oriented manifold triangles; <=128 vertices, <=256 triangles, <=384 edges; fresh destination.",
+      "backend": "CUDA triangle smoothing subdivision",
+      "pass": true,
+      "evidence": {
+        "vertices": 10,
+        "triangles": 16,
+        "matches_original_Loop_rules": true
+      }
+    },
+    {
+      "name": "resample_grid",
+      "family": "resampling",
+      "source": "cuda/modeling_operations.cuh",
+      "entry": "resample_grid(destination,points,nu,nv,u_steps,v_steps)",
+      "limits": "Bilinear sampling of a 2..32 by 2..32 source grid; output within bounded mesh capacity; preserves bilinear geometry, no curvature reconstruction.",
+      "backend": "CUDA bilinear grid resampling",
+      "pass": true,
+      "evidence": {
+        "vertices": 221,
+        "triangles": 384,
+        "boundary_edges": 56,
+        "max_bilinear_error_mm": 1.1102230246251565e-16
+      }
+    },
+    {
+      "name": "resample_polyline",
+      "family": "resampling",
+      "source": "cuda/modeling_operations.cuh",
+      "entry": "resample_polyline(output,samples,points,count)",
+      "limits": "Uniform accumulated chord distance, 2..128 finite input points, 2..4096 outputs; zero-length adjacent segments rejected.",
+      "backend": "CUDA accumulated chord-distance resampling",
+      "pass": true,
+      "evidence": {
+        "output_points": 65,
+        "total_polyline_length_mm": 5.0,
+        "max_reference_error_mm": 0.0,
+        "invalid_inputs_rejected": 7
+      }
+    },
+    {
+      "name": "boolean_union",
+      "family": "topology",
+      "source": "scripts/cad_topology_operations.py",
+      "entry": "boolean_union(a,b)",
+      "limits": "CPU OCCT fuse of valid native B-reps; no GPU Boolean claim; failures raise.",
+      "backend": "CPU native CAD Boolean",
+      "pass": true,
+      "evidence": {
+        "valid": true,
+        "closed_solids": 1,
+        "volume_mm3": 9,
+        "empty_intersection_checked": false
+      }
+    },
+    {
+      "name": "boolean_cut",
+      "family": "topology",
+      "source": "scripts/cad_topology_operations.py",
+      "entry": "boolean_cut(a,b)",
+      "limits": "CPU native A minus B; input topology must be valid; the result may legitimately be empty.",
+      "backend": "CPU native CAD Boolean",
+      "pass": true,
+      "evidence": {
+        "valid": true,
+        "closed_solids": 1,
+        "volume_mm3": 7,
+        "empty_intersection_checked": false
+      }
+    },
+    {
+      "name": "boolean_common",
+      "family": "topology",
+      "source": "scripts/cad_topology_operations.py",
+      "entry": "boolean_common(a,b)",
+      "limits": "CPU native intersection, including valid empty intersection; distinct from untrimmed surface intersection.",
+      "backend": "CPU native CAD Boolean",
+      "pass": true,
+      "evidence": {
+        "valid": true,
+        "closed_solids": 1,
+        "volume_mm3": 1,
+        "empty_intersection_checked": true
+      }
+    },
+    {
+      "name": "delete_faces",
+      "family": "topology",
+      "source": "cuda/topology_operations.cuh; scripts/cad_topology_operations.py",
+      "entry": "delete_triangles(mesh,mask,count); delete_cad_faces(shell,faces)",
+      "limits": "GPU triangle-mask deletion compacts triangles but leaves vertex storage; CAD deletion takes an open/closed shell, not a solid that would become invalid. Does not automatically cap holes.",
+      "backend": "CUDA triangle mask + native CAD shell-face deletion",
+      "pass": true,
+      "evidence": {
+        "gpu_triangles": 10,
+        "gpu_boundary_edges": 4,
+        "native_open_faces": 5,
+        "native_area_mm2": 20.0
+      }
+    },
+    {
+      "name": "fill_hole",
+      "family": "topology",
+      "source": "cuda/topology_operations.cuh; scripts/cad_topology_operations.py",
+      "entry": "fill_planar_hole(mesh,oriented_loop,count); cap_planar_wire(wire)",
+      "limits": "Single simple planar boundary, <=64 mesh vertices; loop opposes remaining halfedges; 1e-12 weld tolerance. Native planar cap can then be sewn. Curved filling uses the separate fill_nside primitive.",
+      "backend": "CUDA oriented boundary filling + native planar cap/sew",
+      "pass": true,
+      "evidence": {
+        "gpu_vertices_after_weld": 8,
+        "gpu_closed_volume_mm3": 8.0,
+        "native_cap_sew_volume_mm3": 8.0
+      }
+    },
+    {
+      "name": "revolve_profile",
+      "family": "solid",
+      "source": "cuda/topology_operations.cuh; scripts/cad_topology_operations.py",
+      "entry": "revolve_profile(mesh,profile,count,segments); revolve_face(face,origin,axis,angle)",
+      "limits": "GPU full 2pi revolution of a simple CCW closed positive-radius RZ profile, <=32 corners. Native CAD supports a planar closed face and arbitrary axis/angle; mesh is a separate faceted preview.",
+      "backend": "CUDA profile revolution + exact native CAD revolve",
+      "pass": true,
+      "evidence": {
+        "profile_vertices": 4,
+        "angular_stations": 48,
+        "native_volume_mm3": 3.392920065876977,
+        "native_closed_solids": 1,
+        "mesh_relative_volume_error": 0.0028533426503633288
+      }
+    },
+    {
+      "name": "smooth_laplacian",
+      "family": "mesh_operation",
+      "source": "cuda/topology_operations.cuh",
+      "entry": "laplacian_smooth(mesh,iterations,lambda)",
+      "limits": "Uniform adjacency Laplacian, <=512 vertices/1024 triangles, 1..64 iterations, 0<lambda<1; boundaries move and volume can shrink.",
+      "backend": "CUDA uniform adjacency smoothing + dense matrix reference",
+      "pass": true,
+      "evidence": {
+        "iterations": 6,
+        "max_matrix_reference_error_mm": 1.1102230246251565e-16,
+        "mean_radius_before_mm": 1.0,
+        "mean_radius_after_mm": 0.872174982540964,
+        "topology_preserved": true,
+        "volume_mm3": 2.5359491273142263
+      }
+    },
+    {
+      "name": "smooth_taubin",
+      "family": "mesh_operation",
+      "source": "cuda/topology_operations.cuh",
+      "entry": "taubin_smooth(mesh,iterations,lambda,mu)",
+      "limits": "Alternating lambda/mu uniform Laplacian, -1<mu<0; bounded mesh as above. Reduces shrinkage in the fixture but does not guarantee exact volume preservation.",
+      "backend": "CUDA two-pass smoothing + dense matrix reference",
+      "pass": true,
+      "evidence": {
+        "iterations": 6,
+        "max_matrix_reference_error_mm": 5.551115123125783e-16,
+        "mean_radius_before_mm": 1.0,
+        "mean_radius_after_mm": 1.0004281929490053,
+        "topology_preserved": true,
+        "volume_mm3": 3.9280682016829025
+      }
+    },
+    {
+      "name": "knot_insert",
+      "family": "curve_edit",
+      "entry": "cad_advanced.knot_insert",
+      "limits": "Exact interior B-spline insertion; nonperiodic tested.",
+      "source": "cad_advanced.knot_insert",
+      "backend": "CPU OCCT / constrained NumPy fit",
+      "pass": true,
+      "evidence": {
+        "poles_before": 4,
+        "poles_after": 5,
+        "max_geometry_error_mm": 4.440892098500626e-16,
+        "invalid_domain_rejected": true
+      }
+    },
+    {
+      "name": "knot_remove",
+      "family": "curve_edit",
+      "entry": "cad_advanced.knot_remove",
+      "limits": "Native removal with a requested tolerance; can reject removal.",
+      "source": "cad_advanced.knot_remove",
+      "backend": "CPU OCCT / constrained NumPy fit",
+      "pass": true,
+      "evidence": {
+        "poles_after": 4,
+        "max_geometry_error_mm": 0.0
+      }
+    },
+    {
+      "name": "degree_elevate",
+      "family": "curve_edit",
+      "entry": "cad_advanced.degree_elevate",
+      "limits": "Exact B-spline degree elevation to <=25.",
+      "source": "cad_advanced.degree_elevate",
+      "backend": "CPU OCCT / constrained NumPy fit",
+      "pass": true,
+      "evidence": {
+        "degree_before": 3,
+        "degree_after": 5,
+        "max_geometry_error_mm": 2.220446049250313e-16
+      }
+    },
+    {
+      "name": "degree_reduce",
+      "family": "curve_edit",
+      "entry": "cad_advanced.degree_reduce",
+      "limits": "Single nonrational Bezier span; constrained LS and 2048 off-grid checks, sampled error only.",
+      "source": "cad_advanced.degree_reduce",
+      "backend": "CPU OCCT / constrained NumPy fit",
+      "pass": true,
+      "evidence": {
+        "sampled_max_error_mm": 6.690187733356917e-16,
+        "off_grid_samples": 2048,
+        "certified_bound": false,
+        "rejected_excess_error": true
+      }
+    },
+    {
+      "name": "curve_split",
+      "family": "curve_edit",
+      "entry": "cad_advanced.curve_split",
+      "limits": "Exact two-way split strictly inside the domain.",
+      "source": "cad_advanced.curve_split",
+      "backend": "CPU OCCT / constrained NumPy fit",
+      "pass": true,
+      "evidence": {
+        "max_left_error_mm": 5.551115123125783e-16,
+        "max_right_error_mm": 6.661338147750939e-16
+      }
+    },
+    {
+      "name": "curve_reparameterize",
+      "family": "curve_edit",
+      "entry": "cad_advanced.reparameterize",
+      "limits": "Affine increasing finite domain map.",
+      "source": "cad_advanced.reparameterize",
+      "backend": "CPU OCCT / constrained NumPy fit",
+      "pass": true,
+      "evidence": {
+        "domain": [
+          -2,
+          5
+        ],
+        "max_geometry_error_mm": 0.0
+      }
+    },
+    {
+      "name": "fit_curve",
+      "family": "curve_edit",
+      "entry": "cad_advanced.fit_curve",
+      "limits": "Nonperiodic cubic least squares, chord parameters, fixed endpoints.",
+      "source": "cad_advanced.fit_curve",
+      "backend": "CPU OCCT / constrained NumPy fit",
+      "pass": true,
+      "evidence": {
+        "max_sample_residual_mm": 0.014956998219547801,
+        "pole_second_difference_energy": 0.03267742610440238
+      }
+    },
+    {
+      "name": "fair_curve",
+      "family": "curve_edit",
+      "entry": "cad_advanced.fair_curve",
+      "limits": "Penalized second control-pole differences; fixed endpoints, no interpolation promise.",
+      "source": "cad_advanced.fair_curve",
+      "backend": "CPU OCCT / constrained NumPy fit",
+      "pass": true,
+      "evidence": {
+        "max_sample_residual_mm": 0.02283748344785027,
+        "pole_second_difference_energy": 0.019986116195230327
+      }
+    },
+    {
+      "name": "sweep_guided",
+      "family": "advanced_sweep_loft",
+      "entry": "cuda/advanced_operations.cuh:sweep_sections",
+      "limits": "CUDA projected guide rail defines profile frame; nonzero projected rail required.",
+      "source": "cuda/advanced_operations.cuh",
+      "backend": "CUDA frame/profile construction + CPU native B-spline sheet",
+      "pass": true,
+      "evidence": {
+        "stations": 25,
+        "profile_corners": 8,
+        "max_gpu_native_D1_error": 6.661338147750939e-15,
+        "closed_frame_seam_checked": false,
+        "native_valid": true
+      }
+    },
+    {
+      "name": "sweep_scaled",
+      "family": "advanced_sweep_loft",
+      "entry": "cuda/advanced_operations.cuh:sweep_sections",
+      "limits": "CUDA positive scalar per path station; <=32 stations and <=31 corners.",
+      "source": "cuda/advanced_operations.cuh",
+      "backend": "CUDA frame/profile construction + CPU native B-spline sheet",
+      "pass": true,
+      "evidence": {
+        "stations": 25,
+        "profile_corners": 8,
+        "max_gpu_native_D1_error": 5.995204332975845e-15,
+        "closed_frame_seam_checked": false,
+        "native_valid": true
+      }
+    },
+    {
+      "name": "sweep_variable",
+      "family": "advanced_sweep_loft",
+      "entry": "cuda/advanced_operations.cuh:sweep_sections",
+      "limits": "CUDA compatible polygon profile per station; bilinear side sheet, no self-intersection guarantee.",
+      "source": "cuda/advanced_operations.cuh",
+      "backend": "CUDA frame/profile construction + CPU native B-spline sheet",
+      "pass": true,
+      "evidence": {
+        "stations": 25,
+        "profile_corners": 8,
+        "max_gpu_native_D1_error": 5.995204332975845e-15,
+        "closed_frame_seam_checked": false,
+        "native_valid": true
+      }
+    },
+    {
+      "name": "sweep_closed",
+      "family": "advanced_sweep_loft",
+      "entry": "cuda/advanced_operations.cuh:sweep_sections",
+      "limits": "CUDA RMF holonomy distributed by chord length; duplicate endpoint/profile/scale; G0 closed seam, no continuous G1 guarantee.",
+      "source": "cuda/advanced_operations.cuh",
+      "backend": "CUDA frame/profile construction + CPU native B-spline sheet",
+      "pass": true,
+      "evidence": {
+        "stations": 25,
+        "profile_corners": 8,
+        "max_gpu_native_D1_error": 3.1086244689504383e-15,
+        "closed_frame_seam_checked": true,
+        "native_valid": true
+      }
+    },
+    {
+      "name": "loft_compatible",
+      "family": "advanced_sweep_loft",
+      "entry": "cad_advanced.compatible_sections + cad_ops.loft",
+      "limits": "Exact degree/knot/domain harmonization then native loft; caller supplies matching orientation/correspondence.",
+      "source": "cad_advanced.compatible_sections + cad_ops.loft",
+      "backend": "CPU exact B-spline compatibility + native loft",
+      "pass": true,
+      "evidence": {
+        "harmonized_degree": 5,
+        "harmonized_poles": 7,
+        "original_geometry_preserved": true,
+        "native_loft_valid": true
+      }
+    },
+    {
+      "name": "surface_extend",
+      "family": "surface_edit",
+      "entry": "cad_advanced.extend_bezier_u",
+      "limits": "Exact polynomial U extrapolation of a nonrational Bezier patch with original [0,1] domain.",
+      "source": "cad_advanced.extend_bezier_u",
+      "backend": "CUDA control net / CPU OCCT surface and independent NumPy reference",
+      "pass": true,
+      "evidence": {
+        "old_domain_sampled": [
+          -0.2,
+          1.2
+        ],
+        "max_polynomial_extension_error_mm": 5.551115123125783e-16
+      }
+    },
+    {
+      "name": "surface_untrim",
+      "family": "surface_edit",
+      "entry": "cad_advanced.untrim_surface",
+      "limits": "Rebuild the natural support-domain face; does not restore discarded upstream geometry.",
+      "source": "cad_advanced.untrim_surface",
+      "backend": "CUDA control net / CPU OCCT surface and independent NumPy reference",
+      "pass": true,
+      "evidence": {
+        "trimmed_area_mm2": 0.36513591770651044,
+        "restored_natural_area_mm2": 1.0169562131056475
+      }
+    },
+    {
+      "name": "surface_replace",
+      "family": "surface_edit",
+      "entry": "cad_advanced.replace_surface_face",
+      "limits": "Isolated untrimmed rectangular patch, matching sampled boundary; arbitrary solid-face replacement excluded.",
+      "source": "cad_advanced.replace_surface_face",
+      "backend": "CUDA control net / CPU OCCT surface and independent NumPy reference",
+      "pass": true,
+      "evidence": {
+        "valid": true,
+        "boundary_preserved": true,
+        "changed_interior_z_mm": 0.15,
+        "boundary_mismatch_rejected": true
+      }
+    },
+    {
+      "name": "match_g1",
+      "family": "surface_edit",
+      "entry": "cuda/advanced_operations.cuh:match_bezier_boundary",
+      "limits": "Compatible bicubic Bezier U border, same V orientation; positive derivative scale. Unit scale tested C1.",
+      "source": "cuda/advanced_operations.cuh",
+      "backend": "CUDA control net / CPU OCCT surface and independent NumPy reference",
+      "pass": true,
+      "evidence": {
+        "order": 1,
+        "max_native_seam_jet_error": 4.440892098500626e-16,
+        "scale": 1.0
+      }
+    },
+    {
+      "name": "match_g2",
+      "family": "surface_edit",
+      "entry": "cuda/advanced_operations.cuh:match_bezier_boundary",
+      "limits": "Same compatible border; position/D1/D2 rows matched. Unit scale tested C2.",
+      "source": "cuda/advanced_operations.cuh",
+      "backend": "CUDA control net / CPU OCCT surface and independent NumPy reference",
+      "pass": true,
+      "evidence": {
+        "order": 2,
+        "max_native_seam_jet_error": 4.440892098500626e-16,
+        "scale": 1.0
+      }
+    },
+    {
+      "name": "fair_patches",
+      "family": "surface_edit",
+      "entry": "cuda/advanced_operations.cuh:fair_patch_pair",
+      "limits": "Joint 7x4 composite net; <=64 projected bending-gradient steps, C2-compatible locked outer boundary and orthogonal seam projection.",
+      "source": "cuda/advanced_operations.cuh",
+      "backend": "CUDA control net / CPU OCCT surface and independent NumPy reference",
+      "pass": true,
+      "evidence": {
+        "iterations": 12,
+        "max_independent_reference_error_mm": 1.6653345369377348e-16,
+        "z_bending_energy_before": 0.20343187808327728,
+        "z_bending_energy_after": 0.039983417919376076,
+        "C2_and_outer_boundary_preserved": true
+      }
+    },
+    {
+      "name": "surface_quality",
+      "family": "surface_edit",
+      "entry": "cad_advanced.surface_quality",
+      "limits": "Sampled Jacobian/principal curvature diagnostics; not global regularity/Class-A certification.",
+      "source": "cad_advanced.surface_quality",
+      "backend": "CUDA control net / CPU OCCT surface and independent NumPy reference",
+      "pass": true,
+      "evidence": {
+        "samples": 289,
+        "minimum_sampled_jacobian": 1.0014477572120197,
+        "maximum_sampled_principal_curvature_per_mm": 0.24562176723743184,
+        "sampled_regular": true,
+        "global_injectivity_certified": false
+      }
+    },
+    {
+      "name": "fillet",
+      "family": "solid_feature",
+      "entry": "cad_advanced.fillet",
+      "limits": "Native selected-edge constant positive radius; infeasible blends reject.",
+      "source": "cad_advanced.fillet",
+      "backend": "CPU native B-rep feature",
+      "pass": true,
+      "evidence": {
+        "native_valid": true,
+        "solids": 1,
+        "volume_mm3": 7.982831853071796,
+        "analytic_volume_mm3": 7.982831853071795,
+        "absolute_volume_error_mm3": 8.881784197001252e-16
+      }
+    },
+    {
+      "name": "variable_fillet",
+      "family": "solid_feature",
+      "entry": "cad_advanced.fillet",
+      "limits": "Native linear R1/R2 law along selected contour; positive feasible radii.",
+      "source": "cad_advanced.fillet",
+      "backend": "CPU native B-rep feature",
+      "pass": true,
+      "evidence": {
+        "native_valid": true,
+        "solids": 1,
+        "volume_mm3": 7.989896820771433,
+        "constant_radius_volume_bounds_mm3": [
+          7.982831853071795,
+          7.995707963267949
+        ],
+        "independent_end_slab_areas_mm2": [
+          3.997773790857411,
+          3.991574001251297
+        ],
+        "cross_section_varies": true,
+        "note": "Rolling sphere envelope with varying radius; constant-radius prism integration is not the variable-fillet volume formula."
+      }
+    },
+    {
+      "name": "chamfer",
+      "family": "solid_feature",
+      "entry": "cad_advanced.chamfer",
+      "limits": "Native symmetric selected-edge chamfer.",
+      "source": "cad_advanced.chamfer",
+      "backend": "CPU native B-rep feature",
+      "pass": true,
+      "evidence": {
+        "native_valid": true,
+        "solids": 1,
+        "volume_mm3": 7.960000000000001,
+        "analytic_volume_mm3": 7.96,
+        "absolute_volume_error_mm3": 8.881784197001252e-16
+      }
+    },
+    {
+      "name": "thicken",
+      "family": "solid_feature",
+      "entry": "cad_advanced.thicken",
+      "limits": "Native simple face/shell offset and side walls; no general offset self-intersection solver.",
+      "source": "cad_advanced.thicken",
+      "backend": "CPU native B-rep feature",
+      "pass": true,
+      "evidence": {
+        "native_valid": true,
+        "solids": 1,
+        "volume_mm3": 0.8,
+        "analytic_volume_mm3": 0.8,
+        "absolute_volume_error_mm3": 0.0
+      }
+    },
+    {
+      "name": "shell",
+      "family": "solid_feature",
+      "entry": "cad_advanced.shell",
+      "limits": "Native remove-selected-face and join offset; feasible test box, negative inward thickness.",
+      "source": "cad_advanced.shell",
+      "backend": "CPU native B-rep feature",
+      "pass": true,
+      "evidence": {
+        "native_valid": true,
+        "solids": 1,
+        "volume_mm3": 3.3919999999999986,
+        "analytic_volume_mm3": 3.3919999999999986,
+        "absolute_volume_error_mm3": 0.0
+      }
+    },
+    {
+      "name": "draft",
+      "family": "solid_feature",
+      "entry": "cad_advanced.draft",
+      "limits": "Native planar/cylindrical/conical face draft, abs(angle)<45deg, explicit neutral plane.",
+      "source": "cad_advanced.draft",
+      "backend": "CPU native B-rep feature",
+      "pass": true,
+      "evidence": {
+        "native_valid": true,
+        "solids": 1,
+        "volume_mm3": 7.6000000000000005,
+        "analytic_volume_mm3": 7.6,
+        "absolute_volume_error_mm3": 8.881784197001252e-16
+      }
+    },
+    {
+      "name": "rib",
+      "family": "solid_feature",
+      "entry": "cad_advanced.rib",
+      "limits": "Thicken an explicit planar rib profile and Boolean-fuse with base; not automatic skeleton ribs.",
+      "source": "cad_advanced.rib",
+      "backend": "CPU native B-rep feature",
+      "pass": true,
+      "evidence": {
+        "native_valid": true,
+        "solids": 1,
+        "volume_mm3": 1.6800000000000002,
+        "analytic_volume_mm3": 1.68,
+        "absolute_volume_error_mm3": 2.220446049250313e-16
+      }
+    },
+    {
+      "name": "decimate",
+      "family": "mesh_edit",
+      "entry": "mesh_advanced.decimate",
+      "limits": "CPU shortest-edge collapse; closed oriented manifold, link/no-flip tests and vertex-displacement budget; not a Hausdorff guarantee.",
+      "source": "mesh_advanced.decimate",
+      "backend": "CPU indexed mesh topology",
+      "pass": true,
+      "evidence": {
+        "vertices": 18,
+        "triangles": 32,
+        "boundary_edges": 0,
+        "nonmanifold_edges": 0,
+        "orientation_errors": 0,
+        "euler": 2,
+        "area": 11.05133904668116,
+        "signed_volume": 3.1950432459513345,
+        "collapses": 8,
+        "max_source_vertex_displacement_mm": 0.564696368436517,
+        "surface_Hausdorff_bound": false,
+        "input_triangles": 48
+      }
+    },
+    {
+      "name": "adaptive_remesh",
+      "family": "mesh_edit",
+      "entry": "mesh_advanced.adaptive_remesh",
+      "limits": "CPU conforming length-driven midpoint refinement; piecewise planar geometry preserved; <=16 passes.",
+      "source": "mesh_advanced.adaptive_remesh",
+      "backend": "CPU indexed mesh topology",
+      "pass": true,
+      "evidence": {
+        "vertices": 38,
+        "triangles": 62,
+        "boundary_edges": 12,
+        "nonmanifold_edges": 0,
+        "orientation_errors": 0,
+        "euler": 1,
+        "area": 1.9999999999999996,
+        "signed_volume": 0.0,
+        "max_edge_mm": 0.5000000000000001,
+        "input_triangles": 4,
+        "planar_area_preserved": true
+      }
+    },
+    {
+      "name": "edge_flip",
+      "family": "mesh_edit",
+      "entry": "mesh_advanced.edge_flip",
+      "limits": "CPU two-triangle planar convex interior edge; reject duplicate diagonal.",
+      "source": "mesh_advanced.edge_flip",
+      "backend": "CPU indexed mesh topology",
+      "pass": true,
+      "evidence": {
+        "vertices": 4,
+        "triangles": 2,
+        "boundary_edges": 4,
+        "nonmanifold_edges": 0,
+        "orientation_errors": 0,
+        "euler": 1,
+        "area": 2.0,
+        "signed_volume": 0.0
+      }
+    },
+    {
+      "name": "bridge_loops",
+      "family": "mesh_edit",
+      "entry": "mesh_advanced.bridge_loops",
+      "limits": "CPU disjoint equally sized oriented boundary loops with caller correspondence; may return open surface.",
+      "source": "mesh_advanced.bridge_loops",
+      "backend": "CPU indexed mesh topology",
+      "pass": true,
+      "evidence": {
+        "vertices": 8,
+        "triangles": 8,
+        "boundary_edges": 8,
+        "nonmanifold_edges": 0,
+        "orientation_errors": 0,
+        "euler": 0,
+        "area": 8.0,
+        "signed_volume": 2.6666666666666665
+      }
+    },
+    {
+      "name": "region_extrude",
+      "family": "mesh_edit",
+      "entry": "mesh_advanced.region_extrude",
+      "limits": "CPU selected triangle region translated outward with boundary walls; vector must point out of every selected face.",
+      "source": "mesh_advanced.region_extrude",
+      "backend": "CPU indexed mesh topology",
+      "pass": true,
+      "evidence": {
+        "vertices": 12,
+        "triangles": 20,
+        "boundary_edges": 0,
+        "nonmanifold_edges": 0,
+        "orientation_errors": 0,
+        "euler": 2,
+        "area": 28.0,
+        "signed_volume": 10.0
+      }
+    },
+    {
+      "name": "crease_subdivide",
+      "family": "mesh_edit",
+      "entry": "mesh_advanced.crease_subdivide",
+      "limits": "CPU one Loop step with hard edge/boundary rules and >=3-crease corner lock.",
+      "source": "mesh_advanced.crease_subdivide",
+      "backend": "CPU indexed mesh topology",
+      "pass": true,
+      "evidence": {
+        "vertices": 26,
+        "triangles": 48,
+        "boundary_edges": 0,
+        "nonmanifold_edges": 0,
+        "orientation_errors": 0,
+        "euler": 2,
+        "area": 24.0,
+        "signed_volume": 8.0,
+        "hard_edges": 12,
+        "all_original_corners_locked": true
+      }
+    },
+    {
+      "name": "self_intersection_detect",
+      "family": "repair",
+      "entry": "mesh_advanced.self_intersections",
+      "limits": "CPU nonadjacent triangle crossing pairs; O(T^2), coplanar overlapping candidate rejects as unsupported.",
+      "source": "mesh_advanced.self_intersections",
+      "backend": "CPU explicit mesh repair / native shape healing",
+      "pass": true,
+      "evidence": {
+        "crossing_pairs": [
+          [
+            0,
+            1
+          ]
+        ],
+        "clean_closed_cube_checked": true,
+        "coplanar_case_policy": "reject unsupported candidate"
+      }
+    },
+    {
+      "name": "self_intersection_repair",
+      "family": "repair",
+      "entry": "mesh_advanced.repair_self_intersections",
+      "limits": "CPU explicit face-discard policy covering detected crossings; reports open result, no automatic closed reconstruction.",
+      "source": "mesh_advanced.repair_self_intersections",
+      "backend": "CPU explicit mesh repair / native shape healing",
+      "pass": true,
+      "evidence": {
+        "vertices": 3,
+        "triangles": 1,
+        "boundary_edges": 3,
+        "nonmanifold_edges": 0,
+        "orientation_errors": 0,
+        "euler": 1,
+        "area": 2.0,
+        "signed_volume": 0.0,
+        "removed_faces": [
+          1
+        ],
+        "original_crossing_pairs": [
+          [
+            0,
+            1
+          ]
+        ],
+        "closed_repair": false
+      }
+    },
+    {
+      "name": "nonmanifold_repair",
+      "family": "repair",
+      "entry": "mesh_advanced.repair_nonmanifold",
+      "limits": "CPU vertex-fan splitting, same face geometry, explicit new boundaries.",
+      "source": "mesh_advanced.repair_nonmanifold",
+      "backend": "CPU explicit mesh repair / native shape healing",
+      "pass": true,
+      "evidence": {
+        "vertices": 9,
+        "triangles": 3,
+        "boundary_edges": 9,
+        "nonmanifold_edges": 0,
+        "orientation_errors": 0,
+        "euler": 3,
+        "area": 1.5,
+        "signed_volume": 0.0,
+        "duplicated_vertices": 4,
+        "geometry_preserved": true,
+        "cuts_create_boundaries": true,
+        "original_nonmanifold_edges": 1
+      }
+    },
+    {
+      "name": "tolerance_unify",
+      "family": "repair",
+      "entry": "cad_advanced.unify_tolerance",
+      "limits": "Copied native shape tolerances 1e-9..1e-3 mm; does not heal larger geometric gaps.",
+      "source": "cad_advanced.unify_tolerance",
+      "backend": "CPU explicit mesh repair / native shape healing",
+      "pass": true,
+      "evidence": {
+        "tolerance_mm": 1e-06,
+        "max_native_tolerance_error_mm": 0.0,
+        "source_preserved": true
+      }
+    },
+    {
+      "name": "small_feature_cleanup",
+      "family": "repair",
+      "entry": "cad_advanced.cleanup_small_features",
+      "limits": "Native same-domain unification and small-edge/wireframe repair; coplanar sliver test. Arbitrary curved sliver removal not guaranteed.",
+      "source": "cad_advanced.cleanup_small_features",
+      "backend": "CPU explicit mesh repair / native shape healing",
+      "pass": true,
+      "evidence": {
+        "faces_before": 10,
+        "faces_after": 6,
+        "same_domain_sliver_removed": true,
+        "volume_mm3": 1.0000100000000003
+      }
+    },
+    {
+      "name": "stable_handles",
+      "family": "orchestration",
+      "entry": "feature_graph.Handle",
+      "limits": "Typed feature ids stable through parameter/history/save-load; never reused in live graph.",
+      "source": "feature_graph.Handle",
+      "backend": "CPU typed feature graph",
+      "pass": true,
+      "evidence": {
+        "stable_id": "object-00000001",
+        "wrong_type_rejected": true,
+        "ids_survive_serialization": true
+      }
+    },
+    {
+      "name": "select_subshape",
+      "family": "orchestration",
+      "entry": "feature_graph.FeatureGraph.select/resolve",
+      "limits": "Unique geometric centroid point/edge/face query; revision-stale or ambiguous selections reject.",
+      "source": "feature_graph.FeatureGraph.select/resolve",
+      "backend": "CPU typed feature graph",
+      "pass": true,
+      "evidence": {
+        "vertex_edge_face_selections": 3,
+        "ambiguous_query_rejected": true,
+        "stale_selection_rejected": true
+      }
+    },
+    {
+      "name": "feature_dag",
+      "family": "orchestration",
+      "entry": "feature_graph.FeatureGraph",
+      "limits": "Typed DAG, cycle rejection, descendant-only invalidation and memoized execution.",
+      "source": "feature_graph.FeatureGraph",
+      "backend": "CPU typed feature graph",
+      "pass": true,
+      "evidence": {
+        "memoization_checked": true,
+        "descendant_only_invalidation": true,
+        "cycle_rejected_atomically": true
+      }
+    },
+    {
+      "name": "history_undo",
+      "family": "orchestration",
+      "entry": "feature_graph.FeatureGraph.undo",
+      "limits": "Undo graph edit, clear caches, invalidate all prior subshape selections.",
+      "source": "feature_graph.FeatureGraph.undo",
+      "backend": "CPU typed feature graph",
+      "pass": true,
+      "evidence": {
+        "changed_volume_mm3": 12.0,
+        "undo_volume_mm3": 8.0,
+        "id": "object-00000001"
+      }
+    },
+    {
+      "name": "history_redo",
+      "family": "orchestration",
+      "entry": "feature_graph.FeatureGraph.redo",
+      "limits": "Redo graph edit; branching edit clears redo.",
+      "source": "feature_graph.FeatureGraph.redo",
+      "backend": "CPU typed feature graph",
+      "pass": true,
+      "evidence": {
+        "redo_volume_mm3": 12.0,
+        "branch_edit_clears_redo": true
+      }
+    },
+    {
+      "name": "feature_rebuild",
+      "family": "orchestration",
+      "entry": "feature_graph.FeatureGraph.rebuild/loads",
+      "limits": "Deterministic registered operations and JSON graph; same geometry checked after fresh load/rebuild.",
+      "source": "feature_graph.FeatureGraph.rebuild/loads",
+      "backend": "CPU typed feature graph",
+      "pass": true,
+      "evidence": {
+        "saved_graph": "feature_graph.json",
+        "ids_and_geometry_survive_fresh_rebuild": true,
+        "volume_mm3": 12.0
+      }
+    },
+    {
+      "name": "snap_point",
+      "family": "placement",
+      "source": "cuda/motion_operations.cuh + scripts/placement_ops.py",
+      "entry": "snap_grid / snap_vertices / snap_point",
+      "limits": "CUDA grid and <=4096 nearest vertices; CPU native CAD nearest point on edge/trimmed face. Capture radius can reject. Native ties return first solution.",
+      "backend": "CUDA grid/vertex + CPU native CAD",
+      "pass": true,
+      "evidence": {
+        "grid_gpu_cpu_match": true,
+        "nearest_vertex_checked": true,
+        "native_edge_and_trimmed_face_snap_checked": true,
+        "capture_radius_rejection_checked": true,
+        "invalid_gpu_requests_rejected": 4
+      }
+    },
+    {
+      "name": "merge_mesh",
+      "family": "placement",
+      "source": "scripts/placement_ops.py",
+      "entry": "merge_mesh(meshes,tolerance)",
+      "limits": "CPU concatenate indexed objects; optional first-representative weld. Internal faces remain; solid union uses boolean_union, surface merge uses sew_surfaces.",
+      "backend": "CPU indexed merge/weld",
+      "pass": true,
+      "evidence": {
+        "vertices": 6,
+        "triangles": 4,
+        "boundary_edges": 6,
+        "nonmanifold_edges": 0,
+        "orientation_errors": 0,
+        "euler": 1,
+        "area": 2.0,
+        "signed_volume": 0.0,
+        "mode": "combine and first-representative weld",
+        "welded_vertices": 2,
+        "does_not_remove_internal_faces": true
+      }
+    },
+    {
+      "name": "move_along_curve",
+      "family": "placement",
+      "source": "cuda/motion_operations.cuh",
+      "entry": "move_curve_arc(curve,start_parameter,signed_distance,clamp,...)",
+      "limits": "CUDA bounded analytic/B-spline curve records; numerical Gauss arc length and inverse solve; open-domain clamp or reject, unit tangent frame. No periodic wrapping.",
+      "backend": "CUDA arc-length positioning + CPU instance transform",
+      "pass": true,
+      "evidence": {
+        "samples": 33,
+        "distance_mm": 2.0,
+        "max_analytic_arc_length_error_mm": 7.622791287076325e-13,
+        "CAD_instances_attached": 3
+      }
+    },
+    {
+      "name": "move_on_mesh",
+      "family": "placement",
+      "source": "cuda/motion_operations.cuh",
+      "entry": "move_mesh_path(points,nv,triangles,nt,start_face,start_point,direction,distance,...)",
+      "limits": "CUDA straightest face walk with edge parallel transport; <=128 vertices,256 triangles/crossings. Ambiguous vertex hits, nonmanifold crossings and degenerate faces reject; open boundary clamps with status=2.",
+      "backend": "CUDA intrinsic triangle walk + CPU instance transform",
+      "pass": true,
+      "evidence": {
+        "samples": 33,
+        "distance_mm": 1.5,
+        "max_unfolded_reference_error_mm": 2.220446049250313e-16,
+        "crossed_face_ids": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "boundary_clamp_checked": true
+      }
+    },
+    {
+      "name": "move_on_surface",
+      "family": "placement",
+      "source": "cuda/motion_operations.cuh",
+      "entry": "move_surface_uv(surface,u,v,du,dv,...)",
+      "limits": "CUDA NURBS UV displacement returns attached point, path tangent and normal; finite domain, regular surface and nonzero displacement. UV trajectory is not a world-space geodesic.",
+      "backend": "CUDA UV placement/frame + CPU instance transform",
+      "pass": true,
+      "evidence": {
+        "samples": 17,
+        "uv_displacement": [
+          0.6,
+          0.3
+        ],
+        "max_analytic_attached_point_error_mm": 1.1102230246251565e-16,
+        "unit_frame_error": 2.220446049250313e-16,
+        "world_geodesic": false
+      }
+    }
+  ]
+}

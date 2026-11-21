@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "status": "proposal_not_executable",
+  "runner_implemented": false,
+  "name": "gpu-cad-recursive-improvement-pilot",
+  "plan": "SELF_IMPROVEMENT_PLAN.md",
+  "baseline": {
+    "regression_anchor": "v6",
+    "evidence": "output/harness/validation.json",
+    "package_receipt": "output/delivery/receipt-v6.json",
+    "recursive_comparison_anchor": "v7-nonlinear-bootstrap-to-be-built",
+    "fixed_feedback_abi_required_before_cross_evaluation": true
+  },
+  "initial_implementation_scope": ["S0", "S1"],
+  "pilot": {
+    "max_generations": 3,
+    "max_total_wall_seconds": 7200,
+    "max_generation_wall_seconds": 1800,
+    "max_generations_without_promotion": 2,
+    "max_model_candidates_per_generation": 2,
+    "max_harness_candidates_per_generation": 4,
+    "max_external_model_api_calls": 0,
+    "allow_zero_promotions": true,
+    "gpu_training_and_rollout": "time_multiplexed"
+  },
+  "resources": {
+    "max_live_device_bytes": 6442450944,
+    "max_hot_trace_bytes": 536870912,
+    "max_pilot_disk_increment_bytes": 2147483648,
+    "initial_batch_candidates": 32,
+    "minimum_batch_candidates": 8,
+    "oom_policy": "halve_batch_then_fail_if_minimum_cannot_fit"
+  },
+  "episode": {
+    "task_family": "nonlinear-four-bicubic-patch-v1-to-be-built",
+    "coordinates": 192,
+    "initial_dof": 6,
+    "max_rounds": 32,
+    "max_trial_branches_per_round": 4,
+    "initial_state_geometry_evaluations": 1,
+    "max_post_initialization_geometry_evaluations": 128,
+    "max_total_geometry_evaluations": 129,
+    "finite_difference_state_queries_consume_geometry_budget": true,
+    "analytic_gradient_and_jvp_counts_and_time_reported_separately": true,
+    "actions": ["DELTA_NULLSPACE", "PROJECTED_SMOOTH", "STOP"],
+    "goal_contract_mutable_by_candidate": false,
+    "stop_implies_success": false,
+    "failed_optimization_implies_infeasible": false,
+    "curvature_constraint_scope": "versioned_sample_positions_not_continuous_domain_certificate",
+    "max_intermediate_host_decision_readbacks": 0,
+    "final_packed_readbacks_per_episode_batch": 1,
+    "requires_new_v7_branch_and_trace_abi": true
+  },
+  "proposed_policy": {
+    "layers": [72, 64, 64, 12],
+    "hidden_activation": "tanh",
+    "parameter_count_including_biases": 9612,
+    "observation_groups": {
+      "current_dof": 6,
+      "target_descriptors": 8,
+      "target_residuals": 24,
+      "curvature_statistics": 8,
+      "previous_reason_one_hot": 16,
+      "budget_and_round_fraction": 2,
+      "step_improvement_score_stagnation": 4,
+      "validity_metrics": 4
+    },
+    "output_groups": {
+      "action_logits": 3,
+      "dof_delta": 6,
+      "smoothing_step": 1,
+      "predicted_return": 1,
+      "predicted_failure_probability": 1
+    },
+    "policy_dtype": "f32_after_parity_validation",
+    "geometry_and_sensitive_checks_dtype": "f64",
+    "reuse_existing_769_parameter_weights_as_feedback_policy": false,
+    "learning_sequence": ["teacher_behavior_cloning", "learner_state_teacher_relabeling", "counterfactual_search_distillation"],
+    "replay_fractions": {
+      "historical_verified": 0.4,
+      "current_hard_states": 0.3,
+      "diversity_archive": 0.2,
+      "rejected_and_boundary": 0.1
+    }
+  },
+  "data": {
+    "split_unit": "template_ancestry_and_task_family",
+    "train": {"templates": 128, "tasks_per_template": 32, "tasks": 4096},
+    "development": {"templates": 16, "tasks_per_template": 32, "tasks": 512},
+    "qualification_per_generation": {"templates": 32, "tasks_per_template": 32, "tasks": 1024, "fresh_per_generation": true},
+    "final_audit": {"templates": 32, "tasks_per_template": 32, "tasks": 1024, "single_final_nomination_only": true},
+    "minimum_stratified_step_roundtrips_per_qualification": 64,
+    "all_actual_deliverables_require_step_roundtrip": true,
+    "training_may_access_final_audit": false,
+    "sealed_evaluator_access_isolation_implemented": false
+  },
+  "qualification": {
+    "cross_evaluation": ["parent_harness_parent_model", "parent_harness_new_model", "new_harness_parent_model", "new_harness_new_model"],
+    "also_compare_deterministic_optimizer": true,
+    "nominate_one_combination_and_primary_metric_on_development_before_qualification": true,
+    "max_observed_invalid_commits": 0,
+    "max_observed_false_success_labels": 0,
+    "require_legacy_regressions_and_same_binary_replay": true,
+    "minimum_success_rate_delta_confidence_lower_bound": -0.01,
+    "maximum_predeclared_critical_family_success_rate_point_drop": 0.02,
+    "primary_metric_options": {
+      "success_rate": {"minimum_absolute_gain": 0.03, "gain_confidence_lower_bound_strictly_above": 0},
+      "normalized_geometric_error": {"minimum_relative_reduction": 0.05, "gain_confidence_lower_bound_strictly_above": 0},
+      "gpu_latency": {"maximum_p50_ratio": 0.9, "ratio_confidence_upper_bound_strictly_below": 1, "maximum_p95_ratio": 1.05}
+    },
+    "confidence_level": 0.99,
+    "bootstrap_resamples": 10000,
+    "bootstrap_unit": "paired_template_family_cluster",
+    "performance_warmup_repeats": 5,
+    "performance_measured_paired_repeats": 30,
+    "report_all_task_and_common_success_quality": true,
+    "report_compile_training_teacher_export_and_host_transfer_costs_separately": true
+  },
+  "protected_contract": ["goal_definitions", "units_and_tolerances", "success_predicate", "oracle_definitions", "evaluation_answers", "qualification_rules", "budget_accounting"],
+  "first_pilot_harness_changes": ["redundant_computation_and_cache", "bounded_step_search", "batched_policy_and_active_state_scheduling", "validator_implementation_with_external_parity"],
+  "out_of_first_pilot_scope": ["arbitrary_topology_transactions", "general_nonlinear_G1_G2", "unbounded_online_code_mutation", "learned_experiment_scheduler", "continuous_domain_geometry_certificate"],
+  "versioning": {
+    "immutable_run_directory": "experiments/<run_id>/",
+    "immutable_bundle_directory": "versions/<bundle_hash>/",
+    "future_active_pointer": "registry/champion.json",
+    "require_parent_bundle_and_content_hashes": true,
+    "active_runtime_kernel_mutation": false,
+    "promotion_requires_atomic_pointer_update_and_recovery_receipt": true
+  },
+  "references": [
+    "https://proceedings.mlr.press/v15/ross11a.html",
+    "https://arxiv.org/abs/2506.13131",
+    "https://arxiv.org/abs/1504.04909",
+    "https://docs.nvidia.com/cuda/archive/12.6.3/cuda-c-programming-guide/index.html#conditional-graph-nodes"
+  ]
+}

@@ -1,0 +1,15 @@
+[package]
+name = "rust-cuda-modeling-demo"
+version = "0.1.0"
+edition = "2024"
+default-run = "rust-cuda-modeling-demo"
+description = "Runtime-compiled CUDA implicit modeling, GPU mesh extraction and rendering"
+
+[dependencies]
+cudarc = { version = "=0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "cuda-12060", "dynamic-loading"] }
+png = "0.17.16"
+libloading = "=0.9.1"
+
+[profile.release]
+debug = 1
+

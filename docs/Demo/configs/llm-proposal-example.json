@@ -1,0 +1,14 @@
+{
+  "contract": "hood-proposals-v1",
+  "contract_revision": 1,
+  "programs": [
+    {
+      "request_id": "fit_00",
+      "actions": [
+        {"op": "ADD_PROBES", "values": [-4, 3, -2, -1, 2, -3]},
+        {"op": "ADD_PROBES", "values": [8, -6, 4, 2, -4, 6]},
+        {"op": "STOP"}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,149 @@
+# Implementation Status
+
+Spec v0.3.1 → code, as of the implementation passes P1–P12 (build & test deferred by request).
+
+**Build verified** (2026-11-20) on Windows 11 / MSVC 14.44 / CUDA 12.6 / RTX 2000 Ada and on
+Linux: `cargo build --workspace --all-targets` with 0 warnings; `cargo test --workspace --
+--include-ignored` 102 passed / 0 failed. GPU coverage:
+- `crates/conformance/tests/parity_cuda.rs`: CUDA vs CPU bit parity for scan, compaction,
+  radix sort, top-k, segmented reduce, expression VM, batched LM, MLP inference, harness
+  validate/bin, and batched mesh mass properties (64 configurations in one pass).
+- `crates/driver-cuda/tests/graphs_vmm_cuda.rs`: graph capture/replay/update, IF and SWITCH
+  conditional nodes, a device-driven WHILE loop (`cudaGraphSetConditional` from NVRTC code),
+  VMM reserve/map/use.
+- `crates/server/tests/golden_trace.rs`: spec 15 flange study over MCP JSON-RPC (64
+  configurations → 4 topology classes → rank matching an exact-volume oracle → exact survivors,
+  τ = 1 → render → save → STEP export/reimport → delivery), replayed bit-identically. Steps
+  needing the GPU feature data plane are printed as pending.
+
+The CAD fuzzer runs **10 000** layered programs with 0 failures on both machines. Every program also passes these metamorphic relations:
+- inclusion–exclusion at each boolean;
+- translation invariance;
+- commutation of subtractive ops;
+- STEP write → read.
+
+The generator deliberately places features in near-degenerate ways: concentric, tangent, centred on walls, on corners, and with fillets and chamfers. Tangential (zero-thickness) contacts are rejected explicitly with `TOPOLOGY_FAILED` and the contact point. `agcad conformance --capture <file>` turns shrunk failures into regression tests.
+
+**AI ergonomics:**
+- the MCP tools `check_program` (all diagnostics with fixes) and `describe` (holes, walls and planes as text, plus a semantic diff against a version);
+- `$param` and `=formula` arguments;
+- in-place parameter edits;
+- requirement satisfiability warnings and per-cause infeasibility attribution in study reports;
+- one seamed face per full cylinder (CATIA convention). `cargo xtask check` matches
+`check_spec.py`. `cargo clippy` reports ~80 style lints (no errors).
+
+## GPU-model-driven device operations (`crates/dops`)
+
+This is the loop **LLM observes → sets a goal → GPU model plans and executes CAD operations under the GPU harness → survivors return as exact documents → LLM observes**:
+
+- **MCP tools:** `set_goal` and `device_rollout`, then the existing `describe`, `render`, `export`.
+- **Device design:** a *feature tape* per configuration, mirroring the Part Design tree. Values are literals or parameter + offset.
+  - **Profile ops:** pad, pocket and hole over rectangle, circle and regular-polygon sketches.
+  - **Patterns:** circular, and rectangular (x / y, ≤ 64 instances).
+  - **Corners:** vertical-edge fillet and chamfer of rectangle profiles.
+  - **Shell:** device-only. There is no exact layered offset yet, so it is reported and never approximated silently.
+  - **Multi-body:** `document.body` plus `boolean.add/remove/intersect`. Lowered with `$body` containers.
+  - **Also:** activation and parameters.
+  
+  Each op has a point SDF, an interval version, an exact lowering and a raise. Each is tested for soundness, round trip and CUDA ≡ CPU bitwise. Each device op is a catalog op; opcodes are resolved from the catalog, never hard-coded.
+- **Round:** policy (**mock GPU model**, a deterministic goal-seeking controller writing command records and arg-arena payloads into the device ring) → validate (harness) → apply (trial tapes) → compile (resolve parameters, precompute trig tables) → eval → decide (commit or reject, meter, observe, score) → continue (`cudaGraphSetConditional`). The whole rollout is **one graph launch with a device-driven WHILE**, and the host reads 0 bytes until it ends.
+- **Evaluation:** Lipschitz cell classification of exact distance bounds, evaluated in f32 with an explicit error margin (spec 08 precision policy). It produces:
+  - **rigorous volume and extent intervals** (`bounded` evidence), used for hard rejections;
+  - a gradient-based **volume estimate** (`sampled` evidence), used for steering.
+  
+  All accumulation uses integer atomics, so CUDA and the CPU reference are bit-identical.
+- **Escalation:** survivors lower to exact layered B-reps (soundness oracle: exact volume ∈ device bounds) and to AgIR programs of real features on a new branch. `raise` maps a document back to a device design.
+- **Runtime:**
+  - `memset_async` on every device;
+  - `Studio::reset`, plus `GraphRollout`, which caches the instantiated graph (the server reuses it across `device_rollout` calls);
+  - certification on a low-priority stream, overlapped with host exact escalation;
+  - multi-device sharding (`studio::rollout_sharded`) with global configuration ids in the policy, giving results identical to one device.
+- **Evaluation pipeline (G1/G2):**
+  - **Adaptive interval evaluation:** the f32 interval tape is evaluated over each cell's box, which classifies it as inside, outside or ambiguous.
+  - **Worklists:** per level, ambiguous cells are refined through deterministic scan-compacted worklists (`ScanPlan`: allocation-free, so it is legal inside the graph's WHILE body). Each configuration refines its first cap/8 ambiguous cells in worklist order.
+  - **Counters:** all counts are integer atomics, so CUDA and the CPU reference stay bit-identical.
+- **Evidence chain (spec 14):**
+  - **Proxy rounds:** these use small caps. The policy steers with the sampled estimate, and the bounds reject definite violations.
+  - **Survivors:** `studio::certify` re-evaluates them alone with a deep pass. On the flange this moved the rigorous interval from ±23.9 % to **±3.5 %**, with the estimate within 0.03 % of exact. `device_rollout` reports `certified_volume_bounds`.
+- **Measured** on an RTX 2000 Ada laptop GPU (`agcad bench-device`; eval is ≥ 99.9 % of each round):
+
+  | Design | Eval per round (4096 configurations) | Rigorous volume interval | 4096 × 7-round rollout |
+  |---|---|---|---|
+  | f64 point / Lipschitz, 96³ | — | — | 710 s |
+  | f32 point / Lipschitz, 96³ (G0 baseline) | 1361 ms | ±40 % | 11.9 s |
+  | f32 adaptive interval, 128³ (all-or-nothing cap) | 166 ms | — | — |
+  | f32 adaptive interval, 256³ (cap 4096, partial refinement) | 360 ms | ±30 % | 2.8 s |
+
+  Ruled out by measurement: near-cubic root cells. They made plate bounds 3× wider, because the thin-z cells bound the dominant faces best. The fix will be orientation-aware anisotropic splitting.
+- **Next:**
+  - per-cell tape pruning (patterns: 12 instances per point → about 1);
+  - warp-aggregated atomics and shared-memory tapes;
+  - anisotropic refinement;
+  - a graph cache;
+  - replace the mock policy with a learned one: the trace ring already records (round, committed, accepted, rejected, volume bounds), and the Candle trainer consumes it;
+  - add more device ops: shell, fillet, rectangular pattern, booleans between bodies;
+  - feed `describe` / renders back as observations to the LLM automatically.
+
+## Op coverage (293 catalog ops)
+
+| Family | Feature impl | Harness/runtime | `UNSUPPORTED_OP` |
+|---|---|---|---|
+| `document` | 0 | 14 | 10 |
+| `knowledge` | 1 | 0 | 9 |
+| `udf` | 0 | 4 | 2 |
+| `proc` | 9 | 0 | 9 |
+| `convert` | 1 | 0 | 8 |
+| `study` | 1 | 11 | 1 |
+| `evaluate` | 12 | 0 | 10 |
+| `query` | 5 | 0 | 7 |
+| `file` | 5 | 2 | 6 |
+| `datum` | 3 | 0 | 1 |
+| `sketch` | 11 | 0 | 10 |
+| `constraint` | 12 | 0 | 11 |
+| `wireframe` | 0 | 0 | 22 |
+| `surface` | 0 | 0 | 25 |
+| `part` | 10 | 0 | 19 |
+| `boolean` | 4 | 0 | 3 |
+| `transform` | 7 | 0 | 5 |
+| `direct` | 0 | 0 | 4 |
+| `mesh` | 1 | 0 | 9 |
+| `assembly` | 7 | 0 | 2 |
+| **total (293)** | **89** | **31** | **173** |
+
+- *Feature impl*: a registered `FeatureImpl` (agcad-std / agcad-proc).
+- *Harness/runtime*: handled by the harness session, study engine or runtime document/file layer.
+- *Unsupported*: returns `UNSUPPORTED_OP` with its manifest (AG-07-002).
+
+## What is implemented, by pass
+
+| Pass | Crates | Highlights |
+|---|---|---|
+| P1 | driver, ir, xtask | AgStatus (generated from spec 06), bytecode ABI, device traits, arenas/handles, BatchLayout, caps/precision policy; catalog loader, units, types, AgIR JSON ⇄ bytecode, verifier; spec tooling in Rust |
+| P2 | driver-cpu, driver-cuda, kernels, kernels-cuda | CPU reference device; CUDA device on cudarc raw API (priority streams, stream-ordered buffers, pinned, events, NVRTC + disk cache, graphs + IF/WHILE/SWITCH, VMM + FD export, sticky-fault poisoning); deterministic scan/compaction/radix sort/segmented reduce/stable top-k (CUDA + bit-identical CPU refs) |
+| P3 | rtc, rtc-macros, vm | AgLang strict-Rust-subset front end (syn), sandbox verifier, unit-aware expression graphs, forward/reverse autodiff, CUDA codegen vectorized over configurations, rustc-style diagnostics; expression VM (CUDA + CPU), proc-macros |
+| P4 | solver | Dense Cholesky/QR/SVD/nullspace, batched LM (CUDA + CPU), constraint-graph analysis (Hopcroft–Karp, DM, Tarjan plans), PCG, affine spaces, Newton/interval Newton, Adam/NM/CMA-ES/SA/augmented Lagrangian, interval & affine arithmetic, df64 |
+| P5 | geo | NURBS (Piegl–Tiller), analytic curves/surfaces with jets, robust predicates (Shewchuk), half-edge B-rep + validity, builders (prism/revolve/primitives), exact 2D region booleans + layered extrusion solids, analytic intersection table, watertight tessellation, STEP AP242/AP214 write/read with validation properties, 3MF, deterministic zip, ExactKernel |
+| P6 | runtime, trace | CATIA document model (CoW versions/branches/workspaces/undo), stable naming + signature recovery, rebuild engine + registry, ExecGraph lowering, topology classes, capacity planner, representation cache, .agcad save/open/migrations/snapshots, sessions, multi-GPU sharding |
+| P7 | std | Sketcher + constraints (LM), Part Design (pad/pocket/shaft/groove/hole/primitive/implicit/lattice/edge_fillet/chamfer), booleans (+ smooth implicit), patterns/transforms, meshing (marching tetrahedra), evaluations incl. DFM, queries, knowledge/datum, STEP/STL/3MF/USD/CATIA-VBA export, STEP import, physics (voxel FEA, modal estimate, SIMP), assembly mates + solve |
+| P8 | harness | Requirements + budget, Design Checker with evidence enforcement, transactions/session, GPU wavefront stages (CUDA + CPU), reports with untrusted quoting, review log |
+| P9 | harness | Study engine (configurations, batched update, topology classes, rank + fallback, proxy fidelity, sensitivity, optimize, tolerance analysis, observe), offscreen rasterizer + PNG |
+| P10 | server, cli, model | MCP JSON-RPC over stdio (9 tools), `agcad` CLI, ModelAdaptor/Llm/ReplayModel/CuModel (safetensors, MLP kernels), Candle trainer binary, geometry descriptor |
+| P11 | geo, proc, std | General SSI (seeding + marching + verification), corner fillets/chamfers on layered bodies, Houdini-style procedural networks, physics, assembly, exports |
+| P12 | conformance, improve, geo-occt, capi, optix-sys, driver-wgpu | Requirement-keyed suites, CAD fuzzer with shrinking, OCCT oracle (subprocess), gates/archive/promotion/rollback/held-out accounting, C ABI + header, OptiX shim bindings (feature-gated), wgpu placeholder |
+
+## Known gaps (next passes)
+
+- **GPU data plane for features:** feature kernels (tessellation, SSI, topology builders, STEP encode/decode, rasterization) exist as CPU references; their CUDA versions are the main remaining work for the GPU-only data plane (AG-05-005 is not yet met end-to-end).
+- **General exact kernel:** booleans/fillets beyond same-direction layered solids return `TOPOLOGY_FAILED` (SSI marching exists; topology builders for general faces do not yet).
+- **Surfaces/wireframe GSD families, direct edit, mesh editing, most converters:** `UNSUPPORTED_OP`.
+- **OptiX C++ shim source**, NanoVDB layout, wgpu/CubeCL Tier P, nvJitLink/LTO-IR linking, cuBLAS/cuSOLVER/cuDSS handles.
+- **Autodiff through features** (sensitivity uses finite differences, evidence `sampled`); learned geometry encoder.
+- **SolidWorks receiver profile** remains `experimental` (no B-spline conversion of procedural surfaces; no SolidWorks CI runner).
+
+## Verification commands
+
+1. `cargo build --workspace --all-targets` (Windows: run inside `vcvars64.bat`).
+2. `cargo test --workspace` (CPU paths); add `-- --include-ignored` on an NVIDIA machine.
+3. `cargo xtask check` (needs `docs/spec`).
+4. `agcad conformance --fuzz 3000` (OCCT oracle used if `python3 -c "import OCP"` works).
+5. Next: move the feature data plane to the GPU so the golden trace's pending steps (1.2, 1.3, 2.x/4.x, 5.1, 5.3, 6.3) become assertions.

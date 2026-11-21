@@ -1,0 +1,269 @@
+{
+  "version": 4,
+  "operators": {
+    "knot_insert": {
+      "family": "curve_edit",
+      "entry": "cad_advanced.knot_insert",
+      "limits": "Exact interior B-spline insertion; nonperiodic tested.",
+      "source": "cad_advanced.knot_insert"
+    },
+    "knot_remove": {
+      "family": "curve_edit",
+      "entry": "cad_advanced.knot_remove",
+      "limits": "Native removal with a requested tolerance; can reject removal.",
+      "source": "cad_advanced.knot_remove"
+    },
+    "degree_elevate": {
+      "family": "curve_edit",
+      "entry": "cad_advanced.degree_elevate",
+      "limits": "Exact B-spline degree elevation to <=25.",
+      "source": "cad_advanced.degree_elevate"
+    },
+    "degree_reduce": {
+      "family": "curve_edit",
+      "entry": "cad_advanced.degree_reduce",
+      "limits": "Single nonrational Bezier span; constrained LS and 2048 off-grid checks, sampled error only.",
+      "source": "cad_advanced.degree_reduce"
+    },
+    "curve_split": {
+      "family": "curve_edit",
+      "entry": "cad_advanced.curve_split",
+      "limits": "Exact two-way split strictly inside the domain.",
+      "source": "cad_advanced.curve_split"
+    },
+    "curve_reparameterize": {
+      "family": "curve_edit",
+      "entry": "cad_advanced.reparameterize",
+      "limits": "Affine increasing finite domain map.",
+      "source": "cad_advanced.reparameterize"
+    },
+    "fit_curve": {
+      "family": "curve_edit",
+      "entry": "cad_advanced.fit_curve",
+      "limits": "Nonperiodic cubic least squares, chord parameters, fixed endpoints.",
+      "source": "cad_advanced.fit_curve"
+    },
+    "fair_curve": {
+      "family": "curve_edit",
+      "entry": "cad_advanced.fair_curve",
+      "limits": "Penalized second control-pole differences; fixed endpoints, no interpolation promise.",
+      "source": "cad_advanced.fair_curve"
+    },
+    "sweep_guided": {
+      "family": "advanced_sweep_loft",
+      "entry": "cuda/advanced_operations.cuh:sweep_sections",
+      "limits": "CUDA projected guide rail defines profile frame; nonzero projected rail required.",
+      "source": "cuda/advanced_operations.cuh"
+    },
+    "sweep_scaled": {
+      "family": "advanced_sweep_loft",
+      "entry": "cuda/advanced_operations.cuh:sweep_sections",
+      "limits": "CUDA positive scalar per path station; <=32 stations and <=31 corners.",
+      "source": "cuda/advanced_operations.cuh"
+    },
+    "sweep_variable": {
+      "family": "advanced_sweep_loft",
+      "entry": "cuda/advanced_operations.cuh:sweep_sections",
+      "limits": "CUDA compatible polygon profile per station; bilinear side sheet, no self-intersection guarantee.",
+      "source": "cuda/advanced_operations.cuh"
+    },
+    "sweep_closed": {
+      "family": "advanced_sweep_loft",
+      "entry": "cuda/advanced_operations.cuh:sweep_sections",
+      "limits": "CUDA RMF holonomy distributed by chord length; duplicate endpoint/profile/scale; G0 closed seam, no continuous G1 guarantee.",
+      "source": "cuda/advanced_operations.cuh"
+    },
+    "loft_compatible": {
+      "family": "advanced_sweep_loft",
+      "entry": "cad_advanced.compatible_sections + cad_ops.loft",
+      "limits": "Exact degree/knot/domain harmonization then native loft; caller supplies matching orientation/correspondence.",
+      "source": "cad_advanced.compatible_sections + cad_ops.loft"
+    },
+    "surface_extend": {
+      "family": "surface_edit",
+      "entry": "cad_advanced.extend_bezier_u",
+      "limits": "Exact polynomial U extrapolation of a nonrational Bezier patch with original [0,1] domain.",
+      "source": "cad_advanced.extend_bezier_u"
+    },
+    "surface_untrim": {
+      "family": "surface_edit",
+      "entry": "cad_advanced.untrim_surface",
+      "limits": "Rebuild the natural support-domain face; does not restore discarded upstream geometry.",
+      "source": "cad_advanced.untrim_surface"
+    },
+    "surface_replace": {
+      "family": "surface_edit",
+      "entry": "cad_advanced.replace_surface_face",
+      "limits": "Isolated untrimmed rectangular patch, matching sampled boundary; arbitrary solid-face replacement excluded.",
+      "source": "cad_advanced.replace_surface_face"
+    },
+    "match_g1": {
+      "family": "surface_edit",
+      "entry": "cuda/advanced_operations.cuh:match_bezier_boundary",
+      "limits": "Compatible bicubic Bezier U border, same V orientation; positive derivative scale. Unit scale tested C1.",
+      "source": "cuda/advanced_operations.cuh"
+    },
+    "match_g2": {
+      "family": "surface_edit",
+      "entry": "cuda/advanced_operations.cuh:match_bezier_boundary",
+      "limits": "Same compatible border; position/D1/D2 rows matched. Unit scale tested C2.",
+      "source": "cuda/advanced_operations.cuh"
+    },
+    "fair_patches": {
+      "family": "surface_edit",
+      "entry": "cuda/advanced_operations.cuh:fair_patch_pair",
+      "limits": "Joint 7x4 composite net; <=64 projected bending-gradient steps, C2-compatible locked outer boundary and orthogonal seam projection.",
+      "source": "cuda/advanced_operations.cuh"
+    },
+    "surface_quality": {
+      "family": "surface_edit",
+      "entry": "cad_advanced.surface_quality",
+      "limits": "Sampled Jacobian/principal curvature diagnostics; not global regularity/Class-A certification.",
+      "source": "cad_advanced.surface_quality"
+    },
+    "fillet": {
+      "family": "solid_feature",
+      "entry": "cad_advanced.fillet",
+      "limits": "Native selected-edge constant positive radius; infeasible blends reject.",
+      "source": "cad_advanced.fillet"
+    },
+    "variable_fillet": {
+      "family": "solid_feature",
+      "entry": "cad_advanced.fillet",
+      "limits": "Native linear R1/R2 law along selected contour; positive feasible radii.",
+      "source": "cad_advanced.fillet"
+    },
+    "chamfer": {
+      "family": "solid_feature",
+      "entry": "cad_advanced.chamfer",
+      "limits": "Native symmetric selected-edge chamfer.",
+      "source": "cad_advanced.chamfer"
+    },
+    "thicken": {
+      "family": "solid_feature",
+      "entry": "cad_advanced.thicken",
+      "limits": "Native simple face/shell offset and side walls; no general offset self-intersection solver.",
+      "source": "cad_advanced.thicken"
+    },
+    "shell": {
+      "family": "solid_feature",
+      "entry": "cad_advanced.shell",
+      "limits": "Native remove-selected-face and join offset; feasible test box, negative inward thickness.",
+      "source": "cad_advanced.shell"
+    },
+    "draft": {
+      "family": "solid_feature",
+      "entry": "cad_advanced.draft",
+      "limits": "Native planar/cylindrical/conical face draft, abs(angle)<45deg, explicit neutral plane.",
+      "source": "cad_advanced.draft"
+    },
+    "rib": {
+      "family": "solid_feature",
+      "entry": "cad_advanced.rib",
+      "limits": "Thicken an explicit planar rib profile and Boolean-fuse with base; not automatic skeleton ribs.",
+      "source": "cad_advanced.rib"
+    },
+    "decimate": {
+      "family": "mesh_edit",
+      "entry": "mesh_advanced.decimate",
+      "limits": "CPU shortest-edge collapse; closed oriented manifold, link/no-flip tests and vertex-displacement budget; not a Hausdorff guarantee.",
+      "source": "mesh_advanced.decimate"
+    },
+    "adaptive_remesh": {
+      "family": "mesh_edit",
+      "entry": "mesh_advanced.adaptive_remesh",
+      "limits": "CPU conforming length-driven midpoint refinement; piecewise planar geometry preserved; <=16 passes.",
+      "source": "mesh_advanced.adaptive_remesh"
+    },
+    "edge_flip": {
+      "family": "mesh_edit",
+      "entry": "mesh_advanced.edge_flip",
+      "limits": "CPU two-triangle planar convex interior edge; reject duplicate diagonal.",
+      "source": "mesh_advanced.edge_flip"
+    },
+    "bridge_loops": {
+      "family": "mesh_edit",
+      "entry": "mesh_advanced.bridge_loops",
+      "limits": "CPU disjoint equally sized oriented boundary loops with caller correspondence; may return open surface.",
+      "source": "mesh_advanced.bridge_loops"
+    },
+    "region_extrude": {
+      "family": "mesh_edit",
+      "entry": "mesh_advanced.region_extrude",
+      "limits": "CPU selected triangle region translated outward with boundary walls; vector must point out of every selected face.",
+      "source": "mesh_advanced.region_extrude"
+    },
+    "crease_subdivide": {
+      "family": "mesh_edit",
+      "entry": "mesh_advanced.crease_subdivide",
+      "limits": "CPU one Loop step with hard edge/boundary rules and >=3-crease corner lock.",
+      "source": "mesh_advanced.crease_subdivide"
+    },
+    "self_intersection_detect": {
+      "family": "repair",
+      "entry": "mesh_advanced.self_intersections",
+      "limits": "CPU nonadjacent triangle crossing pairs; O(T^2), coplanar overlapping candidate rejects as unsupported.",
+      "source": "mesh_advanced.self_intersections"
+    },
+    "self_intersection_repair": {
+      "family": "repair",
+      "entry": "mesh_advanced.repair_self_intersections",
+      "limits": "CPU explicit face-discard policy covering detected crossings; reports open result, no automatic closed reconstruction.",
+      "source": "mesh_advanced.repair_self_intersections"
+    },
+    "nonmanifold_repair": {
+      "family": "repair",
+      "entry": "mesh_advanced.repair_nonmanifold",
+      "limits": "CPU vertex-fan splitting, same face geometry, explicit new boundaries.",
+      "source": "mesh_advanced.repair_nonmanifold"
+    },
+    "tolerance_unify": {
+      "family": "repair",
+      "entry": "cad_advanced.unify_tolerance",
+      "limits": "Copied native shape tolerances 1e-9..1e-3 mm; does not heal larger geometric gaps.",
+      "source": "cad_advanced.unify_tolerance"
+    },
+    "small_feature_cleanup": {
+      "family": "repair",
+      "entry": "cad_advanced.cleanup_small_features",
+      "limits": "Native same-domain unification and small-edge/wireframe repair; coplanar sliver test. Arbitrary curved sliver removal not guaranteed.",
+      "source": "cad_advanced.cleanup_small_features"
+    },
+    "stable_handles": {
+      "family": "orchestration",
+      "entry": "feature_graph.Handle",
+      "limits": "Typed feature ids stable through parameter/history/save-load; never reused in live graph.",
+      "source": "feature_graph.Handle"
+    },
+    "select_subshape": {
+      "family": "orchestration",
+      "entry": "feature_graph.FeatureGraph.select/resolve",
+      "limits": "Unique geometric centroid point/edge/face query; revision-stale or ambiguous selections reject.",
+      "source": "feature_graph.FeatureGraph.select/resolve"
+    },
+    "feature_dag": {
+      "family": "orchestration",
+      "entry": "feature_graph.FeatureGraph",
+      "limits": "Typed DAG, cycle rejection, descendant-only invalidation and memoized execution.",
+      "source": "feature_graph.FeatureGraph"
+    },
+    "history_undo": {
+      "family": "orchestration",
+      "entry": "feature_graph.FeatureGraph.undo",
+      "limits": "Undo graph edit, clear caches, invalidate all prior subshape selections.",
+      "source": "feature_graph.FeatureGraph.undo"
+    },
+    "history_redo": {
+      "family": "orchestration",
+      "entry": "feature_graph.FeatureGraph.redo",
+      "limits": "Redo graph edit; branching edit clears redo.",
+      "source": "feature_graph.FeatureGraph.redo"
+    },
+    "feature_rebuild": {
+      "family": "orchestration",
+      "entry": "feature_graph.FeatureGraph.rebuild/loads",
+      "limits": "Deterministic registered operations and JSON graph; same geometry checked after fresh load/rebuild.",
+      "source": "feature_graph.FeatureGraph.rebuild/loads"
+    }
+  }
+}

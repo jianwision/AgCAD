@@ -1,0 +1,14 @@
+{
+  "version":3,
+  "operators":{
+    "bend":{"family":"deformation","source":"cuda/modeling_operations.cuh","entry":"bend_point(point,radius)","limits":"Local X bends into XZ about Y; radius>0 and radius+Z>0; caller constrains angle to avoid overlaps. STEP mesh fixture is faceted, not an exact deformed NURBS claim."},
+    "twist":{"family":"deformation","source":"cuda/modeling_operations.cuh","entry":"twist_point(point,radians_per_length)","limits":"Rotation about local Z by rate*Z; geometry may self-intersect for excessive deformation. Mesh STEP is faceted."},
+    "taper":{"family":"deformation","source":"cuda/modeling_operations.cuh","entry":"taper_point(point,rate)","limits":"Local XY scale=1+rate*Z; strictly positive scale required; mesh STEP is faceted."},
+    "sweep_path":{"family":"surface","source":"cuda/modeling_operations.cuh","entry":"make_path_sweep(record,mesh,path,tangents,count,profile,sides,initial_normal)","limits":"2..32 stations; convex origin-containing CCW profile with 3..31 corners; discrete parallel transport, no antiparallel tangents. Exact piecewise bilinear GPU net exported to CAD; not a certified continuous RMF solver."},
+    "loft_chordal":{"family":"surface","source":"cuda/modeling_operations.cuh","entry":"make_chordal_loft(record,sections,rows,nv,degree,knots)","limits":"2..11 compatible nonrational sections; centroid chord parameters, natural cubic C2 interpolation. Coincident adjacent centroids rejected."},
+    "catmull_clark":{"family":"mesh_operation","source":"cuda/modeling_operations.cuh","entry":"catmull_clark(destination,points,nv,quad_indices,nf)","limits":"One step on closed consistently oriented manifold quads, <=128 vertices/faces, <=256 edges; fresh destination; boundary/crease rules are separate operations."},
+    "loop_subdivide":{"family":"mesh_operation","source":"cuda/modeling_operations.cuh","entry":"loop_subdivide(destination,points,nv,triangle_indices,nt)","limits":"One original Loop step, closed consistently oriented manifold triangles; <=128 vertices, <=256 triangles, <=384 edges; fresh destination."},
+    "resample_grid":{"family":"resampling","source":"cuda/modeling_operations.cuh","entry":"resample_grid(destination,points,nu,nv,u_steps,v_steps)","limits":"Bilinear sampling of a 2..32 by 2..32 source grid; output within bounded mesh capacity; preserves bilinear geometry, no curvature reconstruction."},
+    "resample_polyline":{"family":"resampling","source":"cuda/modeling_operations.cuh","entry":"resample_polyline(output,samples,points,count)","limits":"Uniform accumulated chord distance, 2..128 finite input points, 2..4096 outputs; zero-length adjacent segments rejected."}
+  }
+}

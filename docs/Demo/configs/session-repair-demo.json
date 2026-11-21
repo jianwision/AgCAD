@@ -1,0 +1,15 @@
+{
+  "schema": "cad-replay-v1",
+  "decisions": [
+    {"kind": "program", "actions": [
+      {"op": "BEGIN"},
+      {"op": "RAW_CONTROL_DELTA", "index": 0, "values": [12, 0, 0, 0, 0, 0]},
+      {"op": "COMMIT"}
+    ]},
+    {"kind": "program", "actions": [
+      {"op": "RAW_CONTROL_DELTA", "index": 0, "values": [-12, 0, 0, 0, 0, 0]},
+      {"op": "COMMIT"},
+      {"op": "ADD_PROBES", "values": [-4, 3, -2, -1, 2, -3]}
+    ]}
+  ]
+}

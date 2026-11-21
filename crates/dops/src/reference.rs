@@ -83,33 +83,68 @@ pub unsafe fn ag_dop_policy(params: *const u8, _: &LaunchConfig) {
             if nv < lo { nv = lo; }
             if nv > hi { nv = hi; }
             if (nv - cur).abs() <= 1e-12 * (hi - lo) {
-                // parameter saturated: structural action (remove material with a new hole)
-                if err > 0.0 && act == 0 && count[cfg] < a.nodes && g.hole_r > 0.0 {
+                // parameter saturated: structural action (exact-path features only)
+                if act == 0 && count[cfg] < a.nodes && g.hole_r > 0.0 && err != 0.0 {
                     let ux = unit(hash3(g.seed ^ 0xA5A5_A5A5, gcfg, round));
                     let uy = unit(hash3(g.seed ^ 0x5A5A_5A5A, gcfg, round));
                     let (px, py) = (g.place[0] + ux * (g.place[2] - g.place[0]), g.place[1] + uy * (g.place[3] - g.place[1]));
-                    let rect = (gcfg + round) % 2 == 1 && slot + 1 < rn;
-                    let c = &mut cmds[base + slot];
-                    c.opcode = a.ops.pocket as u16;
-                    let f = &mut arena[base + slot];
-                    f.pref = [NO_PARAM; NVALS];
-                    if rect {
-                        // rounded rectangular pocket: part.pocket (rectangle) + part.edge_fillet
-                        c.args[0] = profile::RECT;
-                        let h = g.hole_r;
-                        f.val = [px - h, py - h, px + h, py + h, g.hole_z0, g.hole_z1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+                    let h = g.hole_r;
+                    let two = slot + 1 < rn && (count[cfg] as usize) + 1 < a.nodes as usize;
+                    let blank = |f: &mut FeatureArgs| { f.pref = [NO_PARAM; NVALS]; f.val = [0.0; NVALS]; };
+                    if err > 0.0 {
+                        // remove material: hole | rounded pocket | slot | bolt circle (4 holes)
+                        let kind = if two { (gcfg + round) % 4 } else { 0 };
+                        let c = &mut cmds[base + slot];
+                        c.opcode = a.ops.pocket as u16;
+                        let f = &mut arena[base + slot];
+                        blank(f);
+                        match kind {
+                            1 | 2 => {
+                                c.args[0] = profile::RECT;
+                                let (hx, hy) = if kind == 1 { (h, h) } else { (2.0 * h, 0.5 * h) };
+                                f.val[0] = px - hx; f.val[1] = py - hy; f.val[2] = px + hx; f.val[3] = py + hy; f.val[4] = g.hole_z0; f.val[5] = g.hole_z1;
+                                slot += 1;
+                                let c2 = &mut cmds[base + slot];
+                                c2.opcode = a.ops.fillet as u16;
+                                c2.args[0] = rec::LAST;
+                                let f2 = &mut arena[base + slot];
+                                blank(f2);
+                                // rounded corners, or fully rounded ends (the device clamps to min(hx, hy))
+                                f2.val[10] = if kind == 1 { 0.4 * h } else { 0.5 * h };
+                            }
+                            3 => {
+                                c.args[0] = profile::CIRCLE;
+                                f.val[0] = px; f.val[1] = py; f.val[2] = 0.5 * h; f.val[4] = g.hole_z0; f.val[5] = g.hole_z1;
+                                slot += 1;
+                                let c2 = &mut cmds[base + slot];
+                                c2.opcode = a.ops.circular_pattern as u16;
+                                c2.args[0] = rec::LAST;
+                                let f2 = &mut arena[base + slot];
+                                blank(f2);
+                                f2.val[6] = 4.0;
+                                f2.val[7] = core::f64::consts::TAU;
+                            }
+                            _ => {
+                                c.args[0] = profile::CIRCLE;
+                                f.val[0] = px; f.val[1] = py; f.val[2] = h; f.val[4] = g.hole_z0; f.val[5] = g.hole_z1;
+                            }
+                        }
                         slot += 1;
-                        let c2 = &mut cmds[base + slot];
-                        c2.opcode = a.ops.fillet as u16;
-                        c2.args[0] = rec::LAST;
-                        let f2 = &mut arena[base + slot];
-                        f2.pref = [NO_PARAM; NVALS];
-                        f2.val[10] = 0.4 * h;
                     } else {
-                        c.args[0] = profile::CIRCLE;
-                        f.val = [px, py, g.hole_r, 0.0, g.hole_z0, g.hole_z1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+                        // add material: a boss on top of the base pad
+                        let nodes = unsafe { sl::<Node>(a.cur_nodes, cn * a.nodes as usize) };
+                        let base_pad = nodes[cfg * a.nodes as usize..cfg * a.nodes as usize + count[cfg] as usize].iter().find(|n| n.op == fop::ADD && n.kind <= profile::SKETCH && n.flags & nflags::ACTIVE != 0);
+                        if let Some(bp) = base_pad {
+                            let top = bp.val[5] + if bp.pref[5] != NO_PARAM && (bp.pref[5] as usize) < kn { pr[cfg * kn + bp.pref[5] as usize] } else { 0.0 };
+                            let c = &mut cmds[base + slot];
+                            c.opcode = a.ops.pad as u16;
+                            c.args[0] = profile::CIRCLE;
+                            let f = &mut arena[base + slot];
+                            blank(f);
+                            f.val[0] = px; f.val[1] = py; f.val[2] = h; f.val[4] = top; f.val[5] = top + h;
+                            slot += 1;
+                        }
                     }
-                    slot += 1;
                 }
                 continue;
             }

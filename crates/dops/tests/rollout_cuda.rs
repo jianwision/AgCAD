@@ -272,3 +272,24 @@ fn new_ops_bitwise() {
         assert!(x.results(1).unwrap().done > 0, "policy {pol}");
     }
 }
+
+/// Structural vocabulary (hole, rounded pocket, slot, bolt circle, boss): CUDA ≡ CPU bitwise.
+#[test]
+#[ignore = "requires NVIDIA GPU"]
+fn structural_moves_bitwise() {
+    let cuda = agcad_driver_cuda::CudaDevice::open(0).unwrap();
+    for (lo, hi, r, zmax) in [(108_000.0, 116_000.0, 9.0, 26.0), (140_000.0, 150_000.0, 13.0, 40.0)] {
+        let mut g = cpu::goal(lo, hi);
+        g.param_lo[..3].copy_from_slice(&[59.0, 11.5, 5.0]);
+        g.param_hi[..3].copy_from_slice(&[60.0, 12.0, 6.0]);
+        g.place = [-30.0, -30.0, 30.0, 30.0];
+        g.hole_r = r;
+        g.domain_hi[2] = zmax;
+        g.max_ext[2] = zmax;
+        let c = StudioConfig { nodes: 12, ..cfg(32, 16) };
+        let base = cpu::flange(60.0, 12.0, 6.0);
+        let (a, b) = (Studio::new(cuda.clone(), &base, &g, c).unwrap(), Studio::new(agcad_driver_cpu::CpuDevice::new(), &base, &g, c).unwrap());
+        assert_eq!(a.run_host_loop().unwrap(), b.run_host_loop().unwrap());
+        assert!(a.state_bytes().unwrap() == b.state_bytes().unwrap(), "structural rollout CUDA ≠ CPU (target {lo})");
+    }
+}

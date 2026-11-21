@@ -730,31 +730,60 @@ AG_KERNEL void ag_dop_policy(const DopsArgs* a) {
         if (nv < lo) nv = lo;
         if (nv > hi) nv = hi;
         if (fabs(nv - cur) <= 1e-12 * (hi - lo)) {
-            if (err > 0.0 && act == 0u && count < a->nodes && g.hole_r > 0.0) {
+            if (act == 0u && count < a->nodes && g.hole_r > 0.0 && err != 0.0) {
                 double ux = unit01(hash3(g.seed ^ 0xA5A5A5A5u, gcfg, round));
                 double uy = unit01(hash3(g.seed ^ 0x5A5A5A5Au, gcfg, round));
                 double px = g.place[0] + ux * (g.place[2] - g.place[0]);
                 double py = g.place[1] + uy * (g.place[3] - g.place[1]);
-                bool rect = ((gcfg + round) % 2u == 1u) && (slot + 1u < rn);
-                CommandRecord& c = cmds[base + slot];
-                c.opcode = (unsigned short)a->ops.pocket;
-                FeatureArgs& f = arena[base + slot];
-                for (int jj = 0; jj < NVALS; ++jj) { f.pref[jj] = NO_PARAM; f.val[jj] = 0.0; }
-                if (rect) {
-                    c.args[0] = PROFILE_RECT;
-                    double h = g.hole_r;
-                    f.val[0] = px - h; f.val[1] = py - h; f.val[2] = px + h; f.val[3] = py + h; f.val[4] = g.hole_z0; f.val[5] = g.hole_z1;
+                double h = g.hole_r;
+                bool two = (slot + 1u < rn) && (count + 1u < a->nodes);
+                if (err > 0.0) {
+                    u32 kind = two ? (gcfg + round) % 4u : 0u;
+                    CommandRecord& c = cmds[base + slot];
+                    c.opcode = (unsigned short)a->ops.pocket;
+                    FeatureArgs& f = arena[base + slot];
+                    for (int jj = 0; jj < NVALS; ++jj) { f.pref[jj] = NO_PARAM; f.val[jj] = 0.0; }
+                    if (kind == 1u || kind == 2u) {
+                        c.args[0] = PROFILE_RECT;
+                        double hx = (kind == 1u) ? h : 2.0 * h, hy = (kind == 1u) ? h : 0.5 * h;
+                        f.val[0] = px - hx; f.val[1] = py - hy; f.val[2] = px + hx; f.val[3] = py + hy; f.val[4] = g.hole_z0; f.val[5] = g.hole_z1;
+                        slot += 1u;
+                        CommandRecord& c2 = cmds[base + slot];
+                        c2.opcode = (unsigned short)a->ops.fillet; c2.args[0] = LAST;
+                        FeatureArgs& f2 = arena[base + slot];
+                        for (int jj = 0; jj < NVALS; ++jj) { f2.pref[jj] = NO_PARAM; f2.val[jj] = 0.0; }
+                        f2.val[10] = (kind == 1u) ? 0.4 * h : 0.5 * h;
+                    } else if (kind == 3u) {
+                        c.args[0] = PROFILE_CIRCLE;
+                        f.val[0] = px; f.val[1] = py; f.val[2] = 0.5 * h; f.val[4] = g.hole_z0; f.val[5] = g.hole_z1;
+                        slot += 1u;
+                        CommandRecord& c2 = cmds[base + slot];
+                        c2.opcode = (unsigned short)a->ops.circular_pattern; c2.args[0] = LAST;
+                        FeatureArgs& f2 = arena[base + slot];
+                        for (int jj = 0; jj < NVALS; ++jj) { f2.pref[jj] = NO_PARAM; f2.val[jj] = 0.0; }
+                        f2.val[6] = 4.0;
+                        f2.val[7] = TAU;
+                    } else {
+                        c.args[0] = PROFILE_CIRCLE;
+                        f.val[0] = px; f.val[1] = py; f.val[2] = h; f.val[4] = g.hole_z0; f.val[5] = g.hole_z1;
+                    }
                     slot += 1u;
-                    CommandRecord& c2 = cmds[base + slot];
-                    c2.opcode = (unsigned short)a->ops.fillet; c2.args[0] = LAST;
-                    FeatureArgs& f2 = arena[base + slot];
-                    for (int jj = 0; jj < NVALS; ++jj) { f2.pref[jj] = NO_PARAM; f2.val[jj] = 0.0; }
-                    f2.val[10] = 0.4 * h;
                 } else {
-                    c.args[0] = PROFILE_CIRCLE;
-                    f.val[0] = px; f.val[1] = py; f.val[2] = g.hole_r; f.val[4] = g.hole_z0; f.val[5] = g.hole_z1;
+                    const Node* cn_ = ag_ptr<const Node>(a->cur_nodes) + (u64)cfg * a->nodes;
+                    int bp = -1;
+                    for (u32 q = 0; q < count; ++q) { if (cn_[q].op == FOP_ADD && cn_[q].kind <= PROFILE_SKETCH && (cn_[q].flags & NF_ACTIVE) != 0u) { bp = (int)q; break; } }
+                    if (bp >= 0) {
+                        const Node& n0 = cn_[bp];
+                        double top = n0.val[5] + ((n0.pref[5] != NO_PARAM && n0.pref[5] < kn) ? pr[n0.pref[5]] : 0.0);
+                        CommandRecord& c = cmds[base + slot];
+                        c.opcode = (unsigned short)a->ops.pad;
+                        c.args[0] = PROFILE_CIRCLE;
+                        FeatureArgs& f = arena[base + slot];
+                        for (int jj = 0; jj < NVALS; ++jj) { f.pref[jj] = NO_PARAM; f.val[jj] = 0.0; }
+                        f.val[0] = px; f.val[1] = py; f.val[2] = h; f.val[4] = top; f.val[5] = top + h;
+                        slot += 1u;
+                    }
                 }
-                slot += 1u;
             }
             continue;
         }

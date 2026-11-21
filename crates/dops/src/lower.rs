@@ -441,10 +441,13 @@ pub fn to_program(d: &Design, requirements_rev: u32, expected_revision: u32) -> 
             let mut v = [0.0; NVALS];
             for (j, x) in v.iter_mut().enumerate() { *x = value(n, &d.params, j); }
             let pts: Vec<J> = instance_corners(n, &v, d).iter().map(|p| json!([format!("{} mm", p[0]), format!("{} mm", p[1])])).collect();
+            // the size as the device clamps it (≤ half the shorter side); parametric when unclamped
+            let k = corner_size(n, &v);
+            let size = if (k - v[10]).abs() < 1e-12 { length(d, n, 10) } else { J::String(format!("{k} mm")) };
             if n.flags & nflags::FILLET != 0 {
-                st.push(json!({"id": format!("dev_fil{i}"), "op": "part.edge_fillet", "args": {"edges": pts, "r": length(d, n, 10), "propagation": "minimal"}}));
+                st.push(json!({"id": format!("dev_fil{i}"), "op": "part.edge_fillet", "args": {"edges": pts, "r": size, "propagation": "minimal"}}));
             } else {
-                st.push(json!({"id": format!("dev_cha{i}"), "op": "part.chamfer", "args": {"edges": pts, "mode": "distance", "a": length(d, n, 10)}}));
+                st.push(json!({"id": format!("dev_cha{i}"), "op": "part.chamfer", "args": {"edges": pts, "mode": "distance", "a": size}}));
             }
         }
         // container of this feature's statements, and the body's latest feature

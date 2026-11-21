@@ -21,6 +21,8 @@ pub struct Server {
     pub branch: String,
     /// Goal for device rollouts (set by `set_goal`).
     pub goal: Option<(agcad_dops::abi::Goal, Vec<String>)>,
+    /// Stiffness requirement checked on survivors.
+    pub load: Option<device::LoadSpec>,
     /// Rollouts run so far (names the result branches).
     pub rollouts: u32,
     /// Cached device rollout graphs.
@@ -43,7 +45,7 @@ pub fn tools() -> Vec<Value> {
         tool("describe", "Structured text view of the current body: bounding box, volume, holes and cylindrical walls by diameter/axis/position, planar faces by normal/offset, parameters. With against_version: semantic diff (holes added/removed, volume delta, parameter changes).", json!({ "type": "object", "properties": { "against_version": { "type": "integer" } } })),
         tool("render", "Offscreen render (PNG, base64) of the current body: views iso/top/front/right, mode shaded/face_ids.", json!({ "type": "object", "properties": { "view": { "type": "string" }, "mode": { "type": "string" } } })),
         tool("export", "Export the current body (step_ap242 | stl | 3mf); returns path written by the control plane.", json!({ "type": "object", "properties": { "format": { "type": "string" } } })),
-        tool("set_goal", "Goal for the GPU model: target_volume [min, max] mm³, optional max_extent [x, y, z] mm, parameters {name: {min, max, volume_effect: \"+\"|\"-\"}} it may vary, optional new_holes {r, region [x0, y0, x1, y1]} it may add, optional domain {min, max}. The GPU model then plans and executes edits on many configurations (device_rollout).", json!({ "type": "object", "properties": { "target_volume": { "type": "array" }, "max_extent": { "type": "array" }, "parameters": { "type": "object" }, "new_holes": { "type": "object" }, "domain": { "type": "object" } }, "required": ["target_volume", "parameters"] })),
+        tool("set_goal", "Goal for the GPU model: target_volume [min, max] mm³, optional max_extent [x, y, z] mm, parameters {name: {min, max, volume_effect: \"+\"|\"-\"}} it may vary, optional new_holes {r, region [x0, y0, x1, y1]} it may add, optional domain {min, max}. Engineering constraints (sampled on the device; a survivor must satisfy them and edits may not worsen them): min_wall (mm), min_clearance (mm), machining \"3ax\" (tool access from +z; defaults from the requirements' process) with undercut_tolerance (mm²), centroid {min, max}. Stiffness: load {support: \"x_min\"|\"y_min\"|\"z_min\", force [N], voxel mm, E MPa, nu} with max_compliance (N·mm), checked on survivors by a voxel FEA solve on the device. The GPU model then plans and executes edits on many configurations (device_rollout).", json!({ "type": "object", "properties": { "target_volume": { "type": "array" }, "max_extent": { "type": "array" }, "parameters": { "type": "object" }, "new_holes": { "type": "object" }, "domain": { "type": "object" }, "min_wall": { "type": "number" }, "min_clearance": { "type": "number" }, "machining": { "type": "string", "enum": ["3ax", "none"] }, "undercut_tolerance": { "type": "number" }, "centroid": { "type": "object" }, "load": { "type": "object" }, "max_compliance": { "type": "number" } }, "required": ["target_volume", "parameters"] })),
         tool("device_rollout", "Run the GPU model on the current design: `configurations` variants × up to `rounds` rounds of plan → edit → evaluate → check → decide, entirely on the device (CUDA graph) or the CPU reference. Returns the top survivors; with apply_best (default true) the best becomes the active branch as Part Design features (then render / describe / export it).", json!({ "type": "object", "properties": { "configurations": { "type": "integer" }, "rounds": { "type": "integer" }, "top_k": { "type": "integer" }, "apply_best": { "type": "boolean" }, "resolution": { "type": "integer" }, "device": { "type": "string", "enum": ["cuda", "cpu"] } } })),
         tool("finish", "Run delivery checks and produce the DeliveryReport (stop/execution/requirements/delivery).", json!({ "type": "object" })),
     ]
@@ -83,7 +85,7 @@ fn b64(data: &[u8]) -> String {
 
 impl Server {
     pub fn new(requirements: Requirements, part: &str) -> Self {
-        Server { session: HarnessSession::new(requirements, part), branch: "main".into(), goal: None, rollouts: 0, device_cache: Default::default() }
+        Server { session: HarnessSession::new(requirements, part), branch: "main".into(), goal: None, load: None, rollouts: 0, device_cache: Default::default() }
     }
 
     fn current_mesh(&self) -> Option<agcad_geo::tessellate::Mesh> {
@@ -194,11 +196,17 @@ impl Server {
                 let ws = self.session.doc.workspace(&self.branch).ok_or("no workspace")?;
                 let (design, warnings) = device::raise_design(&ws.state)?;
                 let bbox = self.session.last_update.as_ref().and_then(|u| u.products.values().rev().find_map(|p| if let Product::Solid(s) = p { Some(s.brep().bbox()) } else { None })).map(|b| ([b.min.x, b.min.y, b.min.z], [b.max.x, b.max.y, b.max.z]));
-                let (mut g, notes) = device::parse_goal(args, &design.names, bbox)?;
+                let p3 = self.session.requirements.process == agcad_harness::requirements::Process::Machining3ax;
+                let (mut g, notes) = device::parse_goal(args, &design.names, bbox, p3)?;
                 device::freeze_fixed(&mut g, &design.params);
+                let load = device::parse_load(args)?;
                 self.goal = Some((g, design.names.clone()));
+                self.load = load;
                 json!({ "ok": true, "parameters": design.names, "device_features": design.nodes.len(), "notes": notes, "raise_warnings": warnings,
-                        "goal": { "target_volume": [g.vol_lo, g.vol_hi], "max_extent": g.max_ext, "domain": { "min": g.domain_lo, "max": g.domain_hi } } })
+                        "goal": { "target_volume": [g.vol_lo, g.vol_hi], "max_extent": g.max_ext, "domain": { "min": g.domain_lo, "max": g.domain_hi },
+                                  "min_wall": (g.min_wall > 0.0).then_some(g.min_wall), "min_clearance": (g.min_gap > 0.0).then_some(g.min_gap), "machining_3ax": g.machining_3ax == 1,
+                                  "stiffness": load.map(|l| json!({ "support_axis": l.support_axis, "force": l.force, "max_compliance": l.max_compliance })),
+                                  "centroid": (g.centroid_hi.iter().zip(&g.centroid_lo).any(|(h, l)| h > l)).then(|| json!({ "min": g.centroid_lo, "max": g.centroid_hi })) } })
             }
             "device_rollout" => {
                 let (g, names) = self.goal.clone().ok_or("no goal: call set_goal first")?;
@@ -216,8 +224,24 @@ impl Server {
                 let run = device::run(&mut self.device_cache, &design, &g, cfg, top_k, prefer_cuda)?;
                 let mut out = device::summarize(&run, &names);
                 out["raise_warnings"] = json!(warnings);
+                // stiffness escalation on the survivors (voxel PCG on the device)
+                let mut stiff_ok = vec![true; run.summary.top.len()];
+                if let Some(spec) = self.load {
+                    for (i, sv) in run.summary.top.iter().enumerate() {
+                        let v = match device::stiffness(&sv.design, &sv.obs, &spec, prefer_cuda) {
+                            Ok((r, h)) => {
+                                stiff_ok[i] = r.converged && spec.max_compliance.is_none_or(|m| r.compliance <= m);
+                                json!({ "compliance": r.compliance, "max_displacement": r.max_disp, "converged": r.converged, "iterations": r.iterations, "voxel": h, "voxels": r.voxels, "ok": stiff_ok[i], "evidence": "sampled" })
+                            }
+                            Err(e) => { stiff_ok[i] = false; json!({ "error": e }) }
+                        };
+                        out["top"][i]["stiffness"] = v;
+                        if !stiff_ok[i] { out["top"][i]["goal_met"] = json!(false); }
+                    }
+                }
                 if args.get("apply_best").and_then(Value::as_bool).unwrap_or(true) {
-                    if let Some(best) = run.summary.top.iter().find(|s| s.obs[10] == 1.0).or(run.summary.top.first()) {
+                    let pick = run.summary.top.iter().enumerate().find(|(i, s)| s.obs[10] == 1.0 && stiff_ok[*i]).map(|(_, s)| s);
+                    if let Some(best) = pick.or(run.summary.top.first()) {
                         // escalation, overlapped: deep certification of the survivor runs on its
                         // own (low-priority) device stream while the host builds the exact solid
                         let (exact, cert) = std::thread::scope(|sc| {

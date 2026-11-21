@@ -7,7 +7,21 @@ typedef unsigned long long cudaGraphConditionalHandle;
 extern "C" __device__ __attribute__((cudart_builtin)) void cudaGraphSetConditional(cudaGraphConditionalHandle handle, unsigned int value);
 
 #define NVALS 12
-#define OBS 16
+#define OBS 32
+#define CS 16
+#define C_INSIDE 0
+#define C_BOUNDARY 1
+#define C_FILL 2
+#define C_THIN 3
+#define C_M1 4
+#define C_M2 7
+#define C_UNDERCUT 10
+#define C_GAP 11
+#define C_MIN_WALL 12
+#define C_MIN_GAP 13
+#define C_AREA 14
+#define C_V6 15
+#define MARCH_STEPS 160u
 #define MAX_PARAMS 8
 #define MAX_PATTERN 64u
 #define NO_PARAM 0xFFFFFFFFu
@@ -39,10 +53,11 @@ struct CNode { u32 kind, op, active, count, sides, mods, _pad[2]; float v[NVALS]
 #define TABLE 384
 #define POLY 256
 struct Goal {
-    double domain_lo[3], domain_hi[3], vol_lo, vol_hi, max_ext[3], _pad0;
+    double domain_lo[3], domain_hi[3], vol_lo, vol_hi, max_ext[3], min_wall;
     double place[4], hole_r, hole_z0, hole_z1, gain;
     double param_lo[MAX_PARAMS], param_hi[MAX_PARAMS], param_sign[MAX_PARAMS];
-    u32 n_params, seed, _pad1[2];
+    u32 n_params, seed, machining_3ax, _pad1;
+    double min_gap, undercut_tol, centroid_lo[3], centroid_hi[3];
 };
 struct TraceRow { u32 round, committed, accepted, rejected; double vol_lo, vol_hi; };
 struct OpTable { u32 update, parameter, pad, pocket, hole, circular_pattern, deactivate, rect_pattern, fillet, chamfer, shell, body, add, remove, intersect, _pad; };
@@ -540,7 +555,9 @@ AG_KERNEL void ag_dop_eval_clear(const DopsArgs* a) {
     u32 c = AG_TID;
     if (c >= a->configs) return;
     u64* counts = ag_ptr<u64>(a->counts);
-    for (int j = 0; j < 4; ++j) counts[4 * c + j] = 0ull;
+    for (int j = 0; j < CS; ++j) counts[CS * c + j] = 0ull;
+    counts[CS * c + C_MIN_WALL] = 0xFFFFFFFFFFFFFFFFull;
+    counts[CS * c + C_MIN_GAP] = 0xFFFFFFFFFFFFFFFFull;
     ag_ptr<u32>(a->domain_hit)[c] = 0u;
     u32* bb = ag_ptr<u32>(a->bbox) + 12u * c;
     for (int k = 0; k < 3; ++k) { bb[k] = 0xFFFFFFFFu; bb[3 + k] = 0u; bb[6 + k] = 0xFFFFFFFFu; bb[9 + k] = 0u; }
@@ -684,21 +701,104 @@ __device__ void cell_box(const Grid& gr, u32 level, u32 ix, u32 iy, u32 iz, Iv* 
     }
 }
 
-__device__ u64 fill_q(const CNode* nodes, u32 cnt, const float* tabs, float x, float y, float z, const float* d) {
-    float f = tape_sdf_c(nodes, cnt, tabs, x, y, z);
+struct Surface { float f, g[3], gl, w; };
+
+__device__ Surface surface(const CNode* nodes, u32 cnt, const float* tabs, float x, float y, float z, const float* d) {
+    Surface s;
+    s.f = tape_sdf_c(nodes, cnt, tabs, x, y, z);
     float h = 0.25f * fminn(fminn(d[0], d[1]), d[2]);
     float gx = tape_sdf_c(nodes, cnt, tabs, x + h, y, z) - tape_sdf_c(nodes, cnt, tabs, x - h, y, z);
     float gy = tape_sdf_c(nodes, cnt, tabs, x, y + h, z) - tape_sdf_c(nodes, cnt, tabs, x, y - h, z);
     float gz = tape_sdf_c(nodes, cnt, tabs, x, y, z + h) - tape_sdf_c(nodes, cnt, tabs, x, y, z - h);
-    float gl = sqrtf(gx * gx + gy * gy + gz * gz);
+    s.g[0] = gx; s.g[1] = gy; s.g[2] = gz;
+    s.gl = sqrtf(gx * gx + gy * gy + gz * gz);
+    s.w = (s.gl > 1e-30f) ? (fabsf(gx) * d[0] + fabsf(gy) * d[1] + fabsf(gz) * d[2]) / s.gl : 0.0f;
+    return s;
+}
+
+__device__ u64 fill_of(const Surface& s) {
     float frac = 0.5f;
-    if (gl > 1e-30f) {
-        float w = (fabsf(gx) * d[0] + fabsf(gy) * d[1] + fabsf(gz) * d[2]) / gl;
-        frac = 0.5f - f / w;
+    if (s.gl > 1e-30f) {
+        frac = 0.5f - s.f / s.w;
         if (frac < 0.0f) frac = 0.0f;
         if (frac > 1.0f) frac = 1.0f;
     }
     return (u64)floor((double)frac * 1048576.0 + 0.5);
+}
+
+__device__ u64 fill_q(const CNode* nodes, u32 cnt, const float* tabs, float x, float y, float z, const float* d) { return fill_of(surface(nodes, cnt, tabs, x, y, z, d)); }
+
+__device__ __forceinline__ u64 qarea(float a) { return (u64)floor((double)a * 1024.0 + 0.5); }
+
+__device__ float march(const CNode* nodes, u32 cnt, const float* tabs, const float* p, const float* dir, bool inside, float t0, float tmax, float hmin) {
+    float t = t0;
+    for (u32 i = 0; i < MARCH_STEPS; ++i) {
+        if (t >= tmax) return tmax;
+        float f = tape_sdf_c(nodes, cnt, tabs, p[0] + dir[0] * t, p[1] + dir[1] * t, p[2] + dir[2] * t);
+        float s = inside ? -f : f;
+        if (s <= 0.0f) return t;
+        t = t + ((s > hmin) ? s : hmin);
+    }
+    return tmax;
+}
+
+struct Probe { float area, wall, gap; bool thin, narrow, undercut; };
+
+__device__ Probe probe(const CNode* nodes, u32 cnt, const float* tabs, const Goal& goal, const Surface& s, const float* c, const float* d) {
+    Probe pr; pr.area = 0.0f; pr.wall = FAR32; pr.gap = FAR32; pr.thin = false; pr.narrow = false; pr.undercut = false;
+    if (!(s.gl > 1e-30f) || !(fabsf(s.f) < 0.5f * s.w)) return pr;
+    pr.area = d[0] * d[1] * d[2] / s.w;
+    float n[3] = {s.g[0] / s.gl, s.g[1] / s.gl, s.g[2] / s.gl};
+    float p[3] = {c[0] - n[0] * s.f, c[1] - n[1] * s.f, c[2] - n[2] * s.f};
+    float dm = fminn(fminn(d[0], d[1]), d[2]);
+    float hmin = 0.1f * dm;
+    if (!(fabsf(tape_sdf_c(nodes, cnt, tabs, p[0], p[1], p[2])) <= hmin)) return pr;
+    float mh = -hmin;
+    float fin = tape_sdf_c(nodes, cnt, tabs, p[0] + n[0] * mh, p[1] + n[1] * mh, p[2] + n[2] * mh);
+    float fout = tape_sdf_c(nodes, cnt, tabs, p[0] + n[0] * hmin, p[1] + n[1] * hmin, p[2] + n[2] * hmin);
+    if (!(fin < 0.0f && fout > 0.0f)) return pr;
+    if (goal.min_wall > 0.0) {
+        float tw = (float)goal.min_wall;
+        float nd[3] = {-n[0], -n[1], -n[2]};
+        pr.wall = march(nodes, cnt, tabs, p, nd, true, hmin, tw, hmin);
+        pr.thin = pr.wall < tw;
+    }
+    if (goal.min_gap > 0.0) {
+        float tg = (float)goal.min_gap;
+        pr.gap = march(nodes, cnt, tabs, p, n, false, hmin, tg, hmin);
+        pr.narrow = pr.gap < tg;
+    }
+    if (goal.machining_3ax != 0u) {
+        float q[3] = {p[0] + n[0] * dm, p[1] + n[1] * dm, p[2] + n[2] * dm};
+        bool up = n[2] >= -0.25f;
+        float dir[3] = {0.0f, 0.0f, up ? 1.0f : -1.0f};
+        float tmax = up ? (float)goal.domain_hi[2] - q[2] : q[2] - (float)goal.domain_lo[2];
+        if (tmax > 0.0f && tape_sdf_c(nodes, cnt, tabs, q[0], q[1], q[2]) > 0.0f) pr.undercut = march(nodes, cnt, tabs, q, dir, false, 0.0f, tmax, 0.5f * dm) < tmax;
+    }
+    return pr;
+}
+
+__device__ void acc_moments(u64* cc, u32 ix, u32 iy, u32 iz, u32 sh, u64 q20) {
+    u64 w = 1ull << (3u * sh);
+    u64 q6 = q20 >> 14;
+    u64 ss = 4ull << (2u * sh);
+    u32 idx[3] = {ix, iy, iz};
+    for (int k = 0; k < 3; ++k) {
+        u64 c2 = ((u64)(2u * idx[k] + 1u)) << sh;
+        atomicAdd((unsigned long long*)&cc[C_M1 + k], (unsigned long long)(q20 * w * c2));
+        atomicAdd((unsigned long long*)&cc[C_M2 + k], (unsigned long long)(q6 * w * (12ull * c2 * c2 + ss)));
+    }
+    atomicAdd((unsigned long long*)&cc[C_V6], (unsigned long long)(q6 * w));
+}
+
+__device__ void acc_probe(u64* cc, const Probe& p) {
+    u64 aq = qarea(p.area);
+    if (aq != 0ull) atomicAdd((unsigned long long*)&cc[C_AREA], (unsigned long long)aq);
+    if (p.thin) atomicAdd((unsigned long long*)&cc[C_THIN], (unsigned long long)aq);
+    if (p.narrow) atomicAdd((unsigned long long*)&cc[C_GAP], (unsigned long long)aq);
+    if (p.undercut) atomicAdd((unsigned long long*)&cc[C_UNDERCUT], (unsigned long long)aq);
+    if (p.wall < FAR32) atomicMin((unsigned long long*)&cc[C_MIN_WALL], (unsigned long long)__float_as_uint(p.wall));
+    if (p.gap < FAR32) atomicMin((unsigned long long*)&cc[C_MIN_GAP], (unsigned long long)__float_as_uint(p.gap));
 }
 
 __device__ __forceinline__ u64 enc(u32 cfg, u32 ix, u32 iy, u32 iz) { return ((u64)cfg << 32) | ((u64)ix << 20) | ((u64)iy << 10) | (u64)iz; }
@@ -770,7 +870,8 @@ AG_KERNEL void ag_ad_classify(const DopsArgs* a) {
         Iv r = tape_iv(tape, c, tb, b[0], b[1], b[2]);
         if (r.lo - e > 0.0f) continue;
         if (r.hi + e < 0.0f) {
-            atomicAdd((unsigned long long*)&counts[4 * cfg], (unsigned long long)(1ull << (3u * sh)));
+            atomicAdd((unsigned long long*)&counts[CS * cfg], (unsigned long long)(1ull << (3u * sh)));
+            acc_moments(counts + (u64)CS * cfg, ix, iy, iz, sh, 1ull << 20);
             u32 lo[3] = {ix << sh, iy << sh, iz << sh};
             acc_bbox(ag_ptr<u32>(a->bbox) + 12u * cfg, lo, 1u << sh, true);
             u32 idx[3] = {ix, iy, iz};
@@ -810,10 +911,16 @@ AG_KERNEL void ag_ad_resolve(const DopsArgs* a) {
         Iv b[3];
         cell_box(gr, l, ix, iy, iz, b);
         u64 w = 1ull << (3u * sh);
-        atomicAdd((unsigned long long*)&counts[4 * cfg + 1], (unsigned long long)w);
+        u64* cc = counts + (u64)CS * cfg;
+        atomicAdd((unsigned long long*)&cc[C_BOUNDARY], (unsigned long long)w);
         float d[3] = {b[0].hi - b[0].lo, b[1].hi - b[1].lo, b[2].hi - b[2].lo};
-        float cx = 0.5f * (b[0].lo + b[0].hi), cy = 0.5f * (b[1].lo + b[1].hi), cz = 0.5f * (b[2].lo + b[2].hi);
-        atomicAdd((unsigned long long*)&counts[4 * cfg + 2], (unsigned long long)(fill_q(tape, c, tb, cx, cy, cz, d) * w));
+        float cxyz[3] = {0.5f * (b[0].lo + b[0].hi), 0.5f * (b[1].lo + b[1].hi), 0.5f * (b[2].lo + b[2].hi)};
+        Surface sf = surface(tape, c, tb, cxyz[0], cxyz[1], cxyz[2], d);
+        u64 fq = fill_of(sf);
+        atomicAdd((unsigned long long*)&cc[C_FILL], (unsigned long long)(fq * w));
+        acc_moments(cc, ix, iy, iz, sh, fq);
+        Probe pr = probe(tape, c, tb, goal, sf, cxyz, d);
+        acc_probe(cc, pr);
         u32 lo[3] = {ix << sh, iy << sh, iz << sh};
         acc_bbox(ag_ptr<u32>(a->bbox) + 12u * cfg, lo, 1u << sh, false);
         u32 idx[3] = {ix, iy, iz};
@@ -855,6 +962,63 @@ AG_KERNEL void ag_ad_total(const DopsArgs* a) {
     ag_ptr<u32>(a->lvl)[a->level + 1u] = (ag_ptr<const u32>(a->offs)[cap - 1u] + ag_ptr<const u32>(a->flag)[cap - 1u]) * 8u;
 }
 
+// ---- engineering metrics (twin of reference.rs engineering) ----
+#define OB_CENTROID 13
+#define OB_INERTIA 16
+#define OB_AREA 19
+#define OB_THIN 20
+#define OB_MIN_WALL 21
+#define OB_GAP 22
+#define OB_MIN_GAP 23
+#define OB_UNDERCUT 24
+#define OB_VIOLATION 25
+#define OB_CENTROID_OK 26
+struct Eng { double centroid[3], inertia[3], area, thin, min_wall, gap, min_gap, undercut, violation; bool centroid_ok; };
+
+__device__ double min_bits(u64 v) { return (v == 0xFFFFFFFFFFFFFFFFull) ? -1.0 : (double)__uint_as_float((u32)v); }
+
+__device__ Eng engineering(const Grid& gr, const Goal& goal, const u64* cc, double ve) {
+    Eng e;
+    double qa = 1.0 / 1024.0;
+    double v20 = (double)cc[C_INSIDE] * 1048576.0 + (double)cc[C_FILL];
+    double v6 = (double)cc[C_V6];
+    double var[3];
+    e.centroid_ok = true;
+    for (int k = 0; k < 3; ++k) {
+        double half = 0.5 * gr.fine[k];
+        double m1 = (v20 > 0.0) ? (double)cc[C_M1 + k] / v20 : 0.0;
+        double m2 = (v6 > 0.0) ? (double)cc[C_M2 + k] / (12.0 * v6) : 0.0;
+        e.centroid[k] = gr.lo[k] + m1 * half;
+        double vv = m2 - m1 * m1;
+        var[k] = (vv > 0.0) ? vv * half * half : 0.0;
+        if (goal.centroid_hi[k] > goal.centroid_lo[k] && !(e.centroid[k] >= goal.centroid_lo[k] && e.centroid[k] <= goal.centroid_hi[k])) e.centroid_ok = false;
+    }
+    e.inertia[0] = ve * (var[1] + var[2]);
+    e.inertia[1] = ve * (var[0] + var[2]);
+    e.inertia[2] = ve * (var[0] + var[1]);
+    e.thin = (double)cc[C_THIN] * qa;
+    e.gap = (double)cc[C_GAP] * qa;
+    e.undercut = (double)cc[C_UNDERCUT] * qa;
+    double over = e.undercut - goal.undercut_tol;
+    e.violation = e.thin + e.gap + ((goal.machining_3ax != 0u && over > 0.0) ? over : 0.0);
+    e.area = (double)cc[C_AREA] * qa;
+    e.min_wall = (goal.min_wall > 0.0) ? min_bits(cc[C_MIN_WALL]) : -1.0;
+    e.min_gap = (goal.min_gap > 0.0) ? min_bits(cc[C_MIN_GAP]) : -1.0;
+    return e;
+}
+
+__device__ void eng_write(const Eng& e, double* o) {
+    for (int k = 0; k < 3; ++k) { o[OB_CENTROID + k] = e.centroid[k]; o[OB_INERTIA + k] = e.inertia[k]; }
+    o[OB_AREA] = e.area;
+    o[OB_THIN] = e.thin;
+    o[OB_MIN_WALL] = e.min_wall;
+    o[OB_GAP] = e.gap;
+    o[OB_MIN_GAP] = e.min_gap;
+    o[OB_UNDERCUT] = e.undercut;
+    o[OB_VIOLATION] = e.violation;
+    o[OB_CENTROID_OK] = e.centroid_ok ? 1.0 : 0.0;
+}
+
 // ---- check + decide / observe ----
 AG_KERNEL void ag_dop_decide(const DopsArgs* a) {
     u32 c = AG_TID;
@@ -864,7 +1028,7 @@ AG_KERNEL void ag_dop_decide(const DopsArgs* a) {
     u32 nn = a->nodes, kn = a->params, rn = a->records;
     const Goal goal = *ag_ptr<const Goal>(a->goal);
     Grid gr = make_grid(goal, a->coarse, a->levels);
-    const u64* counts = ag_ptr<const u64>(a->counts) + 4u * c;
+    const u64* counts = ag_ptr<const u64>(a->counts) + (u64)CS * c;
     const u32* bb = ag_ptr<const u32>(a->bbox) + 12u * c;
     u32 dom = ag_ptr<const u32>(a->domain_hit)[c];
     double vc = gr.fine[0] * gr.fine[1] * gr.fine[2];
@@ -877,6 +1041,7 @@ AG_KERNEL void ag_dop_decide(const DopsArgs* a) {
         if (bb[3 + k] > bb[k]) el[k] = (double)(bb[3 + k] - bb[k]) * gr.fine[k];
         if (bb[9 + k] > bb[6 + k]) eh[k] = (double)(bb[9 + k] - bb[6 + k]) * gr.fine[k];
     }
+    Eng en = engineering(gr, goal, counts, ve);
     bool empty = (counts[0] + counts[1]) == 0ull;
     bool hard = el[0] > goal.max_ext[0] || el[1] > goal.max_ext[1] || el[2] > goal.max_ext[2];
     double* obs = ag_ptr<double>(a->obs) + (u64)c * OBS;
@@ -891,7 +1056,8 @@ AG_KERNEL void ag_dop_decide(const DopsArgs* a) {
             if ((u32)cmds[r].opcode == a->ops.update) continue;
             if (status[r].status == AG_ACCEPTED) acc += 1u; else rej += 1u;
         }
-        bool geometry_ok = !empty && dom == 0u && !hard;
+        bool worse = en.violation > obs[OB_VIOLATION];
+        bool geometry_ok = !empty && dom == 0u && !hard && !worse;
         bool commit = geometry_ok && acc > 0u;
         if (!geometry_ok && acc > 0u) {
             unsigned short code = empty ? AG_TOPOLOGY_FAILED : (dom != 0u ? AG_CAPACITY_EXCEEDED : AG_REQUIREMENT_FAILED);
@@ -927,13 +1093,17 @@ AG_KERNEL void ag_dop_decide(const DopsArgs* a) {
         obs[5] = eh[0]; obs[6] = eh[1]; obs[7] = eh[2];
         obs[8] = (dom != 0u) ? 1.0 : 0.0;
         obs[9] = (double)cur_c[c];
-        bool met = !empty && dom == 0u && ve >= goal.vol_lo && ve <= goal.vol_hi && eh[0] <= goal.max_ext[0] && eh[1] <= goal.max_ext[1] && eh[2] <= goal.max_ext[2];
+        bool met = !empty && dom == 0u && ve >= goal.vol_lo && ve <= goal.vol_hi && eh[0] <= goal.max_ext[0] && eh[1] <= goal.max_ext[1] && eh[2] <= goal.max_ext[2]
+            && en.violation == 0.0 && en.centroid_ok;
         obs[10] = met ? 1.0 : 0.0;
         double err = (ve - t) / t;
         obs[11] = err;
         obs[12] = ve;
+        eng_write(en, obs);
+        for (int k = 0; k < 3; ++k) obs[27 + k] = (eh[k] > 0.0) ? gr.lo[k] + (double)bb[6 + k] * gr.fine[k] : 0.0;
         if (met) done[c] = 1u;
-        ag_ptr<double>(a->score)[c] = met ? fabs(err) : 1000.0 + fabs(err);
+        double pen = ((en.area > 0.0) ? en.violation / en.area : 0.0) + (en.centroid_ok ? 0.0 : 1.0);
+        ag_ptr<double>(a->score)[c] = met ? fabs(err) : 1000.0 + fabs(err) + pen;
     }
 }
 
@@ -961,4 +1131,238 @@ AG_KERNEL void ag_dop_stamp(const StampParams* p) {
     u64 t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     ag_ptr<u64>(p->stamps)[(u64)round * 8u + p->stage] = t;
+}
+
+// =====================================================================================
+// Stiffness proxy: voxel hex8 elasticity, matrix-free Jacobi-PCG (twin of src/fea.rs)
+// =====================================================================================
+#define DOT_BLOCKS 256u
+#define DOT_T 256u
+#define S_RZ 0
+#define S_RZN 1
+#define S_PAP 2
+#define S_RR 3
+#define S_BN 4
+#define S_DONE 5
+#define S_ITER 6
+#define S_COMPLIANCE 7
+#define S_CONVERGED 8
+#define S_BB 9
+#define N_USED 1u
+#define N_FIXED 2u
+#define N_LOADED 4u
+struct FeaArgs {
+    u64 tape, tables, solid, nflag, ke, x, r, z, p, ap, b, diag, scal, stat;
+    double lo[3], h, force[3], tol;
+    u32 count, dims[3], axis, _pad[3];
+};
+struct DotArgs { u64 a0, b0, a1, b1, part, scal, n; u32 slot0, slot1, ndots, always; };
+
+__device__ __forceinline__ bool fea_active(const u32* nf, u64 dof) { u32 f = nf[dof / 3u]; return (f & N_USED) != 0u && (f & N_FIXED) == 0u; }
+
+AG_KERNEL void ag_fea_voxelize(const FeaArgs* a) {
+    u64 d0 = a->dims[0], d1 = a->dims[1], d2 = a->dims[2];
+    const CNode* tape = ag_ptr<const CNode>(a->tape);
+    const float* tb = ag_ptr<const float>(a->tables);
+    u32* solid = ag_ptr<u32>(a->solid);
+    u64* stat = ag_ptr<u64>(a->stat);
+    GRID_STRIDE(v, d0 * d1 * d2) {
+        u64 i = v % d0, j = (v / d0) % d1, k = v / (d0 * d1);
+        float x = (float)(a->lo[0] + ((double)i + 0.5) * a->h);
+        float y = (float)(a->lo[1] + ((double)j + 0.5) * a->h);
+        float z = (float)(a->lo[2] + ((double)k + 0.5) * a->h);
+        bool inside = a->count > 0u && tape_sdf_c(tape, a->count, tb, x, y, z) < 0.0f;
+        solid[v] = inside ? 1u : 0u;
+        if (inside) atomicAdd((unsigned long long*)&stat[2], 1ull);
+    }
+}
+
+AG_KERNEL void ag_fea_nodes(const FeaArgs* a) {
+    u64 d[3] = {a->dims[0], a->dims[1], a->dims[2]};
+    const u32* solid = ag_ptr<const u32>(a->solid);
+    u32* nf = ag_ptr<u32>(a->nflag);
+    u64* stat = ag_ptr<u64>(a->stat);
+    u64 nx = d[0] + 1, ny = d[1] + 1;
+    GRID_STRIDE(n, nx * ny * (d[2] + 1)) {
+        u64 c[3] = {n % nx, (n / nx) % ny, n / (nx * ny)};
+        bool used = false;
+        for (int dk = 0; dk < 2; ++dk) for (int dj = 0; dj < 2; ++dj) for (int di = 0; di < 2; ++di) {
+            long long i = (long long)c[0] + di - 1, j = (long long)c[1] + dj - 1, k = (long long)c[2] + dk - 1;
+            if (i >= 0 && j >= 0 && k >= 0 && (u64)i < d[0] && (u64)j < d[1] && (u64)k < d[2] && solid[((u64)k * d[1] + (u64)j) * d[0] + (u64)i] != 0u) used = true;
+        }
+        u32 ax = a->axis;
+        u32 f = 0u;
+        if (used) {
+            f |= N_USED;
+            if (c[ax] == 0ull) f |= N_FIXED;
+            if (c[ax] == d[ax]) { f |= N_LOADED; atomicAdd((unsigned long long*)&stat[0], 1ull); }
+            if (c[ax] != 0ull) atomicAdd((unsigned long long*)&stat[3], 3ull);
+        }
+        nf[n] = f;
+    }
+}
+
+AG_KERNEL void ag_fea_init(const FeaArgs* a) {
+    u64 nd = 3ull * (u64)(a->dims[0] + 1u) * (u64)(a->dims[1] + 1u) * (u64)(a->dims[2] + 1u);
+    const u32* nf = ag_ptr<const u32>(a->nflag);
+    const double* ke = ag_ptr<const double>(a->ke);
+    u64 nload = ag_ptr<const u64>(a->stat)[0];
+    double *x = ag_ptr<double>(a->x), *r = ag_ptr<double>(a->r), *z = ag_ptr<double>(a->z), *p = ag_ptr<double>(a->p), *b = ag_ptr<double>(a->b), *dg = ag_ptr<double>(a->diag);
+    GRID_STRIDE(i, nd) {
+        bool act = fea_active(nf, i);
+        u32 c = (u32)(i % 3ull);
+        b[i] = (act && (nf[i / 3u] & N_LOADED) != 0u) ? a->force[c] / (double)nload : 0.0;
+        dg[i] = act ? ke[c * 25u] * 4.0 : 1.0;
+        x[i] = 0.0;
+        r[i] = b[i];
+        z[i] = r[i] / dg[i];
+        p[i] = z[i];
+    }
+}
+
+AG_KERNEL void ag_fea_dot_part(const DotArgs* a) {
+    __shared__ double s0[DOT_T];
+    __shared__ double s1[DOT_T];
+    const double* scal = ag_ptr<const double>(a->scal);
+    if (a->always == 0u && scal[S_DONE] != 0.0) return;
+    u32 t = threadIdx.x, blk = blockIdx.x;
+    const double *a0 = ag_ptr<const double>(a->a0), *b0 = ag_ptr<const double>(a->b0), *a1 = ag_ptr<const double>(a->a1), *b1 = ag_ptr<const double>(a->b1);
+    double v0 = 0.0, v1 = 0.0;
+    for (u64 i = (u64)blk * DOT_T + t; i < a->n; i += (u64)DOT_BLOCKS * DOT_T) {
+        v0 = v0 + a0[i] * b0[i];
+        if (a->ndots > 1u) v1 = v1 + a1[i] * b1[i];
+    }
+    s0[t] = v0; s1[t] = v1;
+    __syncthreads();
+    for (u32 st = DOT_T / 2u; st > 0u; st >>= 1) {
+        if (t < st) { s0[t] = s0[t] + s0[t + st]; s1[t] = s1[t] + s1[t + st]; }
+        __syncthreads();
+    }
+    if (t == 0u) { double* part = ag_ptr<double>(a->part); part[blk] = s0[0]; part[DOT_BLOCKS + blk] = s1[0]; }
+}
+
+AG_KERNEL void ag_fea_dot_final(const DotArgs* a) {
+    __shared__ double s0[DOT_T];
+    __shared__ double s1[DOT_T];
+    double* scal = ag_ptr<double>(a->scal);
+    if (a->always == 0u && scal[S_DONE] != 0.0) return;
+    u32 t = threadIdx.x;
+    const double* part = ag_ptr<const double>(a->part);
+    double v0 = 0.0, v1 = 0.0;
+    for (u32 k = t; k < DOT_BLOCKS; k += DOT_T) { v0 = v0 + part[k]; v1 = v1 + part[DOT_BLOCKS + k]; }
+    s0[t] = v0; s1[t] = v1;
+    __syncthreads();
+    for (u32 st = DOT_T / 2u; st > 0u; st >>= 1) {
+        if (t < st) { s0[t] = s0[t] + s0[t + st]; s1[t] = s1[t] + s1[t + st]; }
+        __syncthreads();
+    }
+    if (t == 0u) {
+        scal[a->slot0] = s0[0];
+        if (a->ndots > 1u) scal[a->slot1] = s1[0];
+        if (a->always == 0u && a->slot0 == (u32)S_PAP && !(s0[0] > 0.0)) scal[S_DONE] = 1.0;
+    }
+}
+
+AG_KERNEL void ag_fea_start(const FeaArgs* a) {
+    if (AG_TID != 0) return;
+    double* scal = ag_ptr<double>(a->scal);
+    double bn = sqrt(scal[S_BB]);
+    scal[S_BN] = (bn > 2.2250738585072014e-308) ? bn : 2.2250738585072014e-308;
+    scal[S_DONE] = 0.0; scal[S_ITER] = 0.0; scal[S_CONVERGED] = 0.0;
+}
+
+AG_KERNEL void ag_fea_check(const FeaArgs* a) {
+    if (AG_TID != 0) return;
+    double* scal = ag_ptr<double>(a->scal);
+    if (scal[S_DONE] != 0.0) return;
+    if (sqrt(scal[S_RR]) / scal[S_BN] <= a->tol) { scal[S_DONE] = 1.0; scal[S_CONVERGED] = 1.0; }
+}
+
+__device__ const u32 FEA_CORNER[8][3] = {{0,0,0},{1,0,0},{1,1,0},{0,1,0},{0,0,1},{1,0,1},{1,1,1},{0,1,1}};
+
+AG_KERNEL void ag_fea_matvec(const FeaArgs* a) {
+    if (ag_ptr<const double>(a->scal)[S_DONE] != 0.0) return;
+    u64 d[3] = {a->dims[0], a->dims[1], a->dims[2]};
+    u64 nx = d[0] + 1, ny = d[1] + 1;
+    u64 nd = 3ull * nx * ny * (d[2] + 1);
+    const u32* solid = ag_ptr<const u32>(a->solid);
+    const u32* nf = ag_ptr<const u32>(a->nflag);
+    const double* ke = ag_ptr<const double>(a->ke);
+    const double* p = ag_ptr<const double>(a->p);
+    double* yv = ag_ptr<double>(a->ap);
+    GRID_STRIDE(dof, nd) {
+        if (!fea_active(nf, dof)) { yv[dof] = 0.0; continue; }
+        u64 n = dof / 3ull;
+        u32 comp = (u32)(dof % 3ull);
+        u64 c[3] = {n % nx, (n / nx) % ny, n / (nx * ny)};
+        double y = 0.0;
+        for (u32 dk = 0; dk < 2u; ++dk) for (u32 dj = 0; dj < 2u; ++dj) for (u32 di = 0; di < 2u; ++di) {
+            if (c[0] + di < 1ull || c[1] + dj < 1ull || c[2] + dk < 1ull) continue;
+            u64 i = c[0] + di - 1ull, j = c[1] + dj - 1ull, k = c[2] + dk - 1ull;
+            if (i >= d[0] || j >= d[1] || k >= d[2] || solid[(k * d[1] + j) * d[0] + i] == 0u) continue;
+            u32 l0 = 1u - di, l1 = 1u - dj, l2 = 1u - dk;
+            u32 la = 0;
+            for (u32 q = 0; q < 8u; ++q) if (FEA_CORNER[q][0] == l0 && FEA_CORNER[q][1] == l1 && FEA_CORNER[q][2] == l2) la = q;
+            u32 row = 3u * la + comp;
+            double s = 0.0;
+            for (u32 q = 0; q < 8u; ++q) {
+                u64 m = ((k + FEA_CORNER[q][2]) * ny + (j + FEA_CORNER[q][1])) * nx + (i + FEA_CORNER[q][0]);
+                for (u32 e = 0; e < 3u; ++e) {
+                    u64 dd = 3ull * m + e;
+                    double u = fea_active(nf, dd) ? p[dd] : 0.0;
+                    s = s + ke[row * 24u + 3u * q + e] * u;
+                }
+            }
+            y = y + 1.0 * s;
+        }
+        yv[dof] = y;
+    }
+}
+
+AG_KERNEL void ag_fea_update1(const FeaArgs* a) {
+    const double* scal = ag_ptr<const double>(a->scal);
+    if (scal[S_DONE] != 0.0) return;
+    u64 nd = 3ull * (u64)(a->dims[0] + 1u) * (u64)(a->dims[1] + 1u) * (u64)(a->dims[2] + 1u);
+    double alpha = scal[S_RZ] / scal[S_PAP];
+    double *x = ag_ptr<double>(a->x), *r = ag_ptr<double>(a->r), *z = ag_ptr<double>(a->z);
+    const double *p = ag_ptr<const double>(a->p), *ap = ag_ptr<const double>(a->ap), *dg = ag_ptr<const double>(a->diag);
+    GRID_STRIDE(i, nd) {
+        x[i] = x[i] + alpha * p[i];
+        r[i] = r[i] - alpha * ap[i];
+        z[i] = r[i] / dg[i];
+    }
+}
+
+AG_KERNEL void ag_fea_update2(const FeaArgs* a) {
+    const double* scal = ag_ptr<const double>(a->scal);
+    if (scal[S_DONE] != 0.0) return;
+    u64 nd = 3ull * (u64)(a->dims[0] + 1u) * (u64)(a->dims[1] + 1u) * (u64)(a->dims[2] + 1u);
+    double beta = scal[S_RZN] / scal[S_RZ];
+    const double* z = ag_ptr<const double>(a->z);
+    double* p = ag_ptr<double>(a->p);
+    GRID_STRIDE(i, nd) { p[i] = z[i] + beta * p[i]; }
+}
+
+AG_KERNEL void ag_fea_step(const FeaArgs* a) {
+    if (AG_TID != 0) return;
+    double* scal = ag_ptr<double>(a->scal);
+    if (scal[S_DONE] != 0.0) return;
+    scal[S_RZ] = scal[S_RZN];
+    scal[S_ITER] = scal[S_ITER] + 1.0;
+}
+
+AG_KERNEL void ag_fea_finish(const FeaArgs* a) {
+    if (AG_TID != 0) return;
+    double* scal = ag_ptr<double>(a->scal);
+    if (sqrt(scal[S_RR]) / scal[S_BN] <= a->tol) scal[S_CONVERGED] = 1.0;
+}
+
+AG_KERNEL void ag_fea_maxdisp(const FeaArgs* a) {
+    u64 nn = (u64)(a->dims[0] + 1u) * (u64)(a->dims[1] + 1u) * (u64)(a->dims[2] + 1u);
+    const double* x = ag_ptr<const double>(a->x);
+    u64* stat = ag_ptr<u64>(a->stat);
+    GRID_STRIDE(n, nn) {
+        double m = sqrt(x[3 * n] * x[3 * n] + x[3 * n + 1] * x[3 * n + 1] + x[3 * n + 2] * x[3 * n + 2]);
+        atomicMax((unsigned long long*)&stat[1], (unsigned long long)__double_as_longlong(m));
+    }
 }

@@ -11,7 +11,7 @@ use bytemuck::Zeroable;
 use serde_json::{json, Value};
 
 /// Parse a `set_goal` request against the design's parameter names.
-pub fn parse_goal(args: &Value, names: &[String], body_bbox: Option<([f64; 3], [f64; 3])>) -> Result<(Goal, Vec<String>), String> {
+pub fn parse_goal(args: &Value, names: &[String], body_bbox: Option<([f64; 3], [f64; 3])>, process_3ax: bool) -> Result<(Goal, Vec<String>), String> {
     let mut g = Goal::zeroed();
     let mut notes = Vec::new();
     let num = |v: &Value| -> Option<f64> { v.as_f64().or_else(|| v.as_str().and_then(|s| agcad_ir::Quantity::parse(s).ok().map(|q| q.value))) };
@@ -61,9 +61,62 @@ pub fn parse_goal(args: &Value, names: &[String], body_bbox: Option<([f64; 3], [
         g.hole_z0 = g.domain_lo[2] + 1e-3;
         g.hole_z1 = g.domain_hi[2] - 1e-3;
     }
+    // engineering constraints (sampled on the device; see the summary's evidence levels)
+    if let Some(v) = args.get("min_wall") { g.min_wall = num(v).filter(|x| *x > 0.0).ok_or("min_wall: thickness > 0 (mm)")?; }
+    if let Some(v) = args.get("min_clearance") { g.min_gap = num(v).filter(|x| *x > 0.0).ok_or("min_clearance: gap > 0 (mm)")?; }
+    match args.get("machining").and_then(Value::as_str) {
+        Some("3ax") => g.machining_3ax = 1,
+        Some("none") => {}
+        Some(o) => return Err(format!("machining: \"3ax\" or \"none\" (got {o})")),
+        None => if process_3ax { g.machining_3ax = 1; notes.push("requirements process machining_3ax: 3-axis tool access is checked".into()); },
+    }
+    if let Some(v) = args.get("undercut_tolerance") { g.undercut_tol = num(v).ok_or("undercut_tolerance (mm²)")?; }
+    if let Some(c) = args.get("centroid") {
+        let lo = c.get("min").and_then(Value::as_array).ok_or("centroid: {min: [x, y, z], max: [x, y, z]}")?;
+        let hi = c.get("max").and_then(Value::as_array).ok_or("centroid.max")?;
+        for k in 0..3 { g.centroid_lo[k] = lo.get(k).and_then(num).ok_or("centroid.min")?; g.centroid_hi[k] = hi.get(k).and_then(num).ok_or("centroid.max")?; }
+    }
     g.gain = args.get("gain").and_then(Value::as_f64).unwrap_or(0.5);
     g.seed = args.get("seed").and_then(Value::as_u64).unwrap_or(0xA9CAD) as u32;
     Ok((g, notes))
+}
+
+/// Stiffness requirement (escalation on survivors; evidence `sampled`: voxel discretization).
+#[derive(Clone, Copy, Debug)]
+pub struct LoadSpec { pub support_axis: u32, pub force: [f64; 3], pub voxel: Option<f64>, pub e: f64, pub nu: f64, pub max_compliance: Option<f64> }
+
+pub fn parse_load(args: &Value) -> Result<Option<LoadSpec>, String> {
+    let Some(l) = args.get("load") else {
+        return if args.get("max_compliance").is_some() { Err("max_compliance needs a load {support, force}".into()) } else { Ok(None) };
+    };
+    let num = |v: &Value| -> Option<f64> { v.as_f64().or_else(|| v.as_str().and_then(|s| agcad_ir::Quantity::parse(s).ok().map(|q| q.value))) };
+    let support_axis = match l.get("support").and_then(Value::as_str).unwrap_or("z_min") { "x_min" => 0, "y_min" => 1, "z_min" => 2, o => return Err(format!("load.support: x_min | y_min | z_min (got {o})")) };
+    let f = l.get("force").and_then(Value::as_array).ok_or("load.force: [fx, fy, fz] in N")?;
+    let mut force = [0.0; 3];
+    for k in 0..3 { force[k] = f.get(k).and_then(num).ok_or("load.force: [fx, fy, fz]")?; }
+    let voxel = l.get("voxel").and_then(num);
+    if voxel.is_some_and(|h| h <= 0.0) { return Err("load.voxel must be > 0 (mm)".into()); }
+    Ok(Some(LoadSpec { support_axis, force, voxel, e: l.get("E").and_then(num).unwrap_or(210_000.0), nu: l.get("nu").and_then(num).unwrap_or(0.3), max_compliance: args.get("max_compliance").and_then(num) }))
+}
+
+/// Stiffness of a survivor on its outer box (CUDA when preferred and present).
+pub fn stiffness(design: &agcad_dops::Design, obs: &[f64], spec: &LoadSpec, prefer_cuda: bool) -> Result<(agcad_dops::fea::FeaReport, f64), String> {
+    use agcad_dops::abi::ob;
+    let lo = [obs[ob::BOX_LO], obs[ob::BOX_LO + 1], obs[ob::BOX_LO + 2]];
+    let hi = [lo[0] + obs[5], lo[1] + obs[6], lo[2] + obs[7]];
+    let h = spec.voxel.unwrap_or_else(|| obs[5].max(obs[6]).max(obs[7]) / 40.0).max(1e-3);
+    let mut lc = agcad_dops::fea::LoadCase::over(lo, hi, h);
+    lc.support_axis = spec.support_axis;
+    lc.force = spec.force;
+    lc.e = spec.e;
+    lc.nu = spec.nu;
+    let r = if prefer_cuda {
+        match agcad_driver_cuda::CudaDevice::open(0) {
+            Ok(dev) => agcad_dops::fea::stiffness(dev, design, &lc),
+            Err(_) => agcad_dops::fea::stiffness(agcad_driver_cpu::CpuDevice::new(), design, &lc),
+        }
+    } else { agcad_dops::fea::stiffness(agcad_driver_cpu::CpuDevice::new(), design, &lc) };
+    r.map(|r| (r, h)).map_err(|e| e.to_string())
 }
 
 /// Fixed parameters (NaN lower bound) become a zero-width range at their base value.
@@ -121,10 +174,27 @@ pub fn summarize(r: &RolloutRun, names: &[String]) -> Value {
             "configuration": sv.configuration, "goal_met": sv.obs[10] == 1.0, "parameters": params,
             "volume_estimate": (sv.obs[12] * 10.0).round() / 10.0, "volume_bounds": [sv.obs[0], sv.obs[1]],
             "extent_bounds_hi": [sv.obs[5], sv.obs[6], sv.obs[7]], "features": sv.design.nodes.len(),
-            "evidence": { "volume_bounds": "bounded", "volume_estimate": "sampled" },
+            "engineering": engineering(&sv.obs),
+            "evidence": { "volume_bounds": "bounded", "extent_bounds": "bounded", "volume_estimate": "sampled", "engineering": "sampled" },
         })
     }).collect();
     json!({ "device": r.device, "mode": r.mode, "rounds": s.rounds, "configurations_meeting_goal": s.done, "wall_ms": (r.wall_ms * 10.0).round() / 10.0, "host_readback_bytes_during_rollout": s.in_loop_readback_bytes, "top": top })
+}
+
+/// Engineering metrics of an observation row (sampled evidence).
+pub fn engineering(o: &[f64]) -> Value {
+    use agcad_dops::abi::ob;
+    let r = |x: f64, k: f64| (x * k).round() / k;
+    let on = |x: f64| if x < 0.0 { Value::Null } else { json!(r(x, 1e3)) };
+    json!({
+        "centroid": [r(o[ob::CENTROID], 1e3), r(o[ob::CENTROID + 1], 1e3), r(o[ob::CENTROID + 2], 1e3)],
+        "inertia_unit_density": [r(o[ob::INERTIA], 1.0), r(o[ob::INERTIA + 1], 1.0), r(o[ob::INERTIA + 2], 1.0)],
+        "surface_area": r(o[ob::AREA], 10.0),
+        "min_wall_sampled": on(o[ob::MIN_WALL]), "thin_wall_area": r(o[ob::THIN_AREA], 10.0),
+        "min_clearance_sampled": on(o[ob::MIN_GAP]), "narrow_gap_area": r(o[ob::GAP_AREA], 10.0),
+        "undercut_area_3ax": r(o[ob::UNDERCUT_AREA], 10.0),
+        "violation_area": r(o[ob::VIOLATION], 10.0), "centroid_ok": o[ob::CENTROID_OK] == 1.0,
+    })
 }
 
 /// Exact check of a survivor (escalation) without touching the document.

@@ -19,5 +19,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+agcad-std = { workspace = true }
 agcad-driver-cpu = { workspace = true }
 agcad-driver-cuda = { workspace = true }

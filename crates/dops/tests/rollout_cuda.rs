@@ -145,3 +145,34 @@ fn two_graph_shards_equal_one_device() {
     assert_eq!(s.top.iter().map(|t| t.configuration).collect::<Vec<_>>(), one.top.iter().map(|t| t.configuration).collect::<Vec<_>>());
     for (a, b) in s.top.iter().zip(&one.top) { assert_eq!(a.score.to_bits(), b.score.to_bits()); }
 }
+
+/// Engineering probes (moments, area, wall, gap, 3-axis access) are bit-identical on CUDA.
+#[test]
+#[ignore = "requires NVIDIA GPU"]
+fn engineering_probes_bitwise() {
+    use agcad_dops::examples::{box_goal, flange, goal, pocketed_plate, plate_goal, shelled_box};
+    let cuda = agcad_driver_cuda::CudaDevice::open(0).unwrap();
+    let on = |mut g: agcad_dops::Goal| { g.min_wall = 3.0; g.min_gap = 12.0; g.machining_3ax = 1; g };
+    for (d, g) in [(shelled_box(2.0), on(box_goal())), (flange(60.0, 12.0, 6.0), on(goal(1.0, 2.0))), (pocketed_plate(100.0, 3.0), on(plate_goal()))] {
+        let a = agcad_dops::studio::certify(cuda.clone(), &d, &g, 6, 1 << 16).unwrap();
+        let b = agcad_dops::studio::certify(agcad_driver_cpu::CpuDevice::new(), &d, &g, 6, 1 << 16).unwrap();
+        assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "{a:?}\n{b:?}");
+    }
+}
+
+/// Device stiffness proxy: CUDA ≡ CPU bitwise (fixed-shape reductions).
+#[test]
+#[ignore = "requires NVIDIA GPU"]
+fn fea_pcg_bitwise() {
+    use agcad_dops::fea::{stiffness, LoadCase};
+    let d = cpu::flange(60.0, 12.0, 6.0);
+    let mut lc = LoadCase::over([-61.0, -61.0, 0.0], [61.0, 61.0, 12.0], 3.0);
+    lc.force = [500.0, 0.0, 0.0];
+    let a = stiffness(agcad_driver_cuda::CudaDevice::open(0).unwrap(), &d, &lc).unwrap();
+    let b = stiffness(agcad_driver_cpu::CpuDevice::new(), &d, &lc).unwrap();
+    eprintln!("flange FEA: {} voxels, {} dofs, {} iterations, compliance {}", a.voxels, a.dofs, a.iterations, a.compliance);
+    assert!(a.converged);
+    assert_eq!(a.compliance.to_bits(), b.compliance.to_bits());
+    assert_eq!(a.max_disp.to_bits(), b.max_disp.to_bits());
+    assert_eq!((a.iterations, a.voxels, a.dofs), (b.iterations, b.voxels, b.dofs));
+}

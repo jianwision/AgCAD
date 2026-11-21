@@ -18,7 +18,9 @@ pub const NVALS: usize = 12;
 /// Observation row width (f64) per configuration: 0 vol_lo, 1 vol_hi (bounded), 2–4 extent lo,
 /// 5–7 extent hi (bounded), 8 domain hit, 9 features, 10 goal met, 11 relative error,
 /// 12 volume estimate (sampled).
-pub const OBS: usize = 16;
+pub const OBS: usize = 32;
+/// u64 accumulators per configuration (see `cnt`).
+pub const CS: usize = 16;
 /// Maximum parameters per configuration.
 pub const MAX_PARAMS: usize = 8;
 /// Maximum pattern instances evaluated per feature.
@@ -127,7 +129,8 @@ pub struct Goal {
     pub vol_hi: f64,
     /// Hard limit on the bounding-box extent (mm): edits that definitely exceed it are rejected.
     pub max_ext: [f64; 3],
-    pub _pad0: f64,
+    /// Minimum wall thickness (mm, 0 = off): sampled by marching inward from boundary cells.
+    pub min_wall: f64,
     /// Where structural actions may place new holes (x0, y0, x1, y1) and their size / depth.
     pub place: [f64; 4],
     pub hole_r: f64,
@@ -141,7 +144,63 @@ pub struct Goal {
     pub param_sign: [f64; MAX_PARAMS],
     pub n_params: u32,
     pub seed: u32,
-    pub _pad1: [u32; 2],
+    /// 1 = every surface must be reachable by a tool along −z (3-axis machining from +z,
+    /// the part's free bottom being the fixture side).
+    pub machining_3ax: u32,
+    pub _pad1: u32,
+    /// Minimum clearance across empty space (mm, 0 = off): sampled by marching outward.
+    pub min_gap: f64,
+    /// Allowed undercut area (mm²) when `machining_3ax` is set.
+    pub undercut_tol: f64,
+    /// Centroid box (mm); ignored unless hi > lo on that axis.
+    pub centroid_lo: [f64; 3],
+    pub centroid_hi: [f64; 3],
+}
+
+/// Accumulator slots (`CS` u64 per configuration) filled by the adaptive evaluation.
+pub mod cnt {
+    pub const INSIDE: usize = 0;
+    pub const BOUNDARY: usize = 1;
+    pub const FILL: usize = 2;
+    /// Areas are quantized to 2⁻¹⁰ mm².
+    pub const THIN_AREA: usize = 3;
+    /// First moments Σ q20·w·c₂ (c₂ = doubled finest-cell centre index), x y z.
+    pub const M1: usize = 4;
+    /// Second moments Σ q6·w·(12 c₂² + S²) (S = doubled cell side), x y z.
+    pub const M2: usize = 7;
+    pub const UNDERCUT_AREA: usize = 10;
+    pub const GAP_AREA: usize = 11;
+    /// f32 bits of the minimum sampled wall / gap (u64::MAX = none).
+    pub const MIN_WALL: usize = 12;
+    pub const MIN_GAP: usize = 13;
+    pub const AREA: usize = 14;
+    /// Σ q6·w (normalizer of M2).
+    pub const V6: usize = 15;
+}
+
+/// Observation row layout (`OBS` f64 per configuration).
+pub mod ob {
+    pub const VOL_LO: usize = 0;
+    pub const VOL_HI: usize = 1;
+    pub const MET: usize = 10;
+    pub const ERR: usize = 11;
+    pub const VOL_EST: usize = 12;
+    /// Centroid (sampled), x y z.
+    pub const CENTROID: usize = 13;
+    /// Inertia about the centroid, unit density (mm⁵, sampled), Ixx Iyy Izz.
+    pub const INERTIA: usize = 16;
+    pub const AREA: usize = 19;
+    pub const THIN_AREA: usize = 20;
+    /// Smallest sampled wall (≤ min_wall when thin; = min_wall otherwise; −1 = off).
+    pub const MIN_WALL: usize = 21;
+    pub const GAP_AREA: usize = 22;
+    pub const MIN_GAP: usize = 23;
+    pub const UNDERCUT_AREA: usize = 24;
+    /// Constraint violation (mm²): thin + gap + undercut beyond tolerance.
+    pub const VIOLATION: usize = 25;
+    pub const CENTROID_OK: usize = 26;
+    /// Outer (rigorous) bounding-box minimum corner; the box is [BOX_LO, BOX_LO + extent_hi].
+    pub const BOX_LO: usize = 27;
 }
 
 /// Per configuration and round (trace ring; training data for learned policies).

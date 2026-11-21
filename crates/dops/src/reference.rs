@@ -235,11 +235,13 @@ pub unsafe fn ag_dop_compile(params: *const u8, _: &LaunchConfig) {
 pub unsafe fn ag_dop_eval_clear(params: *const u8, _: &LaunchConfig) {
     let a = unsafe { args(params) };
     let cn = a.configs as usize;
-    let counts = unsafe { slm::<u64>(a.counts, 4 * cn) };
+    let counts = unsafe { slm::<u64>(a.counts, CS * cn) };
     let dom = unsafe { slm::<u32>(a.domain_hit, cn) };
     let bb = unsafe { slm::<u32>(a.bbox, 12 * cn) };
     for c in 0..cn {
-        for j in 0..4 { counts[4 * c + j] = 0; }
+        for j in 0..CS { counts[CS * c + j] = 0; }
+        counts[CS * c + cnt::MIN_WALL] = u64::MAX;
+        counts[CS * c + cnt::MIN_GAP] = u64::MAX;
         dom[c] = 0;
         for k in 0..3 { bb[12 * c + k] = u32::MAX; bb[12 * c + 3 + k] = 0; bb[12 * c + 6 + k] = u32::MAX; bb[12 * c + 9 + k] = 0; }
     }
@@ -273,23 +275,99 @@ pub fn cell_box(gr: &Grid, level: u32, ix: u32, iy: u32, iz: u32) -> [Iv; 3] {
     b
 }
 
-/// Fill fraction of a boundary cell (cell dims `d`), quantized to 2⁻²⁰: 0.5 − f / w with w
-/// the cell's width along the SDF gradient. Exact for axis-aligned planar faces.
-pub fn fill_q(nodes: &[CNode], tabs: &[f32], x: f32, y: f32, z: f32, d: [f32; 3]) -> u64 {
+/// SDF value, central-difference gradient and gradient width at a boundary cell centre.
+pub struct Surface { pub f: f32, pub g: [f32; 3], pub gl: f32, pub w: f32 }
+
+pub fn surface(nodes: &[CNode], tabs: &[f32], c: [f32; 3], d: [f32; 3]) -> Surface {
+    let (x, y, z) = (c[0], c[1], c[2]);
     let f = tape_sdf_c(nodes, tabs, x, y, z);
     let h = 0.25f32 * d[0].min(d[1]).min(d[2]);
     let gx = tape_sdf_c(nodes, tabs, x + h, y, z) - tape_sdf_c(nodes, tabs, x - h, y, z);
     let gy = tape_sdf_c(nodes, tabs, x, y + h, z) - tape_sdf_c(nodes, tabs, x, y - h, z);
     let gz = tape_sdf_c(nodes, tabs, x, y, z + h) - tape_sdf_c(nodes, tabs, x, y, z - h);
     let gl = (gx * gx + gy * gy + gz * gz).sqrt();
+    // width of the cell along the gradient direction
+    let w = if gl > 1e-30 { (gx.abs() * d[0] + gy.abs() * d[1] + gz.abs() * d[2]) / gl } else { 0.0 };
+    Surface { f, g: [gx, gy, gz], gl, w }
+}
+
+/// Fill fraction of a boundary cell, quantized to 2⁻²⁰: 0.5 − f / w with w the cell's width
+/// along the SDF gradient. Exact for axis-aligned planar faces.
+pub fn fill_of(s: &Surface) -> u64 {
     let mut frac = 0.5f32;
-    if gl > 1e-30 {
-        let w = (gx.abs() * d[0] + gy.abs() * d[1] + gz.abs() * d[2]) / gl;
-        frac = 0.5 - f / w;
+    if s.gl > 1e-30 {
+        frac = 0.5 - s.f / s.w;
         if frac < 0.0 { frac = 0.0; }
         if frac > 1.0 { frac = 1.0; }
     }
     (frac as f64 * 1048576.0 + 0.5).floor() as u64
+}
+
+pub fn fill_q(nodes: &[CNode], tabs: &[f32], x: f32, y: f32, z: f32, d: [f32; 3]) -> u64 { fill_of(&surface(nodes, tabs, [x, y, z], d)) }
+
+/// Area quantization: 2⁻¹⁰ mm².
+pub fn qarea(a: f32) -> u64 { (a as f64 * 1024.0 + 0.5).floor() as u64 }
+
+/// Maximum sphere-tracing steps of a probe ray.
+pub const MARCH_STEPS: u32 = 160;
+
+/// Sphere-trace from `p` along unit `dir` while the SDF keeps its sign (`inside`: negative);
+/// returns the distance of the first sign change, or `tmax`. Steps never exceed |f| (a
+/// distance bound), so thin features are not skipped; `hmin` guarantees progress.
+pub fn march(nodes: &[CNode], tabs: &[f32], p: [f32; 3], dir: [f32; 3], inside: bool, t0: f32, tmax: f32, hmin: f32) -> f32 {
+    let mut t = t0;
+    let mut i = 0u32;
+    while i < MARCH_STEPS {
+        if t >= tmax { return tmax; }
+        let f = tape_sdf_c(nodes, tabs, p[0] + dir[0] * t, p[1] + dir[1] * t, p[2] + dir[2] * t);
+        let s = if inside { -f } else { f };
+        if s <= 0.0 { return t; }
+        t = t + if s > hmin { s } else { hmin };
+        i += 1;
+    }
+    tmax
+}
+
+/// Engineering probe of one boundary cell (sampled evidence): surface area share, wall
+/// thickness along the inward normal, clearance along the outward normal, and 3-axis tool
+/// access (a ray toward +z from up-facing points, toward −z from down-facing ones: a down-facing
+/// point whose downward ray is blocked is an overhang the tool cannot reach).
+pub struct Probe { pub area: f32, pub wall: f32, pub gap: f32, pub thin: bool, pub narrow: bool, pub undercut: bool }
+
+pub fn probe(nodes: &[CNode], tabs: &[f32], goal: &Goal, s: &Surface, c: [f32; 3], d: [f32; 3]) -> Probe {
+    let mut pr = Probe { area: 0.0, wall: FAR32, gap: FAR32, thin: false, narrow: false, undercut: false };
+    // only cells the zero set actually crosses (interval-ambiguous cells near the surface
+    // are boundary for the rigorous bounds but carry no surface)
+    if !(s.gl > 1e-30) || !(s.f.abs() < 0.5f32 * s.w) { return pr; }
+    pr.area = d[0] * d[1] * d[2] / s.w;
+    let n = [s.g[0] / s.gl, s.g[1] / s.gl, s.g[2] / s.gl];
+    // surface point: the centre projected along the gradient; rejected where the bound is not
+    // a distance (near edges the projection can miss the surface)
+    let p = [c[0] - n[0] * s.f, c[1] - n[1] * s.f, c[2] - n[2] * s.f];
+    let dm = d[0].min(d[1]).min(d[2]);
+    let hmin = 0.1f32 * dm;
+    if !(tape_sdf_c(nodes, tabs, p[0], p[1], p[2]).abs() <= hmin) { return pr; }
+    let at = |t: f32| tape_sdf_c(nodes, tabs, p[0] + n[0] * t, p[1] + n[1] * t, p[2] + n[2] * t);
+    // a valid probe starts inside just below the surface and outside just above it
+    let (fin, fout) = (at(-hmin), at(hmin));
+    if !(fin < 0.0 && fout > 0.0) { return pr; }
+    if goal.min_wall > 0.0 {
+        let tw = goal.min_wall as f32;
+        pr.wall = march(nodes, tabs, p, [-n[0], -n[1], -n[2]], true, hmin, tw, hmin);
+        pr.thin = pr.wall < tw;
+    }
+    if goal.min_gap > 0.0 {
+        let tg = goal.min_gap as f32;
+        pr.gap = march(nodes, tabs, p, n, false, hmin, tg, hmin);
+        pr.narrow = pr.gap < tg;
+    }
+    if goal.machining_3ax != 0 {
+        let q = [p[0] + n[0] * dm, p[1] + n[1] * dm, p[2] + n[2] * dm];
+        let up = n[2] >= -0.25f32;
+        let (dir, tmax) = if up { ([0.0f32, 0.0, 1.0], goal.domain_hi[2] as f32 - q[2]) } else { ([0.0f32, 0.0, -1.0], q[2] - goal.domain_lo[2] as f32) };
+        if tmax > 0.0 && tape_sdf_c(nodes, tabs, q[0], q[1], q[2]) > 0.0 { pr.undercut = march(nodes, tabs, q, dir, false, 0.0, tmax, 0.5f32 * dm) < tmax; }
+    }
+    pr
 }
 
 fn decode(e: u64) -> (usize, u32, u32, u32) { ((e >> 32) as usize, ((e >> 20) & 1023) as u32, ((e >> 10) & 1023) as u32, (e & 1023) as u32) }
@@ -298,6 +376,29 @@ fn encode(cfg: u32, ix: u32, iy: u32, iz: u32) -> u64 { ((cfg as u64) << 32) | (
 struct Acc<'a> { counts: &'a mut [u64], dom: &'a mut [u32], bb: &'a mut [u32] }
 
 impl Acc<'_> {
+    /// Mass moments of a counted cell (q20 fill weight; integer, order-independent).
+    fn moments(&mut self, cfg: usize, idx: [u32; 3], sh: u32, q20: u64) {
+        let w = 1u64 << (3 * sh);
+        let q6 = q20 >> 14;
+        let ss = 4u64 << (2 * sh); // (doubled side)²
+        let o = CS * cfg;
+        for k in 0..3 {
+            let c2 = ((2 * idx[k] + 1) as u64) << sh;
+            self.counts[o + cnt::M1 + k] += q20 * w * c2;
+            self.counts[o + cnt::M2 + k] += q6 * w * (12 * c2 * c2 + ss);
+        }
+        self.counts[o + cnt::V6] += q6 * w;
+    }
+    fn probe(&mut self, cfg: usize, p: &Probe) {
+        let o = CS * cfg;
+        let aq = qarea(p.area);
+        self.counts[o + cnt::AREA] += aq;
+        if p.thin { self.counts[o + cnt::THIN_AREA] += aq; }
+        if p.narrow { self.counts[o + cnt::GAP_AREA] += aq; }
+        if p.undercut { self.counts[o + cnt::UNDERCUT_AREA] += aq; }
+        if p.wall < FAR32 { self.counts[o + cnt::MIN_WALL] = self.counts[o + cnt::MIN_WALL].min(p.wall.to_bits() as u64); }
+        if p.gap < FAR32 { self.counts[o + cnt::MIN_GAP] = self.counts[o + cnt::MIN_GAP].min(p.gap.to_bits() as u64); }
+    }
     fn bbox(&mut self, cfg: usize, lo: [u32; 3], n: u32, inside: bool) {
         for k in 0..3 {
             if inside { self.bb[12 * cfg + k] = self.bb[12 * cfg + k].min(lo[k]); self.bb[12 * cfg + 3 + k] = self.bb[12 * cfg + 3 + k].max(lo[k] + n); }
@@ -355,7 +456,7 @@ pub unsafe fn ag_ad_classify(params: *const u8, _: &LaunchConfig) {
     let wl = unsafe { sl::<u64>(if l % 2 == 0 { a.wl0 } else { a.wl1 }, n) };
     let cls = unsafe { slm::<u32>(a.cls, a.capacity as usize) };
     for x in cls[n..].iter_mut() { *x = 0; }
-    let mut acc = Acc { counts: unsafe { slm::<u64>(a.counts, 4 * cn) }, dom: unsafe { slm::<u32>(a.domain_hit, cn) }, bb: unsafe { slm::<u32>(a.bbox, 12 * cn) } };
+    let mut acc = Acc { counts: unsafe { slm::<u64>(a.counts, CS * cn) }, dom: unsafe { slm::<u32>(a.domain_hit, cn) }, bb: unsafe { slm::<u32>(a.bbox, 12 * cn) } };
     let sh = a.levels - 1 - l;
     let e = gr.eps as f32;
     for i in 0..n {
@@ -368,7 +469,8 @@ pub unsafe fn ag_ad_classify(params: *const u8, _: &LaunchConfig) {
         let r = tape_iv(tape, tb, b[0], b[1], b[2]);
         if r.lo - e > 0.0 { continue; }
         if r.hi + e < 0.0 {
-            acc.counts[4 * cfg] += 1u64 << (3 * sh);
+            acc.counts[CS * cfg] += 1u64 << (3 * sh);
+            acc.moments(cfg, [ix, iy, iz], sh, 1 << 20);
             acc.bbox(cfg, [ix << sh, iy << sh, iz << sh], 1 << sh, true);
             if border_hit(&gr, tape, tb, l, [ix, iy, iz], &b, true) { acc.dom[cfg] = 1; }
             continue;
@@ -395,7 +497,7 @@ pub unsafe fn ag_ad_resolve(params: *const u8, _: &LaunchConfig) {
     let flag = unsafe { slm::<u32>(a.flag, cap) };
     let crank = unsafe { sl::<u32>(a.crank, cap) };
     let start = unsafe { sl::<u32>(a.start, cn) };
-    let mut acc = Acc { counts: unsafe { slm::<u64>(a.counts, 4 * cn) }, dom: unsafe { slm::<u32>(a.domain_hit, cn) }, bb: unsafe { slm::<u32>(a.bbox, 12 * cn) } };
+    let mut acc = Acc { counts: unsafe { slm::<u64>(a.counts, CS * cn) }, dom: unsafe { slm::<u32>(a.domain_hit, cn) }, bb: unsafe { slm::<u32>(a.bbox, 12 * cn) } };
     let sh = a.levels - 1 - l;
     for i in 0..cap {
         flag[i] = 0;
@@ -407,10 +509,15 @@ pub unsafe fn ag_ad_resolve(params: *const u8, _: &LaunchConfig) {
         let tb = &tabs[cfg * nn * TABLE..(cfg * nn + cnt[cfg] as usize) * TABLE];
         let b = cell_box(&gr, l, ix, iy, iz);
         let w = 1u64 << (3 * sh);
-        acc.counts[4 * cfg + 1] += w;
+        acc.counts[CS * cfg + cnt::BOUNDARY] += w;
         let d = [b[0].hi - b[0].lo, b[1].hi - b[1].lo, b[2].hi - b[2].lo];
         let c = [0.5f32 * (b[0].lo + b[0].hi), 0.5f32 * (b[1].lo + b[1].hi), 0.5f32 * (b[2].lo + b[2].hi)];
-        acc.counts[4 * cfg + 2] += fill_q(tape, tb, c[0], c[1], c[2], d) * w;
+        let sf = surface(tape, tb, c, d);
+        let fq = fill_of(&sf);
+        acc.counts[CS * cfg + cnt::FILL] += fq * w;
+        acc.moments(cfg, [ix, iy, iz], sh, fq);
+        let pr = probe(tape, tb, &goal, &sf, c, d);
+        acc.probe(cfg, &pr);
         acc.bbox(cfg, [ix << sh, iy << sh, iz << sh], 1 << sh, false);
         if border_hit(&gr, tape, tb, l, [ix, iy, iz], &b, false) { acc.dom[cfg] = 1; }
     }
@@ -473,6 +580,49 @@ pub fn bounds(gr: &Grid, counts: &[u64], bb: &[u32]) -> (f64, f64, f64, [f64; 3]
     (vol_lo, vol_hi, vol_est, el, eh)
 }
 
+/// Engineering metrics of one configuration from its accumulators (all sampled).
+pub struct Eng { pub centroid: [f64; 3], pub inertia: [f64; 3], pub area: f64, pub thin: f64, pub min_wall: f64, pub gap: f64, pub min_gap: f64, pub undercut: f64, pub violation: f64, pub centroid_ok: bool }
+
+pub fn engineering(gr: &Grid, goal: &Goal, cc: &[u64], ve: f64) -> Eng {
+    let qa = 1.0 / 1024.0;
+    let v20 = cc[cnt::INSIDE] as f64 * 1048576.0 + cc[cnt::FILL] as f64;
+    let v6 = cc[cnt::V6] as f64;
+    let mut centroid = [0.0; 3];
+    let mut var = [0.0; 3];
+    let mut centroid_ok = true;
+    for k in 0..3 {
+        let half = 0.5 * gr.fine[k];
+        let m1 = if v20 > 0.0 { cc[cnt::M1 + k] as f64 / v20 } else { 0.0 };
+        let m2 = if v6 > 0.0 { cc[cnt::M2 + k] as f64 / (12.0 * v6) } else { 0.0 };
+        centroid[k] = gr.lo[k] + m1 * half;
+        let vv = m2 - m1 * m1;
+        var[k] = if vv > 0.0 { vv * half * half } else { 0.0 };
+        if goal.centroid_hi[k] > goal.centroid_lo[k] && !(centroid[k] >= goal.centroid_lo[k] && centroid[k] <= goal.centroid_hi[k]) { centroid_ok = false; }
+    }
+    let inertia = [ve * (var[1] + var[2]), ve * (var[0] + var[2]), ve * (var[0] + var[1])];
+    let mw = |slot: usize| if cc[slot] == u64::MAX { -1.0 } else { f32::from_bits(cc[slot] as u32) as f64 };
+    let thin = cc[cnt::THIN_AREA] as f64 * qa;
+    let gap = cc[cnt::GAP_AREA] as f64 * qa;
+    let undercut = cc[cnt::UNDERCUT_AREA] as f64 * qa;
+    let over = undercut - goal.undercut_tol;
+    let violation = thin + gap + if goal.machining_3ax != 0 && over > 0.0 { over } else { 0.0 };
+    Eng { centroid, inertia, area: cc[cnt::AREA] as f64 * qa, thin, min_wall: if goal.min_wall > 0.0 { mw(cnt::MIN_WALL) } else { -1.0 }, gap, min_gap: if goal.min_gap > 0.0 { mw(cnt::MIN_GAP) } else { -1.0 }, undercut, violation, centroid_ok }
+}
+
+impl Eng {
+    pub fn write(&self, o: &mut [f64]) {
+        for k in 0..3 { o[ob::CENTROID + k] = self.centroid[k]; o[ob::INERTIA + k] = self.inertia[k]; }
+        o[ob::AREA] = self.area;
+        o[ob::THIN_AREA] = self.thin;
+        o[ob::MIN_WALL] = self.min_wall;
+        o[ob::GAP_AREA] = self.gap;
+        o[ob::MIN_GAP] = self.min_gap;
+        o[ob::UNDERCUT_AREA] = self.undercut;
+        o[ob::VIOLATION] = self.violation;
+        o[ob::CENTROID_OK] = if self.centroid_ok { 1.0 } else { 0.0 };
+    }
+}
+
 /// CHECK + DECIDE (eval_trial = 1) or OBSERVE (eval_trial = 0), one thread per configuration:
 /// interval checks against the goal and hard limits, transactional commit of the trial tape,
 /// budget metering, observation row, ranking score and trace row.
@@ -481,7 +631,7 @@ pub unsafe fn ag_dop_decide(params: *const u8, _: &LaunchConfig) {
     let (cn, nn, kn, rn) = (a.configs as usize, a.nodes as usize, a.params as usize, a.records as usize);
     let goal: Goal = unsafe { sl::<Goal>(a.goal, 1)[0] };
     let gr = grid(&goal, a.coarse, a.levels);
-    let counts = unsafe { sl::<u64>(a.counts, 4 * cn) };
+    let counts = unsafe { sl::<u64>(a.counts, CS * cn) };
     let dom = unsafe { sl::<u32>(a.domain_hit, cn) };
     let bb = unsafe { sl::<u32>(a.bbox, 12 * cn) };
     let cmds = unsafe { sl::<CommandRecord>(a.cmds, cn * rn) };
@@ -502,8 +652,10 @@ pub unsafe fn ag_dop_decide(params: *const u8, _: &LaunchConfig) {
     let t = 0.5 * (goal.vol_lo + goal.vol_hi);
     for c in 0..cn {
         if a.eval_trial != 0 && done[c] != 0 { continue; }
-        let (vl, vh, ve, el, eh) = bounds(&gr, &counts[4 * c..4 * c + 4], &bb[12 * c..12 * c + 12]);
-        let empty = counts[4 * c] + counts[4 * c + 1] == 0;
+        let cc = &counts[CS * c..CS * c + CS];
+        let (vl, vh, ve, el, eh) = bounds(&gr, cc, &bb[12 * c..12 * c + 12]);
+        let en = engineering(&gr, &goal, cc, ve);
+        let empty = cc[cnt::INSIDE] + cc[cnt::BOUNDARY] == 0;
         let hard = el[0] > goal.max_ext[0] || el[1] > goal.max_ext[1] || el[2] > goal.max_ext[2];
         let mut write = a.eval_trial == 0;
         if a.eval_trial != 0 {
@@ -513,7 +665,9 @@ pub unsafe fn ag_dop_decide(params: *const u8, _: &LaunchConfig) {
                 if cmds[i].opcode as u32 == a.ops.update { continue; }
                 if status[i].status == ACCEPTED { acc += 1; } else { rej += 1; }
             }
-            let geometry_ok = !empty && dom[c] == 0 && !hard;
+            // constraint violations may not grow (non-worsening edits only)
+            let worse = en.violation > obs[c * OBS + ob::VIOLATION];
+            let geometry_ok = !empty && dom[c] == 0 && !hard && !worse;
             let commit = geometry_ok && acc > 0;
             if !geometry_ok && acc > 0 {
                 let code = if empty { AgStatus::TopologyFailed } else if dom[c] != 0 { AgStatus::CapacityExceeded } else { AgStatus::RequirementFailed }.value();
@@ -544,13 +698,17 @@ pub unsafe fn ag_dop_decide(params: *const u8, _: &LaunchConfig) {
             o[8] = if dom[c] != 0 { 1.0 } else { 0.0 };
             o[9] = cur_c[c] as f64;
             // goal: sampled volume estimate in the target interval; extents bounded (rigorous)
-            let met = !empty && dom[c] == 0 && ve >= goal.vol_lo && ve <= goal.vol_hi && eh[0] <= goal.max_ext[0] && eh[1] <= goal.max_ext[1] && eh[2] <= goal.max_ext[2];
+            let met = !empty && dom[c] == 0 && ve >= goal.vol_lo && ve <= goal.vol_hi && eh[0] <= goal.max_ext[0] && eh[1] <= goal.max_ext[1] && eh[2] <= goal.max_ext[2]
+                && en.violation == 0.0 && en.centroid_ok;
             o[10] = if met { 1.0 } else { 0.0 };
             let err = (ve - t) / t;
             o[11] = err;
             o[12] = ve;
+            en.write(o);
+            for k in 0..3 { o[ob::BOX_LO + k] = if eh[k] > 0.0 { gr.lo[k] + bb[12 * c + 6 + k] as f64 * gr.fine[k] } else { 0.0 }; }
             if met { done[c] = 1; }
-            score[c] = if met { err.abs() } else { 1000.0 + err.abs() };
+            let pen = if en.area > 0.0 { en.violation / en.area } else { 0.0 } + if en.centroid_ok { 0.0 } else { 1.0 };
+            score[c] = if met { err.abs() } else { 1000.0 + err.abs() + pen };
         }
     }
 }
@@ -595,4 +753,17 @@ pub const DOPS_CPU: &[(&str, CpuKernelFn)] = &[
     ("ag_ad_total", ag_ad_total),
     ("ag_dop_decide", ag_dop_decide),
     ("ag_dop_continue", ag_dop_continue),
+    ("ag_fea_voxelize", crate::fea::ag_fea_voxelize),
+    ("ag_fea_nodes", crate::fea::ag_fea_nodes),
+    ("ag_fea_init", crate::fea::ag_fea_init),
+    ("ag_fea_dot_part", crate::fea::ag_fea_dot_part),
+    ("ag_fea_dot_final", crate::fea::ag_fea_dot_final),
+    ("ag_fea_start", crate::fea::ag_fea_start),
+    ("ag_fea_check", crate::fea::ag_fea_check),
+    ("ag_fea_matvec", crate::fea::ag_fea_matvec),
+    ("ag_fea_update1", crate::fea::ag_fea_update1),
+    ("ag_fea_update2", crate::fea::ag_fea_update2),
+    ("ag_fea_step", crate::fea::ag_fea_step),
+    ("ag_fea_finish", crate::fea::ag_fea_finish),
+    ("ag_fea_maxdisp", crate::fea::ag_fea_maxdisp),
 ];

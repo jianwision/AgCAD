@@ -99,3 +99,63 @@ fn repeated_rollouts_reuse_the_cached_graph() {
     assert!((150_000.0..=160_000.0).contains(&v), "second goal not met: {v}");
     eprintln!("first rollout {} ms ({}), cached rerun {} ms ({})", a["wall_ms"], a["mode"], b["wall_ms"], b["mode"]);
 }
+
+#[test]
+fn engineering_constraints_flow_from_requirements_and_goal_to_survivors() {
+    let req = Requirements::parse(r#"{"id":"r","rev":1,"deliver":{"body_type":"SolidBody"},"process":"machining_3ax"}"#).unwrap();
+    let mut s = Server::new(req, "flange");
+    s.session.out_dir = std::env::temp_dir().join(format!("agcad-eng-{}", std::process::id()));
+    let prog = json!({"requirements_rev": 1, "expected_revision": 0, "program": [
+        {"id": "pr", "op": "knowledge.parameter", "args": {"name": "r", "value": "60 mm"}},
+        {"id": "pt", "op": "knowledge.parameter", "args": {"name": "t", "value": "12 mm"}},
+        {"id": "sk", "op": "sketch.create", "args": {"support": "xy"}},
+        {"id": "c", "op": "sketch.circle", "args": {"sketch": "%sk", "mode": "center_radius", "pts": [["0 mm", "0 mm"]], "r": "$r"}},
+        {"id": "rg", "op": "sketch.regions", "args": {"sketch": "%c"}},
+        {"id": "pad", "op": "part.pad", "args": {"profile": "%rg", "limits": "$t"}}
+    ]});
+    assert_eq!(tool(&mut s, "run_program", json!({"program": prog})).unwrap()["report"]["status"], "ACCEPTED");
+    let g = tool(&mut s, "set_goal", json!({"target_volume": [90_000, 100_000], "max_extent": [170, 170, 25], "min_wall": 4, "centroid": {"min": [-1, -1, 0], "max": [1, 1, 20]},
+        "parameters": {"r": {"min": 40, "max": 80, "volume_effect": "+"}, "t": {"min": 6, "max": 20, "volume_effect": "+"}}})).unwrap();
+    assert_eq!(g["goal"]["machining_3ax"], true, "process machining_3ax implies the 3-axis check: {g}");
+    assert_eq!(g["goal"]["min_wall"], 4.0);
+    let r = tool(&mut s, "device_rollout", json!({"configurations": 32, "rounds": 12, "device": "cpu", "resolution": 64, "apply_best": false})).unwrap();
+    let best = &r["top"][0];
+    assert_eq!(best["goal_met"], true, "{r}");
+    let e = &best["engineering"];
+    assert_eq!(e["violation_area"], 0.0, "{e}");
+    assert_eq!(e["undercut_area_3ax"], 0.0, "{e}");
+    assert_eq!(e["min_wall_sampled"], 4.0, "no wall below 4 mm: {e}");
+    assert!(e["centroid"][2].as_f64().unwrap() > 2.0 && e["surface_area"].as_f64().unwrap() > 1e4, "{e}");
+    assert!(tool(&mut s, "set_goal", json!({"target_volume": [1, 2], "parameters": {}, "machining": "5ax"})).is_err());
+}
+
+#[test]
+fn stiffness_requirement_is_checked_on_survivors() {
+    let req = Requirements::parse(r#"{"id":"r","rev":1,"deliver":{"body_type":"SolidBody"}}"#).unwrap();
+    let mut s = Server::new(req, "flange");
+    s.session.out_dir = std::env::temp_dir().join(format!("agcad-stiff-{}", std::process::id()));
+    let prog = json!({"requirements_rev": 1, "expected_revision": 0, "program": [
+        {"id": "pr", "op": "knowledge.parameter", "args": {"name": "r", "value": "60 mm"}},
+        {"id": "pt", "op": "knowledge.parameter", "args": {"name": "t", "value": "12 mm"}},
+        {"id": "sk", "op": "sketch.create", "args": {"support": "xy"}},
+        {"id": "c", "op": "sketch.circle", "args": {"sketch": "%sk", "mode": "center_radius", "pts": [["0 mm", "0 mm"]], "r": "$r"}},
+        {"id": "rg", "op": "sketch.regions", "args": {"sketch": "%c"}},
+        {"id": "pad", "op": "part.pad", "args": {"profile": "%rg", "limits": "$t"}}
+    ]});
+    assert_eq!(tool(&mut s, "run_program", json!({"program": prog})).unwrap()["report"]["status"], "ACCEPTED");
+    let goal = |maxc: f64| json!({"target_volume": [90_000, 100_000], "max_extent": [170, 170, 25], "load": {"support": "z_min", "force": [1000, 0, 0], "voxel": 6},
+        "max_compliance": maxc, "parameters": {"r": {"min": 40, "max": 80, "volume_effect": "+"}, "t": {"min": 6, "max": 20, "volume_effect": "+"}}});
+    tool(&mut s, "set_goal", goal(1e9)).unwrap();
+    let roll = json!({"configurations": 16, "rounds": 10, "device": "cpu", "resolution": 32, "top_k": 2, "apply_best": false});
+    let r = tool(&mut s, "device_rollout", roll.clone()).unwrap();
+    let st = &r["top"][0]["stiffness"];
+    assert_eq!(st["converged"], true, "{r}");
+    assert!(st["compliance"].as_f64().unwrap() > 0.0 && st["voxels"].as_u64().unwrap() > 100, "{st}");
+    assert_eq!(r["top"][0]["goal_met"], true);
+    // an unreachable stiffness requirement: survivors no longer meet the goal
+    tool(&mut s, "set_goal", goal(1e-9)).unwrap();
+    let r = tool(&mut s, "device_rollout", roll).unwrap();
+    assert_eq!(r["top"][0]["stiffness"]["ok"], false);
+    assert_eq!(r["top"][0]["goal_met"], false);
+    assert!(tool(&mut s, "set_goal", json!({"target_volume": [1, 2], "parameters": {}, "max_compliance": 1})).is_err());
+}

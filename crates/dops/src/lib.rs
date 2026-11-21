@@ -12,6 +12,7 @@
 
 pub mod abi;
 pub mod examples;
+pub mod fea;
 pub mod lower;
 pub mod math;
 pub mod reference;

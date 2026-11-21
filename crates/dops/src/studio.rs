@@ -158,7 +158,7 @@ impl<D: KernelExt> Studio<D> {
             cmds: zeros(c * r * 64)?,
             arena: zeros(c * r * std::mem::size_of::<FeatureArgs>())?,
             status: zeros(c * r * 16)?,
-            counts: zeros(c * 32)?,
+            counts: zeros(c * CS * 8)?,
             domain_hit: zeros(c * 4)?,
             bbox: zeros(c * 48)?,
             obs: zeros(c * OBS * 8)?,

@@ -74,14 +74,33 @@ fn seg2_of(s: &Seg, dx: f64, dy: f64, a: f64) -> Seg2 {
 /// Exact profile of a pool sketch (one outer loop plus holes), translated by (dx, dy), then
 /// rotated by `a` about the origin (the device convention).
 pub fn sketch_profile(loops: &[Vec<Seg>], dx: f64, dy: f64, a: f64) -> Result<Profile, String> {
-    if loops.is_empty() { return Err("empty sketch".into()); }
-    let p = Profile { loops: loops.iter().map(|lp| lp.iter().map(|s| seg2_of(s, dx, dy, a)).collect()).collect() }.normalize();
-    for lp in &p.loops[1..] {
-        let probe = match lp[0] { Seg2::Line { a, b } => [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])], Seg2::Arc { c, r, a0, a1 } => { let t = 0.5 * (a0 + a1); [c[0] + r * t.cos(), c[1] + r * t.sin()] } Seg2::Circle { c, r, .. } => [c[0] + r, c[1]] };
-        if agcad_geo::region2d::winding(&p.loops[..1], probe).round() as i64 <= 0 { return Err("sketch with several outer loops: use one feature per island".into()); }
-    }
-    Ok(p)
+    let mut ps = sketch_profiles(loops, dx, dy, a)?;
+    if ps.len() != 1 { return Err("sketch with several outer loops: use sketch_profiles".into()); }
+    Ok(ps.remove(0))
 }
+
+/// Exact regions of a pool sketch with any number of islands: loops nested at even depth are
+/// outer boundaries, their direct children holes (the device's parity rule).
+pub fn sketch_profiles(loops: &[Vec<Seg>], dx: f64, dy: f64, a: f64) -> Result<Vec<Profile>, String> {
+    if loops.is_empty() { return Err("empty sketch".into()); }
+    let ls: Vec<Vec<Seg2>> = loops.iter().map(|lp| lp.iter().map(|s| seg2_of(s, dx, dy, a)).collect()).collect();
+    let probe = |lp: &[Seg2]| match lp[0] { Seg2::Line { a, b } => [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])], Seg2::Arc { c, r, a0, a1 } => { let t = 0.5 * (a0 + a1); [c[0] + r * t.cos(), c[1] + r * t.sin()] } Seg2::Circle { c, r, .. } => [c[0] + r, c[1]] };
+    let inside = |p: [f64; 2], lp: &Vec<Seg2>| agcad_geo::region2d::winding(std::slice::from_ref(lp), p).round().abs() as i64 % 2 == 1;
+    // containing loops of each loop
+    let parents: Vec<Vec<usize>> = (0..ls.len()).map(|i| (0..ls.len()).filter(|&j| j != i && inside(probe(&ls[i]), &ls[j])).collect()).collect();
+    let mut out = Vec::new();
+    for i in 0..ls.len() {
+        if parents[i].len() % 2 == 1 { continue; } // a hole
+        let mut prof = Profile { loops: vec![ls[i].clone()] };
+        for j in 0..ls.len() {
+            // direct child: inside i and exactly one level deeper
+            if parents[j].len() == parents[i].len() + 1 && parents[j].contains(&i) { prof.loops.push(ls[j].clone()); }
+        }
+        out.push(prof.normalize());
+    }
+    Ok(out)
+}
+
 
 /// Group sketch segments into closed loops (endpoints matched within 1e-6; segments are
 /// reversed as needed).
@@ -141,7 +160,12 @@ fn profile_of(kind: u32, v: &[f64; NVALS], a: f64) -> Result<Profile, String> {
 
 /// Pattern instances as (rotation θ, translation tx, ty): instance = R(θ)·tool + t, the same
 /// clamps as `compile_node` on the device.
-fn instances(n: &Node, v: &[f64; NVALS]) -> Vec<(f64, f64, f64)> {
+fn instances(n: &Node, v: &[f64; NVALS], d: &Design) -> Vec<(f64, f64, f64)> {
+    if n.flags & nflags::PATTERN_USER != 0 {
+        let idx = v[6].floor();
+        let pts: Vec<(f64, f64, f64)> = if idx >= 0.0 { d.profiles.get(idx as usize).map(|p| p.iter().flatten().take(MAX_PATTERN as usize).map(|s| match *s { Seg::Line { a, .. } => (0.0, a[0], a[1]), Seg::Arc { c, .. } => (0.0, c[0], c[1]) }).collect()).unwrap_or_default() } else { vec![] };
+        return if pts.is_empty() { vec![(0.0, 0.0, 0.0)] } else { pts };
+    }
     if n.flags & nflags::PATTERN != 0 {
         let count = (v[6].floor().clamp(1.0, MAX_PATTERN as f64)) as usize;
         let total = v[7];
@@ -173,9 +197,9 @@ fn corner_size(n: &Node, v: &[f64; NVALS]) -> f64 {
 }
 
 /// 2D corner points of every instance of a rectangle feature (for std fillet/chamfer).
-fn instance_corners(n: &Node, v: &[f64; NVALS]) -> Vec<[f64; 2]> {
+fn instance_corners(n: &Node, v: &[f64; NVALS], d: &Design) -> Vec<[f64; 2]> {
     let (x0, y0, x1, y1) = (v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3]));
-    instances(n, v).into_iter().flat_map(|(a, tx, ty)| [[x0, y0], [x1, y0], [x1, y1], [x0, y1]].map(|p| { let r = rot(p, a); [r[0] + tx, r[1] + ty] })).collect()
+    instances(n, v, d).into_iter().flat_map(|(a, tx, ty)| [[x0, y0], [x1, y0], [x1, y1], [x0, y1]].map(|p| { let r = rot(p, a); [r[0] + tx, r[1] + ty] })).collect()
 }
 
 /// Exact solid of a device design (same feature semantics as the device kernels).
@@ -204,7 +228,7 @@ pub fn to_layered(d: &Design) -> Result<Solid, String> {
                 for (j, x) in v.iter_mut().enumerate() { *x = value(n, &d.params, j); }
                 let meridian = sketch_profile(&d.profiles[pool_index(d, n, i)?], 0.0, 0.0, 0.0)?;
                 let mut tool: Option<Solid> = None;
-                for (a, tx, ty) in instances(n, &v) {
+                for (a, tx, ty) in instances(n, &v, d) {
                     let axis = rot([v[0] + tx, v[1] + ty], a);
                     let l = LayeredSolid::revolve_rectilinear(axis, &meridian).map_err(|e| format!("feature {i}: part.shaft is device-only here ({e}); certify it and deliver the certified implicit body"))?;
                     let inst = Solid::Layered(l);
@@ -248,13 +272,19 @@ pub fn to_layered(d: &Design) -> Result<Solid, String> {
         if !(v[5] > v[4]) { continue; } // empty tool (as on the device)
         let corner = corner_size(n, &v);
         let mut tool: Option<Solid> = None;
-        for (a, tx, ty) in instances(n, &v) {
+        for (a, tx, ty) in instances(n, &v, d) {
             let w = shifted(n.kind, &v, tx, ty);
             let p = if corner > 0.0 {
                 let (x0, y0, x1, y1) = (w[0].min(w[2]), w[1].min(w[3]), w[0].max(w[2]), w[1].max(w[3]));
                 treated_rect(x0, y0, x1, y1, corner, n.flags & nflags::FILLET != 0, a)
             } else if n.kind == profile::SKETCH {
-                sketch_profile(&d.profiles[pool_index(d, n, i)?], w[0], w[1], a).map_err(|e| format!("feature {i}: {e}"))?
+                let mut ps = sketch_profiles(&d.profiles[pool_index(d, n, i)?], w[0], w[1], a).map_err(|e| format!("feature {i}: {e}"))?;
+                let first = ps.remove(0);
+                for extra in ps {
+                    let inst = Solid::Layered(LayeredSolid::extrusion(Frame::WORLD, &extra, v[4], v[5]));
+                    tool = Some(match tool { None => inst, Some(t) => k.boolean(&t, &inst, BoolOp2::Union).map_err(|e| format!("feature {i}: {}", e.message))? });
+                }
+                first
             } else {
                 let Ok(p) = profile_of(n.kind, &w, a) else { continue };
                 p
@@ -398,13 +428,19 @@ pub fn to_program(d: &Design, requirements_rev: u32, expected_revision: u32) -> 
         if n.flags & nflags::PATTERN != 0 {
             st.push(json!({"id": format!("dev_pat{i}"), "op": "transform.circular_pattern", "args": {"items": [format!("%{ft}")], "axis": "z", "count": plain(d, n, 6, ""), "angle": plain(d, n, 7, "rad")}}));
         }
+        if n.flags & nflags::PATTERN_USER != 0 {
+            let mut v = [0.0; NVALS];
+            for (j, x) in v.iter_mut().enumerate() { *x = value(n, &d.params, j); }
+            let pos: Vec<J> = instances(n, &v, d).iter().map(|(_, tx, ty)| json!([format!("{tx} mm"), format!("{ty} mm")])).collect();
+            st.push(json!({"id": format!("dev_upat{i}"), "op": "transform.user_pattern", "args": {"items": [format!("%{ft}")], "positions": pos}}));
+        }
         if n.flags & nflags::PATTERN_RECT != 0 {
             st.push(json!({"id": format!("dev_rpat{i}"), "op": "transform.rectangular_pattern", "args": {"items": [format!("%{ft}")], "dirs": [[1.0, 0.0], [0.0, 1.0]], "counts": [plain(d, n, 6, ""), plain(d, n, 8, "")], "spacing": [length(d, n, 7), length(d, n, 9)]}}));
         }
         if n.kind == profile::RECT && n.flags & (nflags::FILLET | nflags::CHAMFER) != 0 {
             let mut v = [0.0; NVALS];
             for (j, x) in v.iter_mut().enumerate() { *x = value(n, &d.params, j); }
-            let pts: Vec<J> = instance_corners(n, &v).iter().map(|p| json!([format!("{} mm", p[0]), format!("{} mm", p[1])])).collect();
+            let pts: Vec<J> = instance_corners(n, &v, d).iter().map(|p| json!([format!("{} mm", p[0]), format!("{} mm", p[1])])).collect();
             if n.flags & nflags::FILLET != 0 {
                 st.push(json!({"id": format!("dev_fil{i}"), "op": "part.edge_fillet", "args": {"edges": pts, "r": length(d, n, 10), "propagation": "minimal"}}));
             } else {
@@ -484,7 +520,7 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
         let f = &part.features[&id];
         if !f.active { continue; }
         let a = &f.args;
-        let solid_feature = matches!(f.op.as_str(), "part.pad" | "part.pocket" | "part.shell" | "part.shaft" | "part.groove");
+        let solid_feature = matches!(f.op.as_str(), "part.pad" | "part.pocket" | "part.shell" | "part.shaft" | "part.groove" | "part.hole");
         if mirrored && (solid_feature || f.op.starts_with("transform.") && f.op != "transform.mirror") {
             return Err(format!("{}: features after a mirror are not device-representable (the device mirrors the finished body)", f.feature_ref()));
         }
@@ -676,6 +712,65 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
                     (n.pref[7], n.val[7]) = angle;
                 }
             }
+            "part.hole" => {
+                // std semantics: from the body top (zmax) down `depth` (or through), plus an
+                // optional counterbore; one circular pocket per position
+                let zmax = d.nodes.iter().filter(|n| n.op == fop::ADD && n.kind <= profile::SKETCH).map(|n| value(n, &d.params, 5)).fold(f64::NEG_INFINITY, f64::max);
+                let zmin = d.nodes.iter().filter(|n| n.op == fop::ADD && n.kind <= profile::SKETCH).map(|n| value(n, &d.params, 4)).fold(f64::INFINITY, f64::min);
+                if !zmax.is_finite() { return Err(format!("{}: hole needs an existing pad", f.feature_ref())); }
+                let spec = match a.get("spec") { Some(Value::Map(m)) => m.clone(), _ => BTreeMap::new() };
+                let num = |k: &str, w: &mut Vec<String>| -> Result<Option<f64>, String> { match spec.get(k) { Some(v) => { let (p, x) = raise_value(v, &d.names, &pvals, w)?; if p != NO_PARAM { return Err(format!("{}: parametric hole {k} is not device-representable", f.feature_ref())); } Ok(Some(x)) } None => Ok(None) } };
+                let dia = match num("d", &mut warnings)? { Some(x) => x, None => return Err(format!("{}: hole spec needs a diameter 'd'", f.feature_ref())) };
+                let through = spec.get("through").is_some() || matches!(spec.get("depth"), Some(Value::String(s)) if s == "through");
+                let depth = if through { zmax - zmin + 2.0 } else { num("depth", &mut warnings)?.unwrap_or(zmax - zmin + 2.0) };
+                let cb = num("counterbore_d", &mut warnings)?;
+                let cbh = num("counterbore_depth", &mut warnings)?.unwrap_or(dia * 0.5);
+                if spec.contains_key("countersink_d") || spec.contains_key("countersink_angle") { warnings.push(format!("{}: countersink is not modeled by the standard library; ignored on the device too", f.feature_ref())); }
+                for p in list(a.get("positions")) {
+                    let l = match &p { Value::List(l) => l.clone(), _ => return Err(format!("{}: hole positions must be [x, y]", f.feature_ref())) };
+                    let x = raise_value(l.first().ok_or("hole x")?, &d.names, &pvals, &mut warnings)?;
+                    let y = raise_value(l.get(1).ok_or("hole y")?, &d.names, &pvals, &mut warnings)?;
+                    let mut mk = |r: f64, z0: f64| {
+                        let mut n = blank(profile::CIRCLE, fop::REMOVE, id);
+                        (n.pref[0], n.val[0]) = x;
+                        (n.pref[1], n.val[1]) = y;
+                        n.val[2] = r;
+                        n.val[4] = z0;
+                        n.val[5] = zmax + 1.0;
+                        d.nodes.push(n);
+                    };
+                    if let Some(cbd) = cb { mk(cbd / 2.0, zmax - cbh); }
+                    mk(dia / 2.0, zmax - depth);
+                }
+                feat_node.insert(id, d.nodes.len() - 1);
+            }
+            "transform.user_pattern" => {
+                let pos = list(a.get("positions"));
+                let mut pts: Vec<[f64; 2]> = Vec::new();
+                for p in &pos {
+                    let l = match p { Value::List(l) => l.clone(), _ => return Err(format!("{}: positions must be [x, y]", f.feature_ref())) };
+                    let mut c = [0.0; 2];
+                    for k in 0..2 {
+                        let (pp, x) = raise_value(l.get(k).ok_or("position")?, &d.names, &pvals, &mut warnings)?;
+                        if pp != NO_PARAM { return Err(format!("{}: parametric pattern positions are not device-representable", f.feature_ref())); }
+                        c[k] = x;
+                    }
+                    pts.push(c);
+                }
+                if pts.is_empty() || pts.len() > MAX_PATTERN as usize { return Err(format!("{}: 1..={MAX_PATTERN} positions", f.feature_ref())); }
+                let o = pts[0];
+                let entry: Vec<Seg> = pts.iter().map(|p| { let t = [p[0] - o[0], p[1] - o[1]]; Seg::Line { a: t, b: t } }).collect();
+                for it in list(a.get("items")) {
+                    let fid = refid(Some(&it)).ok_or("pattern item must reference a feature")?;
+                    let ni = *feat_node.get(&fid).ok_or(format!("pattern item #{fid} is not a device feature"))?;
+                    if d.profiles.len() >= 64 { return Err("too many sketch profiles".into()); }
+                    let n = &mut d.nodes[ni];
+                    n.flags = (n.flags & !(nflags::PATTERN | nflags::PATTERN_RECT)) | nflags::PATTERN_USER;
+                    n.pref[6] = NO_PARAM;
+                    n.val[6] = d.profiles.len() as f64;
+                    d.profiles.push(vec![entry.clone()]);
+                }
+            }
             "transform.rectangular_pattern" => {
                 if let Some(Value::List(dirs)) = a.get("dirs") {
                     let ok = dirs.len() <= 2 && dirs.iter().enumerate().all(|(k, dv)| matches!(dv, Value::List(c) if c.len() == 2 && c.iter().zip(if k == 0 { [1.0, 0.0] } else { [0.0, 1.0] }).all(|(x, e)| x.as_f64() == Some(e))));
@@ -707,7 +802,7 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
                     let n = &d.nodes[ti];
                     let mut v = [0.0; NVALS];
                     for (j, x) in v.iter_mut().enumerate() { *x = value(n, &d.params, j); }
-                    let cs = instance_corners(n, &v);
+                    let cs = instance_corners(n, &v, &d);
                     !pts.is_empty() && pts.len() == cs.len() && pts.iter().all(|p| cs.iter().any(|c| (c[0] - p[0]).abs() < 1e-6 && (c[1] - p[1]).abs() < 1e-6))
                 });
                 if !matched {

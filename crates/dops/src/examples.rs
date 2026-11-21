@@ -207,3 +207,21 @@ pub fn rounded_block() -> Design {
     b.pref[13] = 0;
     Design { nodes: vec![b], params: vec![4.0], names: vec!["r".into()], profiles: vec![] }
 }
+
+/// Plate with a square pocket repeated at user-pattern positions and a two-island sketch
+/// pocket (two circles in one sketch).
+pub fn user_pattern_plate() -> Design {
+    let plate = feature(profile::RECT, fop::ADD, [(NO_PARAM, 0.0), (NO_PARAM, 0.0), (NO_PARAM, 100.0), (NO_PARAM, 60.0), (NO_PARAM, 0.0), (NO_PARAM, 10.0)]);
+    let mut sq = feature(profile::RECT, fop::REMOVE, [(NO_PARAM, 10.0), (NO_PARAM, 10.0), (NO_PARAM, 20.0), (NO_PARAM, 20.0), (NO_PARAM, 4.0), (NO_PARAM, 11.0)]);
+    sq.flags |= nflags::PATTERN_USER;
+    sq.val[6] = 0.0;
+    let pts = [[0.0, 0.0], [60.0, 0.0], [25.0, 30.0], [70.0, 32.0]];
+    let entry = pts.iter().map(|t| Seg::Line { a: *t, b: *t }).collect();
+    let mut two = blank(profile::SKETCH, fop::REMOVE);
+    two.val[4] = -1.0;
+    two.val[5] = 11.0;
+    two.val[15] = 1.0;
+    let tau = core::f64::consts::TAU;
+    let islands = vec![vec![Seg::Arc { c: [50.0, 30.0], r: 4.0, a0: 0.0, a1: tau }], vec![Seg::Arc { c: [85.0, 15.0], r: 3.0, a0: 0.0, a1: tau }]];
+    Design { nodes: vec![plate, sq, two], params: vec![], names: vec![], profiles: vec![vec![entry], islands] }
+}

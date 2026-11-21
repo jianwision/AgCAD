@@ -119,3 +119,59 @@ fn sketch_sdf_sign_and_distance_are_exact() {
         assert!(f.abs() <= dref + 1e-4 && f.abs() >= dref - 0.2, "distance at ({x}, {y}): {f} vs ≈{dref}");
     }
 }
+
+/// LLM-style document: counterbored + through holes, a user pattern, and one sketch of four
+/// bolt circles (several outer loops). Raise must not drop anything, and the device design's
+/// exact volume must equal the document's; device bounds must contain it.
+#[test]
+fn holes_user_patterns_and_multi_island_sketches_raise_exactly() {
+    let req = agcad_harness::Requirements::parse(r#"{"id":"r","rev":1,"deliver":{"body_type":"SolidBody"}}"#).unwrap();
+    let mut sess = agcad_harness::HarnessSession::new(req, "plate");
+    let prog = serde_json::json!({"agir": "0.2", "requirements_rev": 1, "expected_revision": 0, "program": [
+        {"id": "s1", "op": "sketch.create", "args": {"support": "xy"}},
+        {"id": "r1", "op": "sketch.rectangle", "args": {"sketch": "%s1", "mode": "corners", "pts": [["0 mm", "0 mm"], ["120 mm", "80 mm"]]}},
+        {"id": "g1", "op": "sketch.regions", "args": {"sketch": "%r1"}},
+        {"id": "pad", "op": "part.pad", "args": {"profile": "%g1", "limits": "12 mm"}},
+        {"id": "h1", "op": "part.hole", "args": {"support": "%pad", "positions": [["15 mm", "15 mm"], ["105 mm", "15 mm"]], "spec": {"d": "6 mm", "through": true, "counterbore_d": "11 mm", "counterbore_depth": "4 mm"}}},
+        {"id": "h2", "op": "part.hole", "args": {"support": "%pad", "positions": [["60 mm", "65 mm"]], "spec": {"d": "8 mm", "depth": "7 mm"}}},
+        {"id": "s2", "op": "sketch.create", "args": {"support": "xy"}},
+        {"id": "c1", "op": "sketch.circle", "args": {"sketch": "%s2", "mode": "center_radius", "pts": [["50 mm", "40 mm"]], "r": "3 mm"}},
+        {"id": "c2", "op": "sketch.circle", "args": {"sketch": "%c1", "mode": "center_radius", "pts": [["70 mm", "40 mm"]], "r": "3 mm"}},
+        {"id": "c3", "op": "sketch.circle", "args": {"sketch": "%c2", "mode": "center_radius", "pts": [["60 mm", "30 mm"]], "r": "3 mm"}},
+        {"id": "c4", "op": "sketch.circle", "args": {"sketch": "%c3", "mode": "center_radius", "pts": [["60 mm", "50 mm"]], "r": "3 mm"}},
+        {"id": "g2", "op": "sketch.regions", "args": {"sketch": "%c4"}},
+        {"id": "bolts", "op": "part.pocket", "args": {"profile": "%g2", "limits": {"type": "two_sided", "d": "13 mm", "d2": "1 mm"}}},
+        {"id": "s3", "op": "sketch.create", "args": {"support": "xy"}},
+        {"id": "r3", "op": "sketch.rectangle", "args": {"sketch": "%s3", "mode": "corners", "pts": [["10 mm", "35 mm"], ["20 mm", "45 mm"]]}},
+        {"id": "g3", "op": "sketch.regions", "args": {"sketch": "%r3"}},
+        {"id": "sq", "op": "part.pocket", "args": {"profile": "%g3", "limits": {"type": "two_sided", "d": "13 mm", "d2": "-8 mm"}}},
+        {"id": "up", "op": "transform.user_pattern", "args": {"items": ["%sq"], "positions": [["15 mm", "40 mm"], ["105 mm", "40 mm"], ["15 mm", "62 mm"]]}}
+    ]});
+    let p = agcad_ir::json::decode_program(&prog.to_string(), agcad_ir::Catalog::global()).unwrap();
+    let out = sess.run_program("main", &p, agcad_ir::Catalog::global()).unwrap();
+    assert_eq!(out.report.status, "ACCEPTED", "{:?}", out.report.features);
+    let u = sess.last_update.as_ref().unwrap();
+    let last = u.outcomes.last().unwrap().feature;
+    let agcad_runtime::rebuild::Product::Solid(s) = &u.products[&last] else { panic!("no solid") };
+    let vdoc = agcad_geo::tessellate::tessellate(&s.brep(), &Default::default()).mass_properties().0;
+    let (d, warnings) = raise(&sess.doc.workspace("main").unwrap().state).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let v = exact(&d);
+    assert!((v - vdoc).abs() / vdoc < 1e-9, "device design {v} vs document {vdoc}");
+    let mut g = ops_goal();
+    g.domain_lo = [-6.0, -6.0, -4.0];
+    g.domain_hi = [126.0, 86.0, 16.0];
+    let o = certify(CpuDevice::new(), &d, &g, 6, 1 << 18).unwrap();
+    assert!(o[0] <= v && v <= o[1]);
+    round_trip("holes", &d);
+}
+
+#[test]
+fn user_pattern_and_two_island_sketch_are_sound() {
+    let d = user_pattern_plate();
+    let want = 60_000.0 - 4.0 * 100.0 * 6.0 - core::f64::consts::PI * (16.0 + 9.0) * 10.0;
+    let v = exact(&d);
+    assert!((v - want).abs() / want < 2e-3, "{v} vs {want}");
+    sound("user-pattern", &d, v);
+    round_trip("user-pattern", &d);
+}

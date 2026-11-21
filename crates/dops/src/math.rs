@@ -150,6 +150,21 @@ pub fn compile_node_pool(n: &Node, params: &[f64], pool: &[f32], table: &mut [f3
             table[k + 3] = 0.0;
         }
         c.count = count;
+    } else if n.flags & nflags::PATTERN_USER != 0 {
+        let idx = v[6].floor();
+        let mut k = 0usize;
+        if idx >= 0.0 && ((idx as usize) + 1) * PSTRIDE <= pool.len() {
+            let o = idx as usize * PSTRIDE;
+            let ns = (pool[o] as usize).min(MAX_PATTERN as usize);
+            for i in 0..ns {
+                table[4 * i] = 1.0;
+                table[4 * i + 1] = 0.0;
+                table[4 * i + 2] = pool[o + 1 + 8 * i + 1];
+                table[4 * i + 3] = pool[o + 1 + 8 * i + 2];
+            }
+            k = ns;
+        }
+        c.count = k.max(1) as u32;
     } else if n.flags & nflags::PATTERN_RECT != 0 {
         let c1f = v[6].floor();
         let c1 = if c1f < 1.0 { 1 } else if c1f > MAX_PATTERN as f64 { MAX_PATTERN } else { c1f as u32 };

@@ -91,6 +91,9 @@ pub mod nflags {
     /// Rounded / chamfered top and bottom edges of the extrusion (v13 = size). Device-only.
     pub const ROUND_Z: u32 = 64;
     pub const CHAMFER_Z: u32 = 128;
+    /// User pattern (transform.user_pattern): v6 = pool index of a points entry (each segment's
+    /// start = one instance translation; ≤ 64 instances).
+    pub const PATTERN_USER: u32 = 256;
     /// Profile modifiers carried into the compiled node.
     pub const MODS: u32 = FILLET | CHAMFER | DRAFT | ROUND_Z | CHAMFER_Z;
 }

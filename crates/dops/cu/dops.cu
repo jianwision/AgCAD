@@ -53,6 +53,7 @@ extern "C" __device__ __attribute__((cudart_builtin)) void cudaGraphSetCondition
 #define NF_DRAFT 32u
 #define NF_ROUND_Z 64u
 #define NF_CHAMFER_Z 128u
+#define NF_PATTERN_USER 256u
 #define NF_MODS (NF_FILLET | NF_CHAMFER | NF_DRAFT | NF_ROUND_Z | NF_CHAMFER_Z)
 #define NF_ZMODS (NF_DRAFT | NF_ROUND_Z | NF_CHAMFER_Z)
 #define PARAM_ADD 1u
@@ -229,6 +230,21 @@ __device__ CNode compile_node(const Node& n, const double* params, const float* 
             table[4 * i + 3] = 0.0f;
         }
         c.count = count;
+    } else if ((n.flags & NF_PATTERN_USER) != 0u) {
+        double idx = floor(v[6]);
+        u32 k = 0u;
+        if (idx >= 0.0 && (u64)idx < (u64)npool) {
+            const float* src = pool + (u64)idx * PSTRIDE;
+            u32 ns = (u32)src[0]; if (ns > MAX_PATTERN) ns = MAX_PATTERN;
+            for (u32 i = 0; i < ns; ++i) {
+                table[4 * i] = 1.0f;
+                table[4 * i + 1] = 0.0f;
+                table[4 * i + 2] = src[1 + 8 * i + 1];
+                table[4 * i + 3] = src[1 + 8 * i + 2];
+            }
+            k = ns;
+        }
+        c.count = (k > 1u) ? k : 1u;
     } else if ((n.flags & NF_PATTERN_RECT) != 0u) {
         double c1f = floor(v[6]);
         u32 c1 = (c1f < 1.0) ? 1u : ((c1f > (double)MAX_PATTERN) ? MAX_PATTERN : (u32)c1f);

@@ -1420,3 +1420,19 @@ AG_KERNEL void ag_fea_maxdisp(const FeaArgs* a) {
         atomicMax((unsigned long long*)&stat[1], (unsigned long long)__double_as_longlong(m));
     }
 }
+
+// ---- certified implicit mesh: SDF at grid nodes (twin of src/mesh.rs) ----
+struct MeshArgs { u64 tape, tables, out, _pad0; double lo[3], h; u32 count, dims[3]; };
+AG_KERNEL void ag_mesh_sample(const MeshArgs* a) {
+    u64 nx = a->dims[0], ny = a->dims[1], nz = a->dims[2];
+    const CNode* tape = ag_ptr<const CNode>(a->tape);
+    const float* tb = ag_ptr<const float>(a->tables);
+    float* out = ag_ptr<float>(a->out);
+    GRID_STRIDE(n, nx * ny * nz) {
+        u64 i = n % nx, j = (n / nx) % ny, k = n / (nx * ny);
+        float x = (float)(a->lo[0] + (double)i * a->h);
+        float y = (float)(a->lo[1] + (double)j * a->h);
+        float z = (float)(a->lo[2] + (double)k * a->h);
+        out[n] = (a->count == 0u) ? FAR32 : tape_sdf_c(tape, a->count, tb, x, y, z);
+    }
+}

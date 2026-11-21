@@ -828,4 +828,5 @@ pub const DOPS_CPU: &[(&str, CpuKernelFn)] = &[
     ("ag_fea_step", crate::fea::ag_fea_step),
     ("ag_fea_finish", crate::fea::ag_fea_finish),
     ("ag_fea_maxdisp", crate::fea::ag_fea_maxdisp),
+    ("ag_mesh_sample", crate::mesh::ag_mesh_sample),
 ];

@@ -178,3 +178,17 @@ fn fea_pcg_bitwise() {
     assert_eq!(a.max_disp.to_bits(), b.max_disp.to_bits());
     assert_eq!((a.iterations, a.voxels, a.dofs), (b.iterations, b.voxels, b.dofs));
 }
+
+/// Certified implicit mesh: device sampling is bit-identical, so the meshes are identical.
+#[test]
+#[ignore = "requires NVIDIA GPU"]
+fn implicit_mesh_bitwise() {
+    use agcad_dops::examples::shelled_box;
+    let d = shelled_box(2.0);
+    let (lo, hi) = ([0.0, 0.0, 0.0], [100.0, 60.0, 10.0]);
+    let a = agcad_dops::mesh::extract_mesh(agcad_driver_cuda::CudaDevice::open(0).unwrap(), &d, lo, hi, 0.5).unwrap();
+    let b = agcad_dops::mesh::extract_mesh(agcad_driver_cpu::CpuDevice::new(), &d, lo, hi, 0.5).unwrap();
+    assert!(a.mesh.is_watertight());
+    assert_eq!(a.mesh.triangles, b.mesh.triangles);
+    assert_eq!(a.volume.to_bits(), b.volume.to_bits());
+}

@@ -15,6 +15,7 @@ pub mod examples;
 pub mod fea;
 pub mod lower;
 pub mod math;
+pub mod mesh;
 pub mod reference;
 pub mod registry;
 pub mod studio;

@@ -197,6 +197,40 @@ pub fn engineering(o: &[f64]) -> Value {
     })
 }
 
+/// A certified implicit body: watertight mesh with rigorous evidence.
+pub struct Implicit { pub mesh: agcad_dops::mesh::ImplicitMesh, pub certified: [f64; agcad_dops::abi::OBS], pub reason: String }
+
+impl Implicit {
+    pub fn summary(&self) -> Value {
+        json!({ "evidence": "implicit-certified", "reason": self.reason,
+                "certified_volume_bounds": [self.certified[0], self.certified[1]], "certified_extent_hi": [self.certified[5], self.certified[6], self.certified[7]],
+                "mesh": { "triangles": self.mesh.mesh.triangles.len(), "watertight": self.mesh.mesh.is_watertight(), "volume": self.mesh.volume, "spacing": self.mesh.h,
+                          "max_distance_to_surface": self.mesh.deviation },
+                "exports": ["3mf", "stl"], "note": "STEP needs an exact B-rep; features thinner than the mesh spacing may be missing from the mesh but never from the certified bounds" })
+    }
+}
+
+/// Certify a device-only survivor and extract its mesh (spacing ≈ largest extent / 200).
+pub fn deliver_implicit(design: &agcad_dops::Design, goal: &Goal, reason: &str, prefer_cuda: bool) -> Result<Implicit, String> {
+    use agcad_dops::abi::ob;
+    let run = |certified: [f64; agcad_dops::abi::OBS], m: Result<agcad_dops::mesh::ImplicitMesh, String>| m.map(|mesh| Implicit { mesh, certified, reason: reason.to_string() });
+    let cert = agcad_dops::studio::certify(agcad_driver_cpu::CpuDevice::new(), design, goal, 7, 1 << 18).map_err(|e| e.to_string())?;
+    let lo = [cert[ob::BOX_LO], cert[ob::BOX_LO + 1], cert[ob::BOX_LO + 2]];
+    let hi = [lo[0] + cert[5], lo[1] + cert[6], lo[2] + cert[7]];
+    let h = (cert[5].max(cert[6]).max(cert[7]) / 200.0).max(0.05);
+    let m = match prefer_cuda.then(|| agcad_driver_cuda::CudaDevice::open(0).ok()).flatten() {
+        Some(dev) => agcad_dops::mesh::extract_mesh(dev, design, lo, hi, h),
+        None => agcad_dops::mesh::extract_mesh(agcad_driver_cpu::CpuDevice::new(), design, lo, hi, h),
+    };
+    run(cert, m.map_err(|e| e.to_string()))
+}
+
+/// The exactly-lowerable part of a design (device-only nodes removed) for the document.
+pub fn exact_part(d: &agcad_dops::Design) -> agcad_dops::Design {
+    let exact = |k: u32| k != agcad_dops::abi::profile::SHELL;
+    agcad_dops::Design { nodes: d.nodes.iter().copied().filter(|n| exact(n.kind)).collect(), ..d.clone() }
+}
+
 /// Exact check of a survivor (escalation) without touching the document.
 pub fn exact_volume(d: &agcad_dops::Design) -> Result<f64, String> {
     let s = to_layered(d)?;

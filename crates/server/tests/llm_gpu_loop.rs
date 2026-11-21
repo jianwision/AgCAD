@@ -159,3 +159,27 @@ fn stiffness_requirement_is_checked_on_survivors() {
     assert_eq!(r["top"][0]["goal_met"], false);
     assert!(tool(&mut s, "set_goal", json!({"target_volume": [1, 2], "parameters": {}, "max_compliance": 1})).is_err());
 }
+
+#[test]
+fn device_only_survivor_is_delivered_as_certified_implicit() {
+    use agcad_dops::examples::{box_goal, shelled_box};
+    let d = shelled_box(2.0);
+    let im = agcad_server::device::deliver_implicit(&d, &box_goal(), "part.shell (device-only)", false).unwrap();
+    let s = im.summary();
+    assert_eq!(s["evidence"], "implicit-certified");
+    assert_eq!(s["mesh"]["watertight"], true, "{s}");
+    let analytic = 100.0 * 60.0 * 10.0 - 96.0 * 56.0 * 6.0;
+    let (lo, hi) = (s["certified_volume_bounds"][0].as_f64().unwrap(), s["certified_volume_bounds"][1].as_f64().unwrap());
+    assert!(lo <= analytic && analytic <= hi && (hi - lo) / analytic < 0.01, "{s}");
+    assert!((s["mesh"]["volume"].as_f64().unwrap() - analytic).abs() / analytic < 0.02, "{s}");
+    assert_eq!(agcad_server::device::exact_part(&d).nodes.len(), 1, "document keeps the exact box");
+    // export: 3MF / STL from the implicit body; STEP refuses
+    let req = Requirements::parse(r#"{"id":"r","rev":1,"deliver":{"body_type":"SolidBody"}}"#).unwrap();
+    let mut srv = Server::new(req, "box");
+    srv.session.out_dir = std::env::temp_dir().join(format!("agcad-implicit-{}", std::process::id()));
+    srv.implicit.insert(srv.branch.clone(), im);
+    assert!(tool(&mut srv, "export", json!({"format": "3mf"})).unwrap()["bytes"].as_u64().unwrap() > 1000);
+    assert!(tool(&mut srv, "export", json!({"format": "stl"})).is_ok());
+    let e = tool(&mut srv, "export", json!({"format": "step_ap242"})).unwrap_err();
+    assert!(e.contains("implicit"), "{e}");
+}

@@ -25,6 +25,8 @@ pub struct Server {
     pub load: Option<device::LoadSpec>,
     /// Rollouts run so far (names the result branches).
     pub rollouts: u32,
+    /// Certified implicit bodies of branches whose survivor has device-only ops (no B-rep).
+    pub implicit: std::collections::HashMap<String, device::Implicit>,
     /// Cached device rollout graphs.
     pub device_cache: device::DeviceCache,
 }
@@ -85,10 +87,11 @@ fn b64(data: &[u8]) -> String {
 
 impl Server {
     pub fn new(requirements: Requirements, part: &str) -> Self {
-        Server { session: HarnessSession::new(requirements, part), branch: "main".into(), goal: None, load: None, rollouts: 0, device_cache: Default::default() }
+        Server { session: HarnessSession::new(requirements, part), branch: "main".into(), goal: None, load: None, rollouts: 0, implicit: Default::default(), device_cache: Default::default() }
     }
 
     fn current_mesh(&self) -> Option<agcad_geo::tessellate::Mesh> {
+        if let Some(im) = self.implicit.get(&self.branch) { return Some(im.mesh.mesh.clone()); }
         let u = self.session.last_update.as_ref()?;
         u.products.values().rev().find_map(|p| match p {
             Product::Solid(s) => Some(self.session.kernel.tessellate(s, &Default::default())),
@@ -184,6 +187,9 @@ impl Server {
                     "stl" => agcad_std::file::stl_binary(&m, "part"),
                     "3mf" => agcad_geo::threemf::write_3mf(&[agcad_geo::threemf::ThreeMfObject { name: "part".into(), mesh: m, beams: vec![], material: None }]),
                     _ => {
+                        if let Some(im) = self.implicit.get(&self.branch) {
+                            return Err(format!("branch {} is a certified implicit body ({}): STEP needs an exact B-rep; export \"3mf\" or \"stl\"", self.branch, im.reason));
+                        }
                         let u = self.session.last_update.as_ref().ok_or("no update yet")?;
                         let s = u.products.values().rev().find_map(|p| if let Product::Solid(s) = p { Some(s.clone()) } else { None }).ok_or("no solid body")?;
                         agcad_geo::step_write::write_step(&s.brep(), &Default::default()).0.into_bytes()
@@ -252,13 +258,24 @@ impl Server {
                         self.rollouts += 1;
                         let branch = format!("device-{}", self.rollouts);
                         self.session.doc.branch(0, std::slice::from_ref(&branch));
-                        let prog = device::lower_program(&best.design, self.session.requirements.rev, 0);
+                        // device-only ops (no exact B-rep path): the document gets the exact
+                        // features, the body is delivered as a certified implicit mesh
+                        let implicit = match &exact {
+                            Err(e) => Some(device::deliver_implicit(&best.design, &g, e, prefer_cuda)?),
+                            Ok(_) => None,
+                        };
+                        let doc_design = device::exact_part(&best.design);
+                        let prog = device::lower_program(&doc_design, self.session.requirements.rev, 0);
                         let p = agcad_ir::json::decode_program(&prog.to_string(), catalog).map_err(|e| e.to_string())?;
                         let o = self.session.run_program(&branch, &p, catalog).map_err(|(s, m)| format!("{}: {m}", s.name()))?;
                         self.branch = branch.clone();
                         out["applied"] = json!({ "branch": branch, "configuration": best.configuration, "status": o.report.status, "exact_volume": exact.as_ref().ok(), "exact_error": exact.as_ref().err(),
                             "exact_within_device_bounds": exact.as_ref().map(|v| *v >= best.obs[0] && *v <= best.obs[1]).unwrap_or(false), "checks": o.report.checks,
                             "certified_volume_bounds": cert.map(|c| json!([c[0], c[1]])), "certified_evidence": "bounded" });
+                        if let Some(im) = implicit {
+                            out["applied"]["implicit"] = im.summary();
+                            self.implicit.insert(branch.clone(), im);
+                        }
                     }
                 }
                 out

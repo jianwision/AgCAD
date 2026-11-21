@@ -293,3 +293,25 @@ fn structural_moves_bitwise() {
         assert!(a.state_bytes().unwrap() == b.state_bytes().unwrap(), "structural rollout CUDA ≠ CPU (target {lo})");
     }
 }
+
+/// CMA-ES islands that change structure on stall: CUDA ≡ CPU bitwise, graph ≡ host loop.
+#[test]
+#[ignore = "requires NVIDIA GPU"]
+fn structural_cmaes_bitwise() {
+    use agcad_dops::abi::policy;
+    let base = cpu::flange(60.0, 12.0, 6.0);
+    let mut g = cpu::goal(60_000.0, 66_000.0);
+    g.param_lo[..3].copy_from_slice(&[50.0, 10.0, 3.0]);
+    g.param_hi[..3].copy_from_slice(&[62.0, 12.0, 6.0]);
+    g.place = [-28.0, -28.0, 28.0, 28.0];
+    g.hole_r = 9.0;
+    let c = StudioConfig { records: 6, nodes: 14, policy: policy::CMAES, ..cfg(64, 40) };
+    let cuda = agcad_driver_cuda::CudaDevice::open(0).unwrap();
+    let (x, y) = (Studio::new(cuda.clone(), &base, &g, c).unwrap(), Studio::new(agcad_driver_cpu::CpuDevice::new(), &base, &g, c).unwrap());
+    assert_eq!(x.run_host_loop().unwrap(), y.run_host_loop().unwrap());
+    assert!(x.state_bytes().unwrap() == y.state_bytes().unwrap(), "structural cmaes CUDA ≠ CPU");
+    let gr = Studio::new(cuda, &base, &g, c).unwrap();
+    gr.run_graph().unwrap();
+    assert!(gr.state_bytes().unwrap() == x.state_bytes().unwrap(), "graph ≠ host loop");
+    assert!(x.results(1).unwrap().done > 16);
+}

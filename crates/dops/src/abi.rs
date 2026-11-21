@@ -215,6 +215,12 @@ pub struct OptState {
     pub best: f64,
     pub restarts: u32,
     pub generation: u32,
+    /// Structural move scheduled for the next round (0 none, 1 remove material, 2 add).
+    pub pending: u32,
+    /// Structural moves made so far, and generations without improvement.
+    pub structs: u32,
+    pub stall: u32,
+    pub _pad: u32,
 }
 
 /// Accumulator slots (`CS` u64 per configuration) filled by the adaptive evaluation.

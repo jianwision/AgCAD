@@ -37,7 +37,7 @@ fn island_update_converges_on_a_quadratic() {
             }
             fs[k] = f;
         }
-        island_update(&mut st, &samp, &fs, &g, 3, 0, gi);
+        island_update(&mut st, &samp, &fs, &[0.0; 16], &g, 3, 0, gi);
     }
     for (j, want) in [0.3, 0.6, 0.45].iter().enumerate() { assert!((st.mean[j] - want).abs() < 0.02, "mean {:?}", &st.mean[..3]); }
 }
@@ -101,5 +101,34 @@ fn cmaes_sharding_keeps_islands_whole() {
         let s = agcad_dops::studio::rollout_sharded(&devs, &base, &g, c, 6, &|st| st.run_host_loop().map(|_| ())).unwrap();
         assert_eq!(s.done, one.done, "{shards} shards");
         assert_eq!(s.top.iter().map(|t| (t.configuration, t.score.to_bits())).collect::<Vec<_>>(), one.top.iter().map(|t| (t.configuration, t.score.to_bits())).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn cmaes_changes_structure_when_parameters_cannot_reach_the_goal() {
+    let base = flange(60.0, 12.0, 6.0);
+    // smallest parametric volume ≈ π(2500 − 6·20.25)·10 ≈ 74.7k: the target needs material removed
+    let mk = |hole_r: f64| {
+        let mut g = goal(60_000.0, 66_000.0);
+        g.param_lo[..3].copy_from_slice(&[50.0, 10.0, 3.0]);
+        g.param_hi[..3].copy_from_slice(&[62.0, 12.0, 6.0]);
+        g.place = [-28.0, -28.0, 28.0, 28.0];
+        g.hole_r = hole_r;
+        g
+    };
+    let run = |g: &Goal| {
+        let c = StudioConfig { records: 6, nodes: 14, ..cfg(64, 40, policy::CMAES) };
+        let st = Studio::new(CpuDevice::new(), &base, g, c).unwrap();
+        st.run_host_loop().unwrap();
+        st.results(4).unwrap()
+    };
+    let (plain, structural) = (run(&mk(0.0)), run(&mk(9.0)));
+    eprintln!("unreachable by parameters: cmaes {}/64, cmaes + structure {}/64", plain.done, structural.done);
+    assert_eq!(plain.done, 0);
+    assert!(structural.done >= 16, "{}", structural.done);
+    for sv in structural.top.iter().filter(|s| s.obs[ob::MET] == 1.0) {
+        assert!(sv.design.nodes.len() > 2, "structure was added");
+        let v = exact(&sv.design);
+        assert!(sv.obs[0] <= v && v <= sv.obs[1], "exact {v} ∉ [{}, {}]", sv.obs[0], sv.obs[1]);
     }
 }

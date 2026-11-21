@@ -91,6 +91,13 @@ This is the loop **LLM observes → sets a goal → GPU model plans and executes
   - **Mock policy:** when a parameter saturates it adds exact-path features: a hole, a rounded pocket, a slot, or a 4-hole bolt circle to remove material, or a boss on the base pad to add it.
   - **CMA-ES islands:** an island that stays infeasible for 3 generations makes the same structural move on every member (≤ 6 per island). The move's radius and x / y are bound to spare parameter slots `s{k}_r / _x / _y` (`studio::structural_slots`), so CMA-ES tunes the added structure and the lowered documents stay parametric.
   - **Measured:** on a goal unreachable by parameters alone, plain CMA-ES meets it in 0 / 64 configurations and structural CMA-ES in 64 / 64. Survivors are exact-sound and round-trip through std documents.
+- **Ray queries (`agcad-raytrace`):**
+  - **OptiX:** RTX hardware ray tracing through the `agcad-optix-sys` shim (feature `optix`; SDK from `OPTIX_ROOT` or the default install path). Device programs are compiled to PTX with NVRTC.
+  - **CPU reference:** an exact f64 Möller–Trumbore BVH tracer for machines without OptiX and for parity checks.
+  - **Parity:** OptiX ≡ CPU on hit / miss and distance (1e-4) for 20k random rays.
+  - **Speed:** 4 M rays in about 130–150 ms on the RTX 2000 Ada, including transfers.
+  - **Analyses** (MCP tool `dfm`): tool access for 3-axis (fixture face excluded), 3+2 and 5-axis direction sets; wall thickness and clearance along normals.
+  - **Renders:** ray-traced, shadowed renders (`render {mode: "raytraced"}`, Pareto candidates).
 - **Stiffness proxy** (`fea`): voxel hex8 elasticity solved by matrix-free Jacobi-PCG on the device. Fixed-shape reductions make it bit-identical CUDA ≡ CPU, and it matches `agcad_std::physics` to 1e-6. It runs on survivors.
 - **Measured** on an RTX 2000 Ada laptop GPU (`agcad bench-device`; eval is ≥ 99.9 % of each round):
 

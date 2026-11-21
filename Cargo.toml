@@ -6,6 +6,7 @@ members = [
     "crates/driver-wgpu",
     "crates/driver-cpu",
     "crates/optix-sys",
+    "crates/raytrace",
     "crates/ir",
     "crates/rtc",
     "crates/rtc-macros",
@@ -45,6 +46,7 @@ agcad-driver-cuda = { path = "crates/driver-cuda" }
 agcad-driver-wgpu = { path = "crates/driver-wgpu" }
 agcad-driver-cpu = { path = "crates/driver-cpu" }
 agcad-optix-sys = { path = "crates/optix-sys" }
+agcad-raytrace = { path = "crates/raytrace" }
 agcad-ir = { path = "crates/ir" }
 agcad-rtc = { path = "crates/rtc" }
 agcad-rtc-macros = { path = "crates/rtc-macros" }

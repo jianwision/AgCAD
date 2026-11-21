@@ -1,0 +1,18 @@
+[package]
+name = "agcad-raytrace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Ray queries for CAD analyses (OptiX on RTX GPUs, exact CPU reference): multi-direction tool access, wall thickness, clearance, shaded renders."
+
+[dependencies]
+agcad-geo = { workspace = true }
+agcad-driver = { workspace = true }
+agcad-driver-cuda = { workspace = true }
+agcad-optix-sys = { workspace = true }
+agcad-harness = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+optix = ["agcad-optix-sys/optix"]

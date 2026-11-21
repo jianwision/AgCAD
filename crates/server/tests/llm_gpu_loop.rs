@@ -288,3 +288,32 @@ fn llm_gets_a_pareto_front_with_renders_and_picks_one() {
     assert_eq!(a["applied"]["exact_within_device_bounds"], true, "{a}");
     assert!(tool(&mut s, "device_apply", json!({"candidate": 99})).is_err());
 }
+
+#[test]
+fn llm_asks_for_a_dfm_report() {
+    let req = Requirements::parse(r#"{"id":"r","rev":1,"deliver":{"body_type":"SolidBody"}}"#).unwrap();
+    let mut s = Server::new(req, "plate");
+    s.session.out_dir = std::env::temp_dir().join(format!("agcad-dfm-{}", std::process::id()));
+    let prog = json!({"requirements_rev": 1, "expected_revision": 0, "program": [
+        {"id": "s1", "op": "sketch.create", "args": {"support": "xy"}},
+        {"id": "r1", "op": "sketch.rectangle", "args": {"sketch": "%s1", "mode": "corners", "pts": [["0 mm", "0 mm"], ["100 mm", "60 mm"]]}},
+        {"id": "g1", "op": "sketch.regions", "args": {"sketch": "%r1"}},
+        {"id": "pad", "op": "part.pad", "args": {"profile": "%g1", "limits": "12 mm"}},
+        {"id": "h", "op": "part.hole", "args": {"support": "%pad", "positions": [["50 mm", "30 mm"]], "spec": {"d": "9 mm", "through": true}}},
+        {"id": "s2", "op": "sketch.create", "args": {"support": "xy"}},
+        {"id": "r2", "op": "sketch.rectangle", "args": {"sketch": "%s2", "mode": "corners", "pts": [["10 mm", "10 mm"], ["30 mm", "25 mm"]]}},
+        {"id": "g2", "op": "sketch.regions", "args": {"sketch": "%r2"}},
+        {"id": "pk", "op": "part.pocket", "args": {"profile": "%g2", "limits": {"type": "two_sided", "d": "13 mm", "d2": "-8 mm"}}}
+    ]});
+    assert_eq!(tool(&mut s, "run_program", json!({"program": prog})).unwrap()["report"]["status"], "ACCEPTED");
+    let r = tool(&mut s, "dfm", json!({"min_wall": 5, "min_clearance": 10})).unwrap();
+    // open pocket from the top and a through hole: fully 3-axis machinable once the base is held
+    assert!(r["access"]["3ax"]["unreachable_area"].as_f64().unwrap() < 1.0, "{r}");
+    assert!(r["access"]["5ax"]["unreachable_area"].as_f64().unwrap() < 1.0, "{r}");
+    // pocket floor over 8 mm of material; hole Ø9
+    assert!((r["min_wall"].as_f64().unwrap() - 8.0).abs() < 0.05, "{r}");
+    assert!((r["min_clearance"].as_f64().unwrap() - 9.0).abs() < 0.05, "{r}");
+    assert!(r["narrow_gap_area"].as_f64().unwrap() > 0.0);
+    let img = tool(&mut s, "render", json!({"mode": "raytraced"})).unwrap();
+    assert!(img["png_base64"].as_str().unwrap().len() > 100, "{img}");
+}

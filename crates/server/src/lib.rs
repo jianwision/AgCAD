@@ -52,6 +52,7 @@ pub fn tools() -> Vec<Value> {
         tool("render", "Offscreen render (PNG, base64) of the current body: views iso/top/front/right, mode shaded/face_ids.", json!({ "type": "object", "properties": { "view": { "type": "string" }, "mode": { "type": "string" } } })),
         tool("export", "Export the current body (step_ap242 | stl | 3mf); returns path written by the control plane.", json!({ "type": "object", "properties": { "format": { "type": "string" } } })),
         tool("set_goal", "Goal for the GPU model: target_volume [min, max] mm³, optional max_extent [x, y, z] mm, parameters {name: {min, max, volume_effect: \"+\"|\"-\"}} it may vary, optional new_holes {r, region [x0, y0, x1, y1]} it may add, optional domain {min, max}. objective \"satisfy\" (default: reach target_volume) | \"min_volume\" | \"max_volume\" (optimize subject to every constraint; target_volume optional). Engineering constraints (sampled on the device; a survivor must satisfy them and edits may not worsen them): min_wall (mm), min_clearance (mm), machining \"3ax\" (tool access from +z; defaults from the requirements' process) with undercut_tolerance (mm²), centroid {min, max}. Stiffness: load {support: \"x_min\"|\"y_min\"|\"z_min\", force [N], voxel mm, E MPa, nu} with max_compliance (N·mm), checked on survivors by a voxel FEA solve on the device. The GPU model then plans and executes edits on many configurations (device_rollout).", json!({ "type": "object", "properties": { "target_volume": { "type": "array" }, "max_extent": { "type": "array" }, "parameters": { "type": "object" }, "new_holes": { "type": "object" }, "domain": { "type": "object" }, "min_wall": { "type": "number" }, "min_clearance": { "type": "number" }, "machining": { "type": "string", "enum": ["3ax", "none"] }, "undercut_tolerance": { "type": "number" }, "centroid": { "type": "object" }, "load": { "type": "object" }, "max_compliance": { "type": "number" }, "objective": { "type": "string", "enum": ["satisfy", "min_volume", "max_volume"] } }, "required": ["parameters"] })),
+        tool("dfm", "Design-for-manufacture ray analysis of the current body (RTX ray tracing when available, exact CPU reference otherwise; evidence sampled, one sample per tessellation triangle): tool access for direction sets 3ax (+z, the fixture face excluded), 3+2 (±x ±y ±z) and 5ax (26 directions) — reachable / unreachable area; minimum wall thickness and clearance along surface normals, with the area below optional limits min_wall / min_clearance (mm).", json!({ "type": "object", "properties": { "min_wall": { "type": "number" }, "min_clearance": { "type": "number" }, "sets": { "type": "array" } } })),
         tool("device_apply", "Apply Pareto candidate `candidate` (index into the last device_rollout's pareto list) as a new branch of Part Design features, with exact / certified evidence.", json!({ "type": "object", "properties": { "candidate": { "type": "integer" } }, "required": ["candidate"] })),
         tool("device_rollout", "Run the GPU model on the current design: `configurations` variants × up to `rounds` rounds of plan → edit → evaluate → check → decide, entirely on the device (CUDA graph) or the CPU reference. policy \"cmaes\" (default when parameters are free and no new_holes: islands of `island` configurations run CMA-ES on the device) or \"mock\" (sign-prior controller with structural moves). Returns the top survivors; with apply_best (default true) the best becomes the active branch as Part Design features (then render / describe / export it). With pareto {objectives: [\"volume\", \"compliance\", …] (\"-\" prefix maximizes; keys volume, surface_area, extent, undercut, thin_wall, centroid_z, compliance), k} it returns up to k feasible designs trading the objectives off (non-dominated, diverse), each with a render; pick one with device_apply.", json!({ "type": "object", "properties": { "configurations": { "type": "integer" }, "rounds": { "type": "integer" }, "top_k": { "type": "integer" }, "apply_best": { "type": "boolean" }, "pareto": { "type": "object" }, "resolution": { "type": "integer" }, "device": { "type": "string", "enum": ["cuda", "cpu"] }, "policy": { "type": "string", "enum": ["cmaes", "mock"] }, "island": { "type": "integer" } } })),
         tool("finish", "Run delivery checks and produce the DeliveryReport (stop/execution/requirements/delivery).", json!({ "type": "object" })),
@@ -78,6 +79,34 @@ fn example_statement(o: &agcad_ir::OpManifest) -> Value {
         args.insert(name.to_string(), serde_json::from_str(&ex).unwrap_or(Value::String(ex)));
     }
     json!({ "id": o.name.rsplit('.').next().unwrap_or("s"), "op": o.name, "args": args })
+}
+
+/// DFM report of a body's tessellation (see the `dfm` tool).
+pub fn dfm_report(m: &agcad_geo::tessellate::Mesh, args: &Value) -> Result<Value, String> {
+    use agcad_raytrace::analysis::{access, along_normal, directions, samples};
+    let (t, why) = agcad_raytrace::best(m);
+    let t0 = std::time::Instant::now();
+    let sets: Vec<String> = match args.get("sets").and_then(Value::as_array) { Some(a) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(), None => vec!["3ax".into(), "3+2".into(), "5ax".into()] };
+    // the fixture face: downward-facing samples on the part's lowest plane (held by the vise)
+    let s = samples(m);
+    let zmin = m.positions.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
+    let base: f64 = s.c.iter().zip(&s.n).zip(&s.a).filter(|((c, n), _)| n.z < -1.0 + 1e-6 && (c.z - zmin).abs() < 1e-6).map(|(_, a)| a).sum();
+    let mut acc = serde_json::Map::new();
+    for set in &sets {
+        let dirs = directions(set).ok_or(format!("unknown direction set '{set}' (3ax, 3+2, 5ax)"))?;
+        let a = access(&*t, m, &dirs)?;
+        let fixture = if set == "3ax" { base } else { 0.0 };
+        let unreachable = (a.unreachable - fixture).max(0.0);
+        acc.insert(set.clone(), json!({ "unreachable_area": (unreachable * 100.0).round() / 100.0, "unreachable_fraction": unreachable / a.area, "directions": a.dirs.len(), "fixture_area_excluded": fixture }));
+    }
+    let wall = along_normal(&*t, m, true)?;
+    let gap = along_normal(&*t, m, false)?;
+    let fin = |x: f64| if x.is_finite() { json!((x * 1e4).round() / 1e4) } else { Value::Null };
+    let mut out = json!({ "tracer": t.name(), "fallback_reason": why, "samples": s.c.len(), "surface_area": s.area, "access": acc,
+        "min_wall": fin(wall.min()), "min_clearance": fin(gap.min()), "ms": (t0.elapsed().as_secs_f64() * 1e4).round() / 10.0, "evidence": "sampled" });
+    if let Some(l) = args.get("min_wall").and_then(Value::as_f64) { out["thin_wall_area"] = json!(wall.area_below(l)); }
+    if let Some(l) = args.get("min_clearance").and_then(Value::as_f64) { out["narrow_gap_area"] = json!(gap.area_below(l)); }
+    Ok(out)
 }
 
 fn b64(data: &[u8]) -> String {
@@ -206,6 +235,17 @@ impl Server {
                         json!({ "current": now, "against_version": vid, "diff": agcad_harness::describe::diff(&before, &now) })
                     }
                 }
+            }
+            "dfm" => {
+                let m = self.current_mesh().ok_or("nothing to analyse")?;
+                json!(dfm_report(&m, args)?)
+            }
+            "render" if args.get("mode").and_then(Value::as_str) == Some("raytraced") => {
+                let m = self.current_mesh().ok_or("nothing to render")?;
+                let (t, why) = agcad_raytrace::best(&m);
+                let (w, h) = (512, 512);
+                let png = agcad_raytrace::analysis::render(&*t, &m, w, h)?;
+                json!({ "png_base64": b64(&png), "width": w, "height": h, "tracer": t.name(), "fallback_reason": why })
             }
             "render" => {
                 let m = self.current_mesh().ok_or("nothing to render")?;

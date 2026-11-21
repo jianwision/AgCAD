@@ -22,6 +22,11 @@ bytemuck = { workspace = true }
 agcad-driver = { workspace = true }
 agcad-driver-cpu = { workspace = true }
 agcad-driver-cuda = { workspace = true }
+agcad-raytrace = { workspace = true }
 
 [dev-dependencies]
 agcad-geo-occt = { workspace = true }
+
+[features]
+# RTX hardware ray tracing for dfm / renders (needs the OptiX SDK at build time)
+optix = ["agcad-raytrace/optix"]

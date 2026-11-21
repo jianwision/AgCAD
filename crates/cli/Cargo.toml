@@ -26,3 +26,6 @@ agcad-driver = { workspace = true }
 agcad-dops = { workspace = true }
 agcad-driver-cpu = { workspace = true }
 agcad-driver-cuda = { workspace = true }
+
+[features]
+optix = ["agcad-server/optix"]

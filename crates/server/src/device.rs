@@ -262,6 +262,8 @@ pub fn render_design(d: &agcad_dops::Design, obs: &[f64], goal: &Goal, prefer_cu
         Err(reason) => { let _ = (obs, reason); deliver_implicit(d, goal, "render", prefer_cuda)?.mesh.mesh }
     };
     let (w, h) = (256, 256);
+    // ray-traced (shadows) on RTX GPUs; the rasterizer otherwise
+    if let Ok(t) = agcad_raytrace::OptixTracer::new(&mesh) { if let Ok(p) = agcad_raytrace::analysis::render(&t, &mesh, w, h) { return Ok(p); } }
     Ok(png(&rasterize(&mesh, View::Iso, Mode::Shaded, w, h), w, h))
 }
 

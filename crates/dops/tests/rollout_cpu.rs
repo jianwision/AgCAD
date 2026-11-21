@@ -38,7 +38,7 @@ fn mock_gpu_model_reaches_goal_and_escalates_exactly() {
     let dev = CpuDevice::new();
     let base = flange(60.0, 12.0, 6.0);
     let g = goal(60_000.0, 66_000.0);
-    let cfg = StudioConfig { configs: 8, records: 4, max_rounds: 14, coarse: 8, levels: 5, cap: 4096, nodes: 8, budget: 64, tighten: 0, max_cells: 0 };
+    let cfg = StudioConfig { configs: 8, records: 4, max_rounds: 14, coarse: 8, levels: 5, cap: 4096, nodes: 8, budget: 64, tighten: 0, max_cells: 0, policy: 0, island: 16 };
     let st = Studio::new(dev, &base, &g, cfg).unwrap();
     let rounds = st.run_host_loop().unwrap();
     let res = st.results(4).unwrap();
@@ -76,7 +76,7 @@ fn hard_limit_rejects_and_capacity_is_reported() {
     let base = flange(60.0, 12.0, 6.0);
     let mut g = goal(60_000.0, 66_000.0);
     g.max_ext = [80.0, 80.0, 25.0]; // r ≥ 50 ⇒ extent ≥ 100: every edit definitely violates
-    let cfg = StudioConfig { configs: 3, records: 4, max_rounds: 3, coarse: 8, levels: 6, cap: 16384, nodes: 2, budget: 64, tighten: 0, max_cells: 0 };
+    let cfg = StudioConfig { configs: 3, records: 4, max_rounds: 3, coarse: 8, levels: 6, cap: 16384, nodes: 2, budget: 64, tighten: 0, max_cells: 0, policy: 0, island: 16 };
     let st = Studio::new(dev, &base, &g, cfg).unwrap();
     st.run_host_loop().unwrap();
     let (cmds, status) = st.last_round().unwrap();
@@ -207,7 +207,7 @@ fn shell_is_exact_sound_and_round_trips() {
 #[test]
 fn reset_reuses_buffers_and_matches_a_fresh_studio() {
     let dev = CpuDevice::new();
-    let cfg = StudioConfig { configs: 6, records: 4, max_rounds: 8, coarse: 8, levels: 4, cap: 4096, nodes: 8, budget: 64, tighten: 0, max_cells: 0 };
+    let cfg = StudioConfig { configs: 6, records: 4, max_rounds: 8, coarse: 8, levels: 4, cap: 4096, nodes: 8, budget: 64, tighten: 0, max_cells: 0, policy: 0, island: 16 };
     let (a, b) = (flange(60.0, 12.0, 6.0), flange(70.0, 9.0, 8.0));
     let (ga, gb) = (goal(60_000.0, 66_000.0), goal(80_000.0, 90_000.0));
     let mut reused = Studio::new(dev.clone(), &a, &ga, cfg).unwrap();
@@ -222,7 +222,7 @@ fn reset_reuses_buffers_and_matches_a_fresh_studio() {
 #[test]
 fn sharded_rollout_equals_single_device() {
     let dev = CpuDevice::new();
-    let cfg = StudioConfig { configs: 10, records: 4, max_rounds: 10, coarse: 8, levels: 4, cap: 4096, nodes: 8, budget: 64, tighten: 0, max_cells: 0 };
+    let cfg = StudioConfig { configs: 10, records: 4, max_rounds: 10, coarse: 8, levels: 4, cap: 4096, nodes: 8, budget: 64, tighten: 0, max_cells: 0, policy: 0, island: 16 };
     let (base, g) = (flange(60.0, 12.0, 6.0), goal(60_000.0, 66_000.0));
     let single = Studio::new(dev.clone(), &base, &g, cfg).unwrap();
     single.run_host_loop().unwrap();
@@ -246,7 +246,7 @@ fn global_cell_budget_stays_sound() {
     let dev = CpuDevice::new();
     let d = flange(60.0, 12.0, 6.0);
     let exact = exact_volume(&d);
-    let base = StudioConfig { configs: 4, records: 4, max_rounds: 1, coarse: 8, levels: 6, cap: 16384, nodes: 8, budget: 8, tighten: 0, max_cells: 0 };
+    let base = StudioConfig { configs: 4, records: 4, max_rounds: 1, coarse: 8, levels: 6, cap: 16384, nodes: 8, budget: 8, tighten: 0, max_cells: 0, policy: 0, island: 16 };
     let width = |c: StudioConfig| {
         let st = Studio::new(dev.clone(), &d, &goal(1.0, 2.0), c).unwrap();
         st.observe().unwrap();

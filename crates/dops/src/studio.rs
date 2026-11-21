@@ -57,10 +57,14 @@ pub struct StudioConfig {
     /// configs × cap; when exhausted, the remaining refinements of a level become boundary
     /// cells (still rigorous, just wider bounds), in configuration order.
     pub max_cells: u32,
+    /// `policy::MOCK` or `policy::CMAES`; `island` = CMA-ES population λ (configurations
+    /// per island, 2 ..= 64).
+    pub policy: u32,
+    pub island: u32,
 }
 
 impl Default for StudioConfig {
-    fn default() -> Self { StudioConfig { configs: 64, nodes: 16, records: 4, max_rounds: 32, coarse: 8, levels: 5, cap: 4096, budget: 64, tighten: 0, max_cells: 0 } }
+    fn default() -> Self { StudioConfig { configs: 64, nodes: 16, records: 4, max_rounds: 32, coarse: 8, levels: 5, cap: 4096, budget: 64, tighten: 0, max_cells: 0, policy: 0, island: 16 } }
 }
 
 /// One configuration's result after a rollout.
@@ -88,7 +92,7 @@ struct Bufs<B> {
     // ranking scratch
     rank_keys: B, rank_vals: B,
     stamps: B,
-    wl0: B, wl1: B, cls: B, flag: B, offs: B, crank: B, start: B, lvl: B, term: B, toffs: B, tlist: B, tcount: B,
+    wl0: B, wl1: B, cls: B, flag: B, offs: B, crank: B, start: B, lvl: B, term: B, toffs: B, tlist: B, tcount: B, opt: B, samp: B, tscore: B,
 }
 
 pub struct Studio<D: KernelExt> {
@@ -135,6 +139,8 @@ impl<D: KernelExt> Studio<D> {
         let (c, n, r) = (cfg.configs as usize, cfg.nodes as usize, cfg.records as usize);
         assert!(cfg.levels >= 1 && (cfg.coarse << (cfg.levels - 1)) <= 1024, "finest resolution must be ≤ 1024 per axis");
         assert!(cfg.cap >= cfg.coarse.pow(3), "cap must hold the root grid of one configuration");
+        let island = (cfg.island as usize).clamp(2, MAX_ISLAND);
+        assert!(cfg.policy != policy::CMAES || cfg_offset as usize % island == 0, "shards must start on a CMA-ES island boundary");
         let full = c * cfg.cap as usize;
         let capacity = if cfg.max_cells > 0 { full.min(cfg.max_cells as usize) } else { full };
         assert!(capacity >= c * cfg.coarse.pow(3) as usize, "max_cells must hold the root grids of all configurations");
@@ -195,6 +201,9 @@ impl<D: KernelExt> Studio<D> {
             toffs: zeros(capacity * 4)?,
             tlist: zeros(capacity * 4)?,
             tcount: zeros(4)?,
+            opt: zeros(c.div_ceil(island) * std::mem::size_of::<OptState>())?,
+            samp: zeros(c * MAX_PARAMS * 8)?,
+            tscore: zeros(c * 8)?,
         };
         let mk = |eval_trial: u32, handle: u64, level: u32| DopsArgs {
             goal: b.goal.device_ptr(), cur_nodes: b.cur_nodes.device_ptr(), cur_count: b.cur_count.device_ptr(), cur_params: b.cur_params.device_ptr(),
@@ -202,9 +211,9 @@ impl<D: KernelExt> Studio<D> {
             rev: b.rev.device_ptr(), budget: b.budget.device_ptr(), done: b.done.device_ptr(), cmds: b.cmds.device_ptr(), arena: b.arena.device_ptr(),
             status: b.status.device_ptr(), counts: b.counts.device_ptr(), domain_hit: b.domain_hit.device_ptr(), bbox: b.bbox.device_ptr(),
             obs: b.obs.device_ptr(), score: b.score.device_ptr(), trace: b.trace.device_ptr(), round: b.round.device_ptr(), active: b.active.device_ptr(), compiled: b.compiled.device_ptr(), tables: b.tables.device_ptr(),
-            wl0: b.wl0.device_ptr(), wl1: b.wl1.device_ptr(), cls: b.cls.device_ptr(), flag: b.flag.device_ptr(), offs: b.offs.device_ptr(), crank: b.crank.device_ptr(), start: b.start.device_ptr(), lvl: b.lvl.device_ptr(), term: b.term.device_ptr(), toffs: b.toffs.device_ptr(), tlist: b.tlist.device_ptr(), tcount: b.tcount.device_ptr(),
+            wl0: b.wl0.device_ptr(), wl1: b.wl1.device_ptr(), cls: b.cls.device_ptr(), flag: b.flag.device_ptr(), offs: b.offs.device_ptr(), crank: b.crank.device_ptr(), start: b.start.device_ptr(), lvl: b.lvl.device_ptr(), term: b.term.device_ptr(), toffs: b.toffs.device_ptr(), tlist: b.tlist.device_ptr(), tcount: b.tcount.device_ptr(), opt: b.opt.device_ptr(), samp: b.samp.device_ptr(), tscore: b.tscore.device_ptr(),
             cond_handle: handle, configs: cfg.configs, nodes: cfg.nodes, params: k as u32, records: cfg.records, coarse: cfg.coarse, levels: cfg.levels,
-            eval_trial, max_rounds: cfg.max_rounds, level, capacity: capacity as u32, cap: cfg.cap, cfg_offset, tighten: cfg.tighten, _pad: 0, ops: crate::registry::op_table(agcad_ir::Catalog::global()),
+            eval_trial, max_rounds: cfg.max_rounds, level, capacity: capacity as u32, cap: cfg.cap, cfg_offset, tighten: cfg.tighten, policy: cfg.policy, island: island as u32, _pad2: 0, ops: crate::registry::op_table(agcad_ir::Catalog::global()),
         };
         let a_observe = upload_params(d, &s, &mk(0, 0, 0))?;
         let host_args = mk(1, 0, 0);
@@ -241,7 +250,7 @@ impl<D: KernelExt> Studio<D> {
         d.upload_from_host_async(&self.s, bytemuck::cast_slice(&params), &self.b.cur_params, 0)?;
         d.upload_from_host_async(&self.s, bytemuck::bytes_of(goal), &self.b.goal, 0)?;
         d.upload_from_host_async(&self.s, bytemuck::cast_slice(&vec![self.cfg.budget; c]), &self.b.budget, 0)?;
-        for (buf, bytes) in [(&self.b.rev, c * 4), (&self.b.done, c * 4), (&self.b.round, 4), (&self.b.active, 4), (&self.b.trace, self.cfg.max_rounds as usize * c * 32), (&self.b.stamps, self.cfg.max_rounds as usize * STAGES * 8), (&self.b.obs, c * OBS * 8), (&self.b.score, c * 8)] {
+        for (buf, bytes) in [(&self.b.rev, c * 4), (&self.b.done, c * 4), (&self.b.round, 4), (&self.b.active, 4), (&self.b.trace, self.cfg.max_rounds as usize * c * 32), (&self.b.stamps, self.cfg.max_rounds as usize * STAGES * 8), (&self.b.obs, c * OBS * 8), (&self.b.score, c * 8), (&self.b.samp, c * MAX_PARAMS * 8), (&self.b.tscore, c * 8)] {
             d.memset_async(&self.s, buf, 0, bytes, 0)?;
         }
         d.sync(&self.s)?;
@@ -284,6 +293,7 @@ impl<D: KernelExt> Studio<D> {
         d.launch(&self.s, self.lib, "ag_dop_eval_clear", &self.per_cfg(), &self.a_observe.buffer)?;
         self.enqueue_eval(0)?;
         d.launch(&self.s, self.lib, "ag_dop_decide", &self.per_cfg(), &self.a_observe.buffer)?;
+        d.launch(&self.s, self.lib, "ag_opt_init", &LaunchConfig::linear(1, 32), &self.a_observe.buffer)?;
         Ok(())
     }
 
@@ -308,6 +318,9 @@ impl<D: KernelExt> Studio<D> {
         stamp(6)?;
         d.launch(&self.s, self.lib, "ag_dop_decide", &self.per_cfg(), a)?;
         stamp(7)?;
+        let islands = (self.cfg.configs as u64).div_ceil(self.cfg.island.clamp(2, MAX_ISLAND as u32) as u64);
+        d.launch(&self.s, self.lib, "ag_opt_update", &LaunchConfig::linear(islands, 64), a)?;
+        stamp(8)?;
         d.launch(&self.s, self.lib, "ag_dop_continue", &LaunchConfig::linear(1, 32), cont)?;
         Ok(())
     }
@@ -386,6 +399,8 @@ impl<D: KernelExt> Studio<D> {
         out.extend(self.read::<u8>(&self.b.trace, 0, self.cfg.max_rounds as usize * c * 32)?);
         out.extend(self.read::<u8>(&self.b.cmds, 0, c * self.cfg.records as usize * 64)?);
         out.extend(self.read::<u8>(&self.b.status, 0, c * self.cfg.records as usize * 16)?);
+        out.extend(self.read::<u8>(&self.b.samp, 0, c * MAX_PARAMS * 8)?);
+        out.extend(self.read::<u8>(&self.b.tscore, 0, c * 8)?);
         Ok(out)
     }
 }
@@ -454,7 +469,7 @@ pub fn certify<D: KernelExt>(dev: Arc<D>, design: &Design, goal: &Goal, levels: 
 pub const CERTIFY_TIGHTEN: u32 = 96;
 
 pub fn certify_with<D: KernelExt>(dev: Arc<D>, design: &Design, goal: &Goal, levels: u32, cap: u32, tighten: u32) -> DriverResult<[f64; OBS]> {
-    let cfg = StudioConfig { configs: 1, nodes: design.nodes.len().max(1) as u32, records: 1, max_rounds: 1, coarse: 8, levels, cap, budget: 1, tighten, max_cells: 0 };
+    let cfg = StudioConfig { configs: 1, nodes: design.nodes.len().max(1) as u32, records: 1, max_rounds: 1, coarse: 8, levels, cap, budget: 1, tighten, max_cells: 0, policy: 0, island: 16 };
     let st = Studio::new_with(dev, design, goal, cfg, 0, Priority::Low)?;
     st.observe()?;
     let o: Vec<f64> = st.read(&st.b.obs, 0, OBS)?;
@@ -468,7 +483,9 @@ pub fn certify_with<D: KernelExt>(dev: Arc<D>, design: &Design, goal: &Goal, lev
 /// key, global configuration id) with `sched::merge_topk` — identical to one device.
 pub fn rollout_sharded<D: KernelExt + Send + Sync>(devs: &[Arc<D>], base: &Design, goal: &Goal, cfg: StudioConfig, top_k: usize, run: &(dyn Fn(&Studio<D>) -> DriverResult<()> + Sync)) -> DriverResult<RolloutSummary>
 where D::Stream: Send, D::Buffer: Send {
-    let ranges = agcad_runtime::sched::shard(cfg.configs, devs.len() as u32);
+    // CMA-ES islands stay whole: shard in units of islands
+    let unit = if cfg.policy == policy::CMAES { (cfg.island as usize).clamp(2, MAX_ISLAND) as u32 } else { 1 };
+    let ranges: Vec<std::ops::Range<u32>> = agcad_runtime::sched::shard(cfg.configs.div_ceil(unit), devs.len() as u32).into_iter().map(|r| (r.start * unit).min(cfg.configs)..(r.end * unit).min(cfg.configs)).collect();
     let shards: Vec<DriverResult<RolloutSummary>> = std::thread::scope(|sc| {
         let hs: Vec<_> = ranges.iter().zip(devs).filter(|(r, _)| !r.is_empty()).map(|(r, d)| {
             let (d, r) = (d.clone(), r.clone());

@@ -15,10 +15,21 @@ pub fn parse_goal(args: &Value, names: &[String], body_bbox: Option<([f64; 3], [
     let mut g = Goal::zeroed();
     let mut notes = Vec::new();
     let num = |v: &Value| -> Option<f64> { v.as_f64().or_else(|| v.as_str().and_then(|s| agcad_ir::Quantity::parse(s).ok().map(|q| q.value))) };
-    let tv = args.get("target_volume").and_then(Value::as_array).ok_or("target_volume: [min, max] in mm³ is required")?;
-    g.vol_lo = tv.first().and_then(num).ok_or("target_volume[0]")?;
-    g.vol_hi = tv.get(1).and_then(num).ok_or("target_volume[1]")?;
-    if !(g.vol_hi > g.vol_lo && g.vol_lo > 0.0) { return Err("target_volume must be 0 < min < max".into()); }
+    g.objective = match args.get("objective").and_then(Value::as_str).unwrap_or("satisfy") {
+        "satisfy" => 0,
+        "min_volume" => 1,
+        "max_volume" => 2,
+        o => return Err(format!("objective: \"satisfy\" | \"min_volume\" | \"max_volume\" (got {o})")),
+    };
+    match args.get("target_volume").and_then(Value::as_array) {
+        Some(tv) => {
+            g.vol_lo = tv.first().and_then(num).ok_or("target_volume[0]")?;
+            g.vol_hi = tv.get(1).and_then(num).ok_or("target_volume[1]")?;
+            if !(g.vol_hi > g.vol_lo && g.vol_lo > 0.0) { return Err("target_volume must be 0 < min < max".into()); }
+        }
+        None if g.objective == 0 => return Err("target_volume: [min, max] in mm³ is required (or an objective)".into()),
+        None => {}
+    }
     g.max_ext = [1e6; 3];
     if let Some(m) = args.get("max_extent").and_then(Value::as_array) {
         for k in 0..3 { g.max_ext[k] = m.get(k).and_then(num).ok_or("max_extent: [x, y, z]")?; }
@@ -137,7 +148,7 @@ pub struct RolloutRun {
 /// a repeat rollout with a new goal or base design only rewrites device buffers.
 #[derive(Default)]
 pub struct DeviceCache {
-    cuda: Option<((u32, u32, u32, u32, u32, u32, usize), agcad_dops::GraphRollout<agcad_driver_cuda::CudaDevice>)>,
+    cuda: Option<((u32, u32, u32, u32, u32, u32, usize, u32, u32), agcad_dops::GraphRollout<agcad_driver_cuda::CudaDevice>)>,
 }
 
 /// Run on CUDA (cached graph WHILE) when available and requested, else on the CPU reference.
@@ -145,7 +156,7 @@ pub fn run(cache: &mut DeviceCache, design: &agcad_dops::Design, goal: &Goal, cf
     let t0 = std::time::Instant::now();
     if prefer_cuda {
         if let Ok(dev) = agcad_driver_cuda::CudaDevice::open(0) {
-            let key = (cfg.configs, cfg.nodes, cfg.records, cfg.max_rounds, cfg.levels, cfg.cap, design.params.len());
+            let key = (cfg.configs, cfg.nodes, cfg.records, cfg.max_rounds, cfg.levels, cfg.cap, design.params.len(), cfg.policy, cfg.island);
             let reused = matches!(&cache.cuda, Some((k, _)) if *k == key);
             if reused {
                 cache.cuda.as_mut().unwrap().1.reset(design, goal).map_err(|e| e.to_string())?;

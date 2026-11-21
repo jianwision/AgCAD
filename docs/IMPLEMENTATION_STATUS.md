@@ -73,6 +73,12 @@ This is the loop **LLM observes → sets a goal → GPU model plans and executes
   - centroid limits.
 
   `set_goal` takes `min_wall`, `min_clearance`, `machining: "3ax"` (defaulting from the requirements' process), `centroid`, and `load` / `max_compliance`. Edits may not worsen violations.
+- **On-device optimizer policy** (`policy: "cmaes"`, the server default when parameters are free):
+  - **Islands:** λ configurations per island run sep-CMA-ES on the normalized parameters. Sampling uses Irwin–Hall normals (no transcendentals). Members are elitist, the rank-μ diagonal update is linearly weighted, and step size follows the 1/5-success rule with restarts. The update kernel runs one thread per island.
+  - **Parity:** CUDA ≡ CPU bitwise, graph ≡ host loop, and sharding keeps islands whole.
+  - **Objectives:** `satisfy`, `min_volume` and `max_volume`, subject to every constraint.
+  - **Measured** at 4096 configurations with every LLM sign prior wrong: mock meets the goal in 181 / 4096, CMA-ES in 4095 / 4096 (24 rounds, 16–17k config-rounds/s).
+  - **min_volume** with an 8 mm wall picks the lightest feasible disc. The mock policy remains for structural moves (new holes / pockets).
 - **Stiffness proxy** (`fea`): voxel hex8 elasticity solved by matrix-free Jacobi-PCG on the device. Fixed-shape reductions make it bit-identical CUDA ≡ CPU, and it matches `agcad_std::physics` to 1e-6. It runs on survivors.
 - **Measured** on an RTX 2000 Ada laptop GPU (`agcad bench-device`; eval is ≥ 99.9 % of each round):
 
@@ -92,7 +98,7 @@ This is the loop **LLM observes → sets a goal → GPU model plans and executes
 
   Ruled out by measurement: near-cubic root cells. They made plate bounds 3× wider, because the thin-z cells bound the dominant faces best. The fix will be orientation-aware anisotropic splitting.
 - **Next:**
-  - on-device optimizers (CMA-ES / batched gradients) as policies, and later a learned structural policy (the trace ring and the Candle trainer are in place);
+  - a learned structural policy over feature-tape tokens, one token per node (CANTO-style native tokenization), trained from rollout traces; CMA-ES then tunes its parameters;
   - anisotropic refinement in the global worklist (today it is only within the per-cell tightening);
   - shared-memory tapes;
   - open shells and multi-slab offsets (the general offset path);

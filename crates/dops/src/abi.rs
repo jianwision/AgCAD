@@ -155,6 +155,32 @@ pub struct Goal {
     /// Centroid box (mm); ignored unless hi > lo on that axis.
     pub centroid_lo: [f64; 3],
     pub centroid_hi: [f64; 3],
+    /// 0 = satisfy (done when met); 1 = minimize / 2 = maximize the volume estimate subject
+    /// to every constraint (never done; runs all rounds).
+    pub objective: u32,
+    pub _pad2: u32,
+    /// Objective normalization (mm³; 0 → 1).
+    pub obj_scale: f64,
+}
+
+/// Policy kinds (`DopsArgs::policy`).
+pub mod policy {
+    pub const MOCK: u32 = 0;
+    pub const CMAES: u32 = 1;
+}
+/// Largest CMA-ES island (population λ).
+pub const MAX_ISLAND: usize = 64;
+
+/// Per-island sep-CMA-ES state (normalized parameters u ∈ [0, 1]).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct OptState {
+    pub mean: [f64; MAX_PARAMS],
+    pub diag: [f64; MAX_PARAMS],
+    pub sigma: f64,
+    pub best: f64,
+    pub restarts: u32,
+    pub generation: u32,
 }
 
 /// Accumulator slots (`CS` u64 per configuration) filled by the adaptive evaluation.
@@ -296,6 +322,11 @@ pub struct DopsArgs {
     pub toffs: u64,
     pub tlist: u64,
     pub tcount: u64,
+    /// CMA-ES: island states, per-configuration samples (normalized, MAX_PARAMS each) and
+    /// trial scores.
+    pub opt: u64,
+    pub samp: u64,
+    pub tscore: u64,
     /// CUgraphConditionalHandle of the enclosing WHILE node (0 = host-driven loop).
     pub cond_handle: u64,
     pub configs: u32,
@@ -321,7 +352,10 @@ pub struct DopsArgs {
     pub cfg_offset: u32,
     /// Interval evaluations per terminal boundary cell for bound tightening (0 = off).
     pub tighten: u32,
-    pub _pad: u32,
+    /// `policy::MOCK` or `policy::CMAES`; `island` = λ (configurations per CMA-ES island).
+    pub policy: u32,
+    pub island: u32,
+    pub _pad2: u32,
     pub ops: OpTable,
 }
 
@@ -341,8 +375,8 @@ pub mod rec {
 
 /// Stage timestamps per round (ns): 0 start, 1 policy, 2 validate, 3 apply, 4 compile,
 /// 5 clear, 6 eval, 7 decide. Not part of the deterministic state.
-pub const STAGES: usize = 8;
-pub const STAGE_NAMES: [&str; STAGES - 1] = ["policy", "validate", "apply", "compile", "clear", "eval", "decide"];
+pub const STAGES: usize = 9;
+pub const STAGE_NAMES: [&str; STAGES - 1] = ["policy", "validate", "apply", "compile", "clear", "eval", "decide", "update"];
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Pod, Zeroable)]

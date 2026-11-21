@@ -47,8 +47,8 @@ pub fn tools() -> Vec<Value> {
         tool("describe", "Structured text view of the current body: bounding box, volume, holes and cylindrical walls by diameter/axis/position, planar faces by normal/offset, parameters. With against_version: semantic diff (holes added/removed, volume delta, parameter changes).", json!({ "type": "object", "properties": { "against_version": { "type": "integer" } } })),
         tool("render", "Offscreen render (PNG, base64) of the current body: views iso/top/front/right, mode shaded/face_ids.", json!({ "type": "object", "properties": { "view": { "type": "string" }, "mode": { "type": "string" } } })),
         tool("export", "Export the current body (step_ap242 | stl | 3mf); returns path written by the control plane.", json!({ "type": "object", "properties": { "format": { "type": "string" } } })),
-        tool("set_goal", "Goal for the GPU model: target_volume [min, max] mm³, optional max_extent [x, y, z] mm, parameters {name: {min, max, volume_effect: \"+\"|\"-\"}} it may vary, optional new_holes {r, region [x0, y0, x1, y1]} it may add, optional domain {min, max}. Engineering constraints (sampled on the device; a survivor must satisfy them and edits may not worsen them): min_wall (mm), min_clearance (mm), machining \"3ax\" (tool access from +z; defaults from the requirements' process) with undercut_tolerance (mm²), centroid {min, max}. Stiffness: load {support: \"x_min\"|\"y_min\"|\"z_min\", force [N], voxel mm, E MPa, nu} with max_compliance (N·mm), checked on survivors by a voxel FEA solve on the device. The GPU model then plans and executes edits on many configurations (device_rollout).", json!({ "type": "object", "properties": { "target_volume": { "type": "array" }, "max_extent": { "type": "array" }, "parameters": { "type": "object" }, "new_holes": { "type": "object" }, "domain": { "type": "object" }, "min_wall": { "type": "number" }, "min_clearance": { "type": "number" }, "machining": { "type": "string", "enum": ["3ax", "none"] }, "undercut_tolerance": { "type": "number" }, "centroid": { "type": "object" }, "load": { "type": "object" }, "max_compliance": { "type": "number" } }, "required": ["target_volume", "parameters"] })),
-        tool("device_rollout", "Run the GPU model on the current design: `configurations` variants × up to `rounds` rounds of plan → edit → evaluate → check → decide, entirely on the device (CUDA graph) or the CPU reference. Returns the top survivors; with apply_best (default true) the best becomes the active branch as Part Design features (then render / describe / export it).", json!({ "type": "object", "properties": { "configurations": { "type": "integer" }, "rounds": { "type": "integer" }, "top_k": { "type": "integer" }, "apply_best": { "type": "boolean" }, "resolution": { "type": "integer" }, "device": { "type": "string", "enum": ["cuda", "cpu"] } } })),
+        tool("set_goal", "Goal for the GPU model: target_volume [min, max] mm³, optional max_extent [x, y, z] mm, parameters {name: {min, max, volume_effect: \"+\"|\"-\"}} it may vary, optional new_holes {r, region [x0, y0, x1, y1]} it may add, optional domain {min, max}. objective \"satisfy\" (default: reach target_volume) | \"min_volume\" | \"max_volume\" (optimize subject to every constraint; target_volume optional). Engineering constraints (sampled on the device; a survivor must satisfy them and edits may not worsen them): min_wall (mm), min_clearance (mm), machining \"3ax\" (tool access from +z; defaults from the requirements' process) with undercut_tolerance (mm²), centroid {min, max}. Stiffness: load {support: \"x_min\"|\"y_min\"|\"z_min\", force [N], voxel mm, E MPa, nu} with max_compliance (N·mm), checked on survivors by a voxel FEA solve on the device. The GPU model then plans and executes edits on many configurations (device_rollout).", json!({ "type": "object", "properties": { "target_volume": { "type": "array" }, "max_extent": { "type": "array" }, "parameters": { "type": "object" }, "new_holes": { "type": "object" }, "domain": { "type": "object" }, "min_wall": { "type": "number" }, "min_clearance": { "type": "number" }, "machining": { "type": "string", "enum": ["3ax", "none"] }, "undercut_tolerance": { "type": "number" }, "centroid": { "type": "object" }, "load": { "type": "object" }, "max_compliance": { "type": "number" }, "objective": { "type": "string", "enum": ["satisfy", "min_volume", "max_volume"] } }, "required": ["parameters"] })),
+        tool("device_rollout", "Run the GPU model on the current design: `configurations` variants × up to `rounds` rounds of plan → edit → evaluate → check → decide, entirely on the device (CUDA graph) or the CPU reference. policy \"cmaes\" (default when parameters are free and no new_holes: islands of `island` configurations run CMA-ES on the device) or \"mock\" (sign-prior controller with structural moves). Returns the top survivors; with apply_best (default true) the best becomes the active branch as Part Design features (then render / describe / export it).", json!({ "type": "object", "properties": { "configurations": { "type": "integer" }, "rounds": { "type": "integer" }, "top_k": { "type": "integer" }, "apply_best": { "type": "boolean" }, "resolution": { "type": "integer" }, "device": { "type": "string", "enum": ["cuda", "cpu"] }, "policy": { "type": "string", "enum": ["cmaes", "mock"] }, "island": { "type": "integer" } } })),
         tool("finish", "Run delivery checks and produce the DeliveryReport (stop/execution/requirements/delivery).", json!({ "type": "object" })),
     ]
 }
@@ -205,11 +205,12 @@ impl Server {
                 let p3 = self.session.requirements.process == agcad_harness::requirements::Process::Machining3ax;
                 let (mut g, notes) = device::parse_goal(args, &design.names, bbox, p3)?;
                 device::freeze_fixed(&mut g, &design.params);
+                if g.objective != 0 { g.obj_scale = device::exact_volume(&design).unwrap_or(1.0).max(1.0); }
                 let load = device::parse_load(args)?;
                 self.goal = Some((g, design.names.clone()));
                 self.load = load;
                 json!({ "ok": true, "parameters": design.names, "device_features": design.nodes.len(), "notes": notes, "raise_warnings": warnings,
-                        "goal": { "target_volume": [g.vol_lo, g.vol_hi], "max_extent": g.max_ext, "domain": { "min": g.domain_lo, "max": g.domain_hi },
+                        "goal": { "objective": (["satisfy", "min_volume", "max_volume"][g.objective as usize]), "target_volume": (g.vol_hi > g.vol_lo).then_some([g.vol_lo, g.vol_hi]), "max_extent": g.max_ext, "domain": { "min": g.domain_lo, "max": g.domain_hi },
                                   "min_wall": (g.min_wall > 0.0).then_some(g.min_wall), "min_clearance": (g.min_gap > 0.0).then_some(g.min_gap), "machining_3ax": g.machining_3ax == 1,
                                   "stiffness": load.map(|l| json!({ "support_axis": l.support_axis, "force": l.force, "max_compliance": l.max_compliance })),
                                   "centroid": (g.centroid_hi.iter().zip(&g.centroid_lo).any(|(h, l)| h > l)).then(|| json!({ "min": g.centroid_lo, "max": g.centroid_hi })) } })
@@ -225,10 +226,22 @@ impl Server {
                 let res = args.get("resolution").and_then(Value::as_u64).unwrap_or(128).clamp(8, 1024) as u32;
                 let levels = 1 + (res / 8).max(1).ilog2();
                 let top_k = args.get("top_k").and_then(Value::as_u64).unwrap_or(4).clamp(1, 64) as usize;
-                let cfg = agcad_dops::StudioConfig { configs, records: 4, max_rounds: rounds, coarse: 8, levels, cap: 4096, nodes: (design.nodes.len() as u32 + 8).max(8), budget: 4 * rounds, tighten: 0, max_cells: 0 };
+                // policy: CMA-ES islands over the free parameters unless structural moves are wanted
+                let free = (0..g.n_params as usize).filter(|&j| g.param_hi[j] > g.param_lo[j]).count();
+                let pol = match args.get("policy").and_then(Value::as_str) {
+                    Some("mock") => 0,
+                    Some("cmaes") => 1,
+                    Some(o) => return Err(format!("policy: \"cmaes\" | \"mock\" (got {o})")),
+                    None => if free > 0 && g.hole_r <= 0.0 { 1 } else { 0 },
+                };
+                let island = args.get("island").and_then(Value::as_u64).unwrap_or(16).clamp(2, 64) as u32;
+                let records = (g.n_params.max(4)) as u32;
+                let cfg = agcad_dops::StudioConfig { configs, records, max_rounds: rounds, coarse: 8, levels, cap: 4096, nodes: (design.nodes.len() as u32 + 8).max(8), budget: records * rounds, tighten: 0, max_cells: 0, policy: pol, island };
                 let prefer_cuda = match args.get("device").and_then(Value::as_str) { Some("cpu") => false, Some(_) => true, None => std::env::var("AGCAD_DEVICE").map(|v| v != "cpu").unwrap_or(true) };
                 let run = device::run(&mut self.device_cache, &design, &g, cfg, top_k, prefer_cuda)?;
                 let mut out = device::summarize(&run, &names);
+                out["policy"] = json!(if pol == 1 { "cmaes" } else { "mock" });
+                out["objective"] = json!(["satisfy", "min_volume", "max_volume"][g.objective as usize]);
                 out["raise_warnings"] = json!(warnings);
                 // stiffness escalation on the survivors (voxel PCG on the device)
                 let mut stiff_ok = vec![true; run.summary.top.len()];

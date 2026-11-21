@@ -62,16 +62,21 @@ struct Goal {
     double param_lo[MAX_PARAMS], param_hi[MAX_PARAMS], param_sign[MAX_PARAMS];
     u32 n_params, seed, machining_3ax, _pad1;
     double min_gap, undercut_tol, centroid_lo[3], centroid_hi[3];
+    u32 objective, _pad2;
+    double obj_scale;
 };
 struct TraceRow { u32 round, committed, accepted, rejected; double vol_lo, vol_hi; };
 struct OpTable { u32 update, parameter, pad, pocket, hole, circular_pattern, deactivate, rect_pattern, fillet, chamfer, shell, body, add, remove, intersect, _pad; };
 struct DopsArgs {
     u64 goal, cur_nodes, cur_count, cur_params, tr_nodes, tr_count, tr_params, rev, budget, done,
         cmds, arena, status, counts, domain_hit, bbox, obs, score, trace, round, active, compiled, tables,
-        wl0, wl1, cls, flag, offs, crank, start, lvl, term, toffs, tlist, tcount, cond_handle;
-    u32 configs, nodes, params, records, coarse, levels, eval_trial, max_rounds, level, capacity, cap, cfg_offset, tighten, _pad;
+        wl0, wl1, cls, flag, offs, crank, start, lvl, term, toffs, tlist, tcount, opt, samp, tscore, cond_handle;
+    u32 configs, nodes, params, records, coarse, levels, eval_trial, max_rounds, level, capacity, cap, cfg_offset, tighten, policy, island, _pad2;
     OpTable ops;
 };
+#define POLICY_CMAES 1u
+#define MAX_ISLAND 64u
+struct OptState { double mean[MAX_PARAMS], diag[MAX_PARAMS], sigma, best; u32 restarts, generation; };
 struct CommandRecord { unsigned short opcode, flags; u32 configuration, dst, args[6], expected_revision, configuration_mask_slot, reserved; double imm[2]; };
 struct StatusRecord { unsigned short status, flags; u32 dst, budget_used, aux; };
 
@@ -359,6 +364,124 @@ __device__ u32 hash3(u32 a, u32 b, u32 c) {
 }
 __device__ __forceinline__ double unit01(u32 h) { return (double)(h >> 8) * (1.0 / 16777216.0); }
 
+// ---- CMA-ES islands (twin of reference.rs cma_sample / ag_opt_*) ----
+__device__ __forceinline__ bool param_free(const Goal& g, u32 j) { return g.param_hi[j] > g.param_lo[j]; }
+__device__ double normal12(u32 seed, u32 gcfg, u32 idx) {
+    double s = 0.0;
+    for (u32 k = 0; k < 12u; ++k) s += unit01(hash3(seed ^ 0x51ED270Bu, gcfg, idx * 12u + k));
+    return s - 6.0;
+}
+
+__device__ void cma_sample(const DopsArgs* a, const Goal& g, u32 cfg, u32 gcfg, u32 round, CommandRecord* cmds) {
+    u32 kn = a->params, lam = a->island;
+    const OptState st = ag_ptr<const OptState>(a->opt)[cfg / lam];
+    double* samp = ag_ptr<double>(a->samp) + (u64)cfg * MAX_PARAMS;
+    const double* pr = ag_ptr<const double>(a->cur_params) + (u64)cfg * kn;
+    u32 np = g.n_params; if (np > kn) np = kn; if (np > MAX_PARAMS) np = MAX_PARAMS;
+    bool idle = ag_ptr<const u32>(a->done)[cfg] != 0u || ag_ptr<const u32>(a->budget)[cfg] == 0u;
+    if (idle) {
+        for (u32 j = 0; j < MAX_PARAMS; ++j) samp[j] = (j < np && param_free(g, j)) ? (pr[j] - g.param_lo[j]) / (g.param_hi[j] - g.param_lo[j]) : 0.0;
+        ag_ptr<double>(a->tscore)[cfg] = ag_ptr<const double>(a->score)[cfg];
+        return;
+    }
+    u32 slot = 0;
+    for (u32 j = 0; j < MAX_PARAMS; ++j) {
+        double u = 0.0;
+        if (j < np && param_free(g, j)) {
+            double z = normal12(g.seed, gcfg, round * 16u + j);
+            u = st.mean[j] + st.sigma * sqrt(st.diag[j]) * z;
+            if (u < 0.0) u = 0.0;
+            if (u > 1.0) u = 1.0;
+            if (slot < a->records) {
+                CommandRecord& c = cmds[slot];
+                c.opcode = (unsigned short)a->ops.parameter; c.args[0] = j; c.args[1] = 0u;
+                c.imm[0] = g.param_lo[j] + u * (g.param_hi[j] - g.param_lo[j]);
+                slot += 1u;
+            }
+        }
+        samp[j] = u;
+    }
+}
+
+AG_KERNEL void ag_opt_init(const DopsArgs* a) {
+    if (AG_TID != 0 || a->policy != POLICY_CMAES) return;
+    u32 cn = a->configs, kn = a->params, lam = a->island;
+    const Goal g = *ag_ptr<const Goal>(a->goal);
+    const double* pr = ag_ptr<const double>(a->cur_params);
+    OptState* opt = ag_ptr<OptState>(a->opt);
+    u32 np = g.n_params; if (np > kn) np = kn; if (np > MAX_PARAMS) np = MAX_PARAMS;
+    u32 ni = (cn + lam - 1u) / lam;
+    for (u32 i = 0; i < ni; ++i) {
+        u32 gi = a->cfg_offset / lam + i;
+        OptState st;
+        for (u32 j = 0; j < MAX_PARAMS; ++j) {
+            st.mean[j] = 0.0; st.diag[j] = 1.0;
+            if (j < np && param_free(g, j)) st.mean[j] = (gi == 0u) ? (pr[(u64)i * lam * kn + j] - g.param_lo[j]) / (g.param_hi[j] - g.param_lo[j]) : unit01(hash3(g.seed ^ 0x0CA15EEDu, gi, j));
+        }
+        st.sigma = 0.3; st.best = 1.0e30; st.restarts = 0u; st.generation = 0u;
+        opt[i] = st;
+    }
+}
+
+__device__ void island_update(OptState& st, const double* samp, const double* fs, u32 m, const Goal& g, u32 np, u32 gi, u32 round) {
+    if (m == 0u) return;
+    u32 order[MAX_ISLAND];
+    for (u32 k = 0; k < m; ++k) {
+        u32 p = k;
+        while (p > 0u && (fs[order[p - 1u]] > fs[k] || (fs[order[p - 1u]] == fs[k] && order[p - 1u] > k))) { order[p] = order[p - 1u]; p -= 1u; }
+        order[p] = k;
+    }
+    u32 mu = m / 2u; if (mu < 1u) mu = 1u;
+    double wsum = (double)(mu * (mu + 1u) / 2u);
+    u32 succ = 0;
+    for (u32 k = 0; k < m; ++k) if (fs[k] < st.best) succ += 1u;
+    if (fs[order[0]] < st.best) st.best = fs[order[0]];
+    double old[MAX_PARAMS];
+    for (u32 j = 0; j < MAX_PARAMS; ++j) old[j] = st.mean[j];
+    for (u32 j = 0; j < np; ++j) {
+        if (!param_free(g, j)) continue;
+        double mj = 0.0, var = 0.0;
+        for (u32 r = 0; r < mu; ++r) {
+            double w = (double)(mu - r) / wsum;
+            double x = samp[(u64)order[r] * MAX_PARAMS + j];
+            mj += w * x;
+            double d = (x - old[j]) / st.sigma;
+            var += w * d * d;
+        }
+        st.mean[j] = mj;
+        double dg = 0.8 * st.diag[j] + 0.2 * var;
+        if (dg < 1e-8) dg = 1e-8;
+        if (dg > 1e4) dg = 1e4;
+        st.diag[j] = dg;
+    }
+    st.sigma *= (succ * 5u > m) ? 1.2 : 0.85;
+    if (st.sigma < 1e-4) st.sigma = 1e-4;
+    if (st.sigma > 1.0) st.sigma = 1.0;
+    st.generation += 1u;
+    if (st.sigma < 1e-3 && st.best >= 1000.0) {
+        for (u32 j = 0; j < np; ++j) if (param_free(g, j)) { st.mean[j] = unit01(hash3(g.seed ^ 0x0CA15EEDu, gi, ((round + 1u) << 4) | j)); st.diag[j] = 1.0; }
+        st.sigma = 0.3;
+        st.restarts += 1u;
+    }
+}
+
+AG_KERNEL void ag_opt_update(const DopsArgs* a) {
+    if (a->policy != POLICY_CMAES) return;
+    u32 cn = a->configs, lam = a->island;
+    const Goal g = *ag_ptr<const Goal>(a->goal);
+    u32 round = ag_ptr<const u32>(a->round)[0];
+    const double* samp = ag_ptr<const double>(a->samp);
+    const double* ts = ag_ptr<const double>(a->tscore);
+    OptState* opt = ag_ptr<OptState>(a->opt);
+    u32 np = g.n_params; if (np > a->params) np = a->params; if (np > MAX_PARAMS) np = MAX_PARAMS;
+    u32 ni = (cn + lam - 1u) / lam;
+    u32 i = AG_TID; // one thread per island (islands are independent)
+    if (i >= ni) return;
+    u32 m0 = i * lam;
+    u32 m = (lam < cn - m0) ? lam : cn - m0;
+    island_update(opt[i], samp + (u64)m0 * MAX_PARAMS, ts + m0, m, g, np, a->cfg_offset / lam + i, round);
+}
+
 // ---- policy (mock GPU model) ----
 AG_KERNEL void ag_dop_policy(const DopsArgs* a) {
     u32 cfg = AG_TID;
@@ -380,6 +503,7 @@ AG_KERNEL void ag_dop_policy(const DopsArgs* a) {
         for (int j = 0; j < NVALS; ++j) { f.pref[j] = 0u; f.val[j] = 0.0; }
         arena[base + s] = f;
     }
+    if (a->policy == POLICY_CMAES) { cma_sample(a, g, cfg, gcfg, ag_ptr<const u32>(a->round)[0], cmds + base); return; }
     if (ag_ptr<const u32>(a->done)[cfg] != 0u || ag_ptr<const u32>(a->budget)[cfg] == 0u) return;
     u32 np = g.n_params; if (np > kn) np = kn; if (np > MAX_PARAMS) np = MAX_PARAMS;
     if (np == 0u) return;
@@ -399,7 +523,7 @@ AG_KERNEL void ag_dop_policy(const DopsArgs* a) {
     const double* pr = ag_ptr<const double>(a->cur_params) + (u64)cfg * kn;
     u32 count = ag_ptr<const u32>(a->cur_count)[cfg];
     double t = 0.5 * (g.vol_lo + g.vol_hi);
-    double err = (o[12] - t) / t;
+    double err = (g.vol_hi > g.vol_lo) ? (o[12] - t) / t : 0.0;
     u32 slot = 0;
     u32 acts = (np >= 2u) ? 2u : 1u;
     for (u32 act = 0; act < acts; ++act) {
@@ -1294,6 +1418,20 @@ __device__ void eng_write(const Eng& e, double* o) {
     o[OB_CENTROID_OK] = e.centroid_ok ? 1.0 : 0.0;
 }
 
+struct Judge { bool met; double err, sc; };
+__device__ Judge judge(const Goal& goal, bool empty, bool dom, double ve, const double* eh, const Eng& en) {
+    Judge j;
+    bool has_iv = goal.vol_hi > goal.vol_lo;
+    double t = 0.5 * (goal.vol_lo + goal.vol_hi);
+    j.err = has_iv ? (ve - t) / t : 0.0;
+    bool in_iv = !has_iv || (ve >= goal.vol_lo && ve <= goal.vol_hi);
+    j.met = !empty && !dom && in_iv && eh[0] <= goal.max_ext[0] && eh[1] <= goal.max_ext[1] && eh[2] <= goal.max_ext[2] && en.violation == 0.0 && en.centroid_ok;
+    double pen = ((en.area > 0.0) ? en.violation / en.area : 0.0) + (en.centroid_ok ? 0.0 : 1.0);
+    double scale = (goal.obj_scale > 0.0) ? goal.obj_scale : 1.0;
+    j.sc = !j.met ? 1000.0 + fabs(j.err) + pen : (goal.objective == 1u ? ve / scale : (goal.objective == 2u ? -(ve / scale) : fabs(j.err)));
+    return j;
+}
+
 // ---- check + decide / observe ----
 AG_KERNEL void ag_dop_decide(const DopsArgs* a) {
     u32 c = AG_TID;
@@ -1318,12 +1456,14 @@ AG_KERNEL void ag_dop_decide(const DopsArgs* a) {
         if (bb[9 + k] > bb[6 + k]) eh[k] = (double)(bb[9 + k] - bb[6 + k]) * gr.fine[k];
     }
     Eng en = engineering(gr, goal, counts, ve);
+    bool cma = a->policy == POLICY_CMAES;
     bool empty = (counts[0] + counts[1]) == 0ull;
     bool hard = el[0] > goal.max_ext[0] || el[1] > goal.max_ext[1] || el[2] > goal.max_ext[2];
     double* obs = ag_ptr<double>(a->obs) + (u64)c * OBS;
     u32* cur_c = ag_ptr<u32>(a->cur_count);
+    Judge jd = judge(goal, empty, dom != 0u, ve, eh, en);
+    double* score = ag_ptr<double>(a->score);
     bool write = (a->eval_trial == 0u);
-    double t = 0.5 * (goal.vol_lo + goal.vol_hi);
     if (a->eval_trial != 0u) {
         const CommandRecord* cmds = ag_ptr<const CommandRecord>(a->cmds) + (u64)c * rn;
         StatusRecord* status = ag_ptr<StatusRecord>(a->status) + (u64)c * rn;
@@ -1332,9 +1472,10 @@ AG_KERNEL void ag_dop_decide(const DopsArgs* a) {
             if ((u32)cmds[r].opcode == a->ops.update) continue;
             if (status[r].status == AG_ACCEPTED) acc += 1u; else rej += 1u;
         }
-        bool worse = en.violation > obs[OB_VIOLATION];
+        bool worse = !cma && en.violation > obs[OB_VIOLATION];
         bool geometry_ok = !empty && dom == 0u && !hard && !worse;
-        bool commit = geometry_ok && acc > 0u;
+        if (cma) ag_ptr<double>(a->tscore)[c] = geometry_ok ? jd.sc : 1.0e30;
+        bool commit = geometry_ok && acc > 0u && (!cma || jd.sc < score[c]);
         if (!geometry_ok && acc > 0u) {
             unsigned short code = empty ? AG_TOPOLOGY_FAILED : (dom != 0u ? AG_CAPACITY_EXCEEDED : AG_REQUIREMENT_FAILED);
             for (u32 r = 0; r < rn; ++r) if ((u32)cmds[r].opcode != a->ops.update && status[r].status == AG_ACCEPTED) status[r].status = code;
@@ -1369,17 +1510,13 @@ AG_KERNEL void ag_dop_decide(const DopsArgs* a) {
         obs[5] = eh[0]; obs[6] = eh[1]; obs[7] = eh[2];
         obs[8] = (dom != 0u) ? 1.0 : 0.0;
         obs[9] = (double)cur_c[c];
-        bool met = !empty && dom == 0u && ve >= goal.vol_lo && ve <= goal.vol_hi && eh[0] <= goal.max_ext[0] && eh[1] <= goal.max_ext[1] && eh[2] <= goal.max_ext[2]
-            && en.violation == 0.0 && en.centroid_ok;
-        obs[10] = met ? 1.0 : 0.0;
-        double err = (ve - t) / t;
-        obs[11] = err;
+        obs[10] = jd.met ? 1.0 : 0.0;
+        obs[11] = jd.err;
         obs[12] = ve;
         eng_write(en, obs);
         for (int k = 0; k < 3; ++k) obs[27 + k] = (eh[k] > 0.0) ? gr.lo[k] + (double)bb[6 + k] * gr.fine[k] : 0.0;
-        if (met) done[c] = 1u;
-        double pen = ((en.area > 0.0) ? en.violation / en.area : 0.0) + (en.centroid_ok ? 0.0 : 1.0);
-        ag_ptr<double>(a->score)[c] = met ? fabs(err) : 1000.0 + fabs(err) + pen;
+        if (jd.met && goal.objective == 0u) done[c] = 1u;
+        score[c] = jd.sc;
     }
 }
 
@@ -1406,7 +1543,7 @@ AG_KERNEL void ag_dop_stamp(const StampParams* p) {
     if (round >= p->max_rounds) return;
     u64 t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-    ag_ptr<u64>(p->stamps)[(u64)round * 8u + p->stage] = t;
+    ag_ptr<u64>(p->stamps)[(u64)round * 9u + p->stage] = t;
 }
 
 // =====================================================================================

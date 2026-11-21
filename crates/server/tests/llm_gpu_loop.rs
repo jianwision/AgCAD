@@ -183,3 +183,30 @@ fn device_only_survivor_is_delivered_as_certified_implicit() {
     let e = tool(&mut srv, "export", json!({"format": "step_ap242"})).unwrap_err();
     assert!(e.contains("implicit"), "{e}");
 }
+
+#[test]
+fn llm_asks_for_lightest_part_meeting_constraints() {
+    let req = Requirements::parse(r#"{"id":"r","rev":1,"deliver":{"body_type":"SolidBody"}}"#).unwrap();
+    let mut s = Server::new(req, "flange");
+    s.session.out_dir = std::env::temp_dir().join(format!("agcad-opt-{}", std::process::id()));
+    let prog = json!({"requirements_rev": 1, "expected_revision": 0, "program": [
+        {"id": "pr", "op": "knowledge.parameter", "args": {"name": "r", "value": "60 mm"}},
+        {"id": "pt", "op": "knowledge.parameter", "args": {"name": "t", "value": "12 mm"}},
+        {"id": "sk", "op": "sketch.create", "args": {"support": "xy"}},
+        {"id": "c", "op": "sketch.circle", "args": {"sketch": "%sk", "mode": "center_radius", "pts": [["0 mm", "0 mm"]], "r": "$r"}},
+        {"id": "rg", "op": "sketch.regions", "args": {"sketch": "%c"}},
+        {"id": "pad", "op": "part.pad", "args": {"profile": "%rg", "limits": "$t"}}
+    ]});
+    assert_eq!(tool(&mut s, "run_program", json!({"program": prog})).unwrap()["report"]["status"], "ACCEPTED");
+    let g = tool(&mut s, "set_goal", json!({"objective": "min_volume", "min_wall": 8, "max_extent": [170, 170, 25],
+        "parameters": {"r": {"min": 40, "max": 80}, "t": {"min": 6, "max": 20}}})).unwrap();
+    assert_eq!(g["goal"]["objective"], "min_volume", "{g}");
+    let r = tool(&mut s, "device_rollout", json!({"configurations": 32, "rounds": 16, "device": "cpu", "resolution": 64, "apply_best": true})).unwrap();
+    assert_eq!(r["policy"], "cmaes", "{r}");
+    let best = &r["top"][0];
+    assert_eq!(best["goal_met"], true, "{r}");
+    let (rr, t) = (best["parameters"]["r"].as_f64().unwrap(), best["parameters"]["t"].as_f64().unwrap());
+    assert!(rr < 45.0 && (7.9..9.5).contains(&t), "lightest disc with an 8 mm wall: r {rr} t {t}");
+    assert_eq!(r["applied"]["status"], "ACCEPTED", "{}", r["applied"]);
+    assert_eq!(r["applied"]["exact_within_device_bounds"], true);
+}

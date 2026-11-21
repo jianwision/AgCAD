@@ -50,6 +50,7 @@ pub unsafe fn ag_dop_policy(params: *const u8, _: &LaunchConfig) {
             cmds[base + s] = nop(cfg as u32, rev[cfg], a.ops.update);
             arena[base + s] = FeatureArgs::zeroed();
         }
+        if a.policy == policy::CMAES { unsafe { cma_sample(&a, &g, cfg, gcfg, round, &mut cmds[base..base + rn]) }; continue; }
         if done[cfg] != 0 || budget[cfg] == 0 { continue; }
         let np = (g.n_params as usize).min(kn).min(MAX_PARAMS);
         if np == 0 { continue; }
@@ -69,7 +70,7 @@ pub unsafe fn ag_dop_policy(params: *const u8, _: &LaunchConfig) {
         }
         let o = &obs[cfg * OBS..cfg * OBS + OBS];
         let t = 0.5 * (g.vol_lo + g.vol_hi);
-        let err = (o[12] - t) / t;
+        let err = if g.vol_hi > g.vol_lo { (o[12] - t) / t } else { 0.0 };
         let mut slot = 0usize;
         let acts = if np >= 2 { 2 } else { 1 };
         for act in 0..acts {
@@ -119,6 +120,148 @@ pub unsafe fn ag_dop_policy(params: *const u8, _: &LaunchConfig) {
             c.imm[0] = nv;
             slot += 1;
         }
+    }
+}
+
+/// Free (non-fixed) parameter j of the goal.
+fn free(g: &Goal, j: usize) -> bool { g.param_hi[j] > g.param_lo[j] }
+
+/// Irwin–Hall standard-normal approximation from 12 hashed uniforms (no transcendentals).
+pub fn normal12(seed: u32, gcfg: u32, idx: u32) -> f64 {
+    let mut s = 0.0f64;
+    let mut k = 0u32;
+    while k < 12 { s += unit(hash3(seed ^ 0x51ED_270B, gcfg, idx.wrapping_mul(12).wrapping_add(k))); k += 1; }
+    s - 6.0
+}
+
+/// CMA-ES policy, one configuration: sample u = clamp(mean + σ·√diag·z, 0, 1) from its
+/// island and set every free parameter. Done / out-of-budget members report their current
+/// point and score instead, so the island update sees λ evaluated points.
+unsafe fn cma_sample(a: &DopsArgs, g: &Goal, cfg: usize, gcfg: u32, round: u32, cmds: &mut [CommandRecord]) {
+    let (cn, kn) = (a.configs as usize, a.params as usize);
+    let lam = a.island as usize;
+    let st: OptState = unsafe { sl::<OptState>(a.opt, cn.div_ceil(lam))[cfg / lam] };
+    let samp = unsafe { slm::<f64>(a.samp, cn * MAX_PARAMS) };
+    let tscore = unsafe { slm::<f64>(a.tscore, cn) };
+    let pr = unsafe { sl::<f64>(a.cur_params, cn * kn) };
+    let np = (g.n_params as usize).min(kn).min(MAX_PARAMS);
+    let idle = unsafe { sl::<u32>(a.done, cn)[cfg] != 0 || sl::<u32>(a.budget, cn)[cfg] == 0 };
+    if idle {
+        for j in 0..MAX_PARAMS { samp[cfg * MAX_PARAMS + j] = if j < np && free(g, j) { (pr[cfg * kn + j] - g.param_lo[j]) / (g.param_hi[j] - g.param_lo[j]) } else { 0.0 }; }
+        tscore[cfg] = unsafe { sl::<f64>(a.score, cn)[cfg] };
+        return;
+    }
+    let mut slot = 0usize;
+    for j in 0..MAX_PARAMS {
+        let mut u = 0.0;
+        if j < np && free(g, j) {
+            let z = normal12(g.seed, gcfg, round.wrapping_mul(16).wrapping_add(j as u32));
+            u = st.mean[j] + st.sigma * st.diag[j].sqrt() * z;
+            if u < 0.0 { u = 0.0; }
+            if u > 1.0 { u = 1.0; }
+            if slot < cmds.len() {
+                let c = &mut cmds[slot];
+                c.opcode = a.ops.parameter as u16;
+                c.args[0] = j as u32;
+                c.args[1] = rec::PARAM_SET;
+                c.imm[0] = g.param_lo[j] + u * (g.param_hi[j] - g.param_lo[j]);
+                slot += 1;
+            }
+        }
+        samp[cfg * MAX_PARAMS + j] = u;
+    }
+}
+
+/// CMA-ES island initialization (before the first round): island 0 starts at the base
+/// design, the others at hashed points of the box; σ₀ = 0.3, diag = 1.
+pub unsafe fn ag_opt_init(params: *const u8, _: &LaunchConfig) {
+    let a = unsafe { args(params) };
+    if a.policy != policy::CMAES { return; }
+    let (cn, kn) = (a.configs as usize, a.params as usize);
+    let lam = a.island as usize;
+    let g: Goal = unsafe { sl::<Goal>(a.goal, 1)[0] };
+    let pr = unsafe { sl::<f64>(a.cur_params, cn * kn) };
+    let ni = cn.div_ceil(lam);
+    let opt = unsafe { slm::<OptState>(a.opt, ni) };
+    let np = (g.n_params as usize).min(kn).min(MAX_PARAMS);
+    for (i, st) in opt.iter_mut().enumerate() {
+        let gi = (a.cfg_offset as usize / lam + i) as u32;
+        *st = OptState::zeroed();
+        for j in 0..MAX_PARAMS {
+            st.diag[j] = 1.0;
+            if j < np && free(&g, j) {
+                st.mean[j] = if gi == 0 { (pr[i * lam * kn + j] - g.param_lo[j]) / (g.param_hi[j] - g.param_lo[j]) } else { unit(hash3(g.seed ^ 0x0CA1_5EED, gi, j as u32)) };
+            }
+        }
+        st.sigma = 0.3;
+        st.best = 1.0e30;
+    }
+}
+
+/// CMA-ES island update (after decide): rank the λ members by (trial score, index), move
+/// the mean to the linearly weighted top μ = λ/2, rank-μ diagonal update, 1/5-success step
+/// size; restart a stalled infeasible island at a hashed point.
+pub unsafe fn ag_opt_update(params: *const u8, _: &LaunchConfig) {
+    let a = unsafe { args(params) };
+    if a.policy != policy::CMAES { return; }
+    let cn = a.configs as usize;
+    let lam = a.island as usize;
+    let g: Goal = unsafe { sl::<Goal>(a.goal, 1)[0] };
+    let round = unsafe { sl::<u32>(a.round, 1)[0] };
+    let samp = unsafe { sl::<f64>(a.samp, cn * MAX_PARAMS) };
+    let tscore = unsafe { sl::<f64>(a.tscore, cn) };
+    let ni = cn.div_ceil(lam);
+    let opt = unsafe { slm::<OptState>(a.opt, ni) };
+    let np = (g.n_params as usize).min(a.params as usize).min(MAX_PARAMS);
+    for (i, st) in opt.iter_mut().enumerate() {
+        let m0 = i * lam;
+        let m = lam.min(cn - m0);
+        island_update(st, &samp[m0 * MAX_PARAMS..(m0 + m) * MAX_PARAMS], &tscore[m0..m0 + m], &g, np, (a.cfg_offset as usize / lam + i) as u32, round);
+    }
+}
+
+/// One island's update (shared by the kernel and the reference test).
+pub fn island_update(st: &mut OptState, samp: &[f64], fs: &[f64], g: &Goal, np: usize, gi: u32, round: u32) {
+    let m = fs.len();
+    if m == 0 { return; }
+    // insertion sort by (score, index): deterministic, λ ≤ 64
+    let mut order = [0usize; MAX_ISLAND];
+    for k in 0..m {
+        let mut p = k;
+        while p > 0 && (fs[order[p - 1]] > fs[k] || (fs[order[p - 1]] == fs[k] && order[p - 1] > k)) { order[p] = order[p - 1]; p -= 1; }
+        order[p] = k;
+    }
+    let mu = (m / 2).max(1);
+    let wsum = (mu * (mu + 1) / 2) as f64;
+    let mut succ = 0usize;
+    for k in 0..m { if fs[k] < st.best { succ += 1; } }
+    if fs[order[0]] < st.best { st.best = fs[order[0]]; }
+    let old = st.mean;
+    for j in 0..np {
+        if !free(g, j) { continue; }
+        let mut mj = 0.0;
+        let mut var = 0.0;
+        for r in 0..mu {
+            let w = (mu - r) as f64 / wsum;
+            let x = samp[order[r] * MAX_PARAMS + j];
+            mj += w * x;
+            let d = (x - old[j]) / st.sigma;
+            var += w * d * d;
+        }
+        st.mean[j] = mj;
+        let mut dg = 0.8 * st.diag[j] + 0.2 * var;
+        if dg < 1e-8 { dg = 1e-8; }
+        if dg > 1e4 { dg = 1e4; }
+        st.diag[j] = dg;
+    }
+    st.sigma *= if succ * 5 > m { 1.2 } else { 0.85 };
+    if st.sigma < 1e-4 { st.sigma = 1e-4; }
+    if st.sigma > 1.0 { st.sigma = 1.0; }
+    st.generation += 1;
+    if st.sigma < 1e-3 && st.best >= 1000.0 {
+        for j in 0..np { if free(g, j) { st.mean[j] = unit(hash3(g.seed ^ 0x0CA1_5EED, gi, (round.wrapping_add(1) << 4) | j as u32)); st.diag[j] = 1.0; } }
+        st.sigma = 0.3;
+        st.restarts += 1;
     }
 }
 
@@ -736,6 +879,22 @@ impl Eng {
     }
 }
 
+/// Goal judgement of one evaluation: (met, relative volume error, score). Satisfy mode:
+/// met = feasible and the estimate in the target interval, score |err| (1000 + … if not
+/// met). Objective modes: met = feasible (and in the interval if one is given), score
+/// ±volume / obj_scale.
+pub fn judge(goal: &Goal, empty: bool, dom: bool, ve: f64, eh: [f64; 3], en: &Eng) -> (bool, f64, f64) {
+    let has_iv = goal.vol_hi > goal.vol_lo;
+    let t = 0.5 * (goal.vol_lo + goal.vol_hi);
+    let err = if has_iv { (ve - t) / t } else { 0.0 };
+    let in_iv = !has_iv || (ve >= goal.vol_lo && ve <= goal.vol_hi);
+    let met = !empty && !dom && in_iv && eh[0] <= goal.max_ext[0] && eh[1] <= goal.max_ext[1] && eh[2] <= goal.max_ext[2] && en.violation == 0.0 && en.centroid_ok;
+    let pen = if en.area > 0.0 { en.violation / en.area } else { 0.0 } + if en.centroid_ok { 0.0 } else { 1.0 };
+    let scale = if goal.obj_scale > 0.0 { goal.obj_scale } else { 1.0 };
+    let sc = if !met { 1000.0 + err.abs() + pen } else if goal.objective == 1 { ve / scale } else if goal.objective == 2 { -(ve / scale) } else { err.abs() };
+    (met, err, sc)
+}
+
 /// CHECK + DECIDE (eval_trial = 1) or OBSERVE (eval_trial = 0), one thread per configuration:
 /// interval checks against the goal and hard limits, transactional commit of the trial tape,
 /// budget metering, observation row, ranking score and trace row.
@@ -762,7 +921,8 @@ pub unsafe fn ag_dop_decide(params: *const u8, _: &LaunchConfig) {
     let score = unsafe { slm::<f64>(a.score, cn) };
     let round = unsafe { sl::<u32>(a.round, 1)[0] };
     let trace = unsafe { slm::<TraceRow>(a.trace, a.max_rounds as usize * cn) };
-    let t = 0.5 * (goal.vol_lo + goal.vol_hi);
+    let tscore = unsafe { slm::<f64>(a.tscore, cn) };
+    let cma = a.policy == policy::CMAES;
     for c in 0..cn {
         if a.eval_trial != 0 && done[c] != 0 { continue; }
         let cc = &counts[CS * c..CS * c + CS];
@@ -770,6 +930,7 @@ pub unsafe fn ag_dop_decide(params: *const u8, _: &LaunchConfig) {
         let en = engineering(&gr, &goal, cc, ve);
         let empty = cc[cnt::INSIDE] + cc[cnt::BOUNDARY] == 0;
         let hard = el[0] > goal.max_ext[0] || el[1] > goal.max_ext[1] || el[2] > goal.max_ext[2];
+        let (met, err, sc) = judge(&goal, empty, dom[c] != 0, ve, eh, &en);
         let mut write = a.eval_trial == 0;
         if a.eval_trial != 0 {
             let (mut acc, mut rej) = (0u32, 0u32);
@@ -779,9 +940,11 @@ pub unsafe fn ag_dop_decide(params: *const u8, _: &LaunchConfig) {
                 if status[i].status == ACCEPTED { acc += 1; } else { rej += 1; }
             }
             // constraint violations may not grow (non-worsening edits only)
-            let worse = en.violation > obs[c * OBS + ob::VIOLATION];
+            // (mock policy; the CMA-ES policy is elitist on the full score instead)
+            let worse = !cma && en.violation > obs[c * OBS + ob::VIOLATION];
             let geometry_ok = !empty && dom[c] == 0 && !hard && !worse;
-            let commit = geometry_ok && acc > 0;
+            if cma { tscore[c] = if geometry_ok { sc } else { 1.0e30 }; }
+            let commit = geometry_ok && acc > 0 && (!cma || sc < score[c]);
             if !geometry_ok && acc > 0 {
                 let code = if empty { AgStatus::TopologyFailed } else if dom[c] != 0 { AgStatus::CapacityExceeded } else { AgStatus::RequirementFailed }.value();
                 for r in 0..rn {
@@ -810,18 +973,13 @@ pub unsafe fn ag_dop_decide(params: *const u8, _: &LaunchConfig) {
             o[5] = eh[0]; o[6] = eh[1]; o[7] = eh[2];
             o[8] = if dom[c] != 0 { 1.0 } else { 0.0 };
             o[9] = cur_c[c] as f64;
-            // goal: sampled volume estimate in the target interval; extents bounded (rigorous)
-            let met = !empty && dom[c] == 0 && ve >= goal.vol_lo && ve <= goal.vol_hi && eh[0] <= goal.max_ext[0] && eh[1] <= goal.max_ext[1] && eh[2] <= goal.max_ext[2]
-                && en.violation == 0.0 && en.centroid_ok;
             o[10] = if met { 1.0 } else { 0.0 };
-            let err = (ve - t) / t;
             o[11] = err;
             o[12] = ve;
             en.write(o);
             for k in 0..3 { o[ob::BOX_LO + k] = if eh[k] > 0.0 { gr.lo[k] + bb[12 * c + 6 + k] as f64 * gr.fine[k] } else { 0.0 }; }
-            if met { done[c] = 1; }
-            let pen = if en.area > 0.0 { en.violation / en.area } else { 0.0 } + if en.centroid_ok { 0.0 } else { 1.0 };
-            score[c] = if met { err.abs() } else { 1000.0 + err.abs() + pen };
+            if met && goal.objective == 0 { done[c] = 1; }
+            score[c] = sc;
         }
     }
 }
@@ -869,6 +1027,8 @@ pub const DOPS_CPU: &[(&str, CpuKernelFn)] = &[
     ("ag_ad_total", ag_ad_total),
     ("ag_dop_decide", ag_dop_decide),
     ("ag_dop_continue", ag_dop_continue),
+    ("ag_opt_init", ag_opt_init),
+    ("ag_opt_update", ag_opt_update),
     ("ag_fea_voxelize", crate::fea::ag_fea_voxelize),
     ("ag_fea_nodes", crate::fea::ag_fea_nodes),
     ("ag_fea_init", crate::fea::ag_fea_init),

@@ -8,7 +8,7 @@ use agcad_driver_cpu::CpuDevice;
 
 pub fn bar(l: f64, w: f64) -> Design {
     let b = feature(profile::RECT, fop::ADD, [(NO_PARAM, 0.0), (NO_PARAM, 0.0), (NO_PARAM, w), (NO_PARAM, w), (NO_PARAM, 0.0), (NO_PARAM, l)]);
-    Design { nodes: vec![b], params: vec![], names: vec![] }
+    Design { nodes: vec![b], params: vec![], names: vec![], profiles: vec![] }
 }
 
 #[test]

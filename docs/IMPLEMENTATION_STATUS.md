@@ -43,6 +43,12 @@ This is the loop **LLM observes → sets a goal → GPU model plans and executes
   - **Corners:** vertical-edge fillet and chamfer of rectangle profiles.
   - **Shell (closed):** exact through a 2D inward offset (`region2d::offset_inward`, `LayeredSolid::shell_closed`; std `part.shell` with `remove: []`) when the body is one convex pad minus cuts. In that case the device field is an exact interior distance. Any other body is delivered as a **certified implicit** body: a watertight mesh within h·√3 of the surface with certified volume bounds, exportable as 3MF/STL, with STEP refused.
   - **Multi-body:** `document.body` plus `boolean.add/remove/intersect`. Lowered with `$body` containers.
+  - **General sketches:** lines and arcs, one outer loop plus holes, from a per-design profile pool. The device uses an exact transcendental-free SDF: crossing parity combined with circular-segment parity. `raise` reads LLM sketches built from `sketch.line` / `arc` / `profile` / `elongated_hole` (slots) and mixed primitives. They lower exactly to layered extrusions and back to std sketches.
+  - **Revolve** (`part.shaft` / `part.groove` about the vertical axis): exact as a stack of annuli when the meridian is axis-aligned (`LayeredSolid::revolve_rectilinear`, also used by std for composable shafts). Sloped or curved meridians are device-only.
+  - **Mirror** (`transform.mirror`, planes x = 0 / y = 0, whole body): exact layered reflection plus union. This also fixes std, which dropped the original body for layered mirrors.
+  - **Draft** and **rounded / chamfered top and bottom edges:** device-only (Lipschitz-1 fields), delivered as certified implicit bodies. The document keeps the exact base features.
+  - **Fast path:** tapes with general features run in their own CUDA launch, so plain designs keep full speed.
+  - **Kernel fix:** a smooth (G1) junction of the same wall, continuing across a layer boundary, is no longer misreported as a tangential contact. Carrier-checked: genuinely tangent operands are still rejected.
   - **Also:** activation and parameters.
   
   Each op has a point SDF, an interval version, an exact lowering and a raise. Each is tested for soundness, round trip and CUDA ≡ CPU bitwise. Each device op is a catalog op; opcodes are resolved from the catalog, never hard-coded.

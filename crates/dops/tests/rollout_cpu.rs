@@ -190,7 +190,7 @@ fn shell_is_exact_sound_and_round_trips() {
     let hole = feature(profile::CIRCLE, fop::REMOVE, [(NO_PARAM, 50.0), (NO_PARAM, 30.0), (NO_PARAM, 8.0), (NO_PARAM, 0.0), (NO_PARAM, -1.0), (NO_PARAM, 11.0)]);
     let mut sh = Node { kind: profile::SHELL, op: fop::ADD, flags: nflags::ACTIVE, src: 0, pref: [NO_PARAM; NVALS], val: [0.0; NVALS] };
     sh.val[0] = 1.5;
-    let d = Design { nodes: vec![plate, hole, sh], params: vec![], names: vec![] };
+    let d = Design { nodes: vec![plate, hole, sh], params: vec![], names: vec![], profiles: vec![] };
     let pi = core::f64::consts::PI;
     let want = (6000.0 - pi * 64.0) * 10.0 - (97.0 * 57.0 - pi * 9.5 * 9.5) * 7.0;
     let v = exact_volume(&d);
@@ -199,7 +199,7 @@ fn shell_is_exact_sound_and_round_trips() {
     assert!(o[0] <= v && v <= o[1], "exact {v} ∉ device [{}, {}]", o[0], o[1]);
     // a union body: the device field is not an exact interior distance → honestly device-only
     let pad2 = feature(profile::RECT, fop::ADD, [(NO_PARAM, 50.0), (NO_PARAM, 0.0), (NO_PARAM, 100.0), (NO_PARAM, 60.0), (NO_PARAM, 0.0), (NO_PARAM, 10.0)]);
-    let u = Design { nodes: vec![plate, pad2, sh], params: vec![], names: vec![] };
+    let u = Design { nodes: vec![plate, pad2, sh], params: vec![], names: vec![], profiles: vec![] };
     let e = to_layered(&u).unwrap_err();
     assert!(e.contains("device-only"), "{e}");
 }

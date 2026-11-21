@@ -13,7 +13,6 @@
 //! the volume is reported against the certified (rigorous) bounds, which do not miss them.
 
 use crate::abi::*;
-use crate::math::compile_node;
 use crate::studio::{dops_library, Design};
 use agcad_driver::*;
 use agcad_geo::math::v3;
@@ -57,11 +56,7 @@ pub fn extract_mesh<D: KernelExt>(dev: Arc<D>, design: &Design, lo: [f64; 3], hi
     let d = &*dev;
     let s = d.stream(Priority::Low)?;
     let lib = d.load_library(&dops_library())?;
-    let mut cn = Vec::with_capacity(design.nodes.len());
-    let mut tabs = vec![0.0f32; design.nodes.len().max(1) * TABLE];
-    let prm: Vec<f64> = if design.params.is_empty() { vec![0.0] } else { design.params.clone() };
-    for (i, n) in design.nodes.iter().enumerate() { cn.push(compile_node(n, &prm, &mut tabs[i * TABLE..(i + 1) * TABLE])); }
-    if cn.is_empty() { cn.push(CNode::zeroed()); }
+    let (cn, tabs) = design.compile();
     let up = |bytes: &[u8]| -> DriverResult<D::Buffer> { let b = d.alloc_bytes(&s, bytes.len().max(16))?; d.upload_from_host_async(&s, bytes, &b, 0)?; Ok(b) };
     let tape = up(bytemuck::cast_slice(&cn))?;
     let tables = up(bytemuck::cast_slice(&tabs))?;

@@ -14,7 +14,7 @@ pub const NO_PARAM: u32 = u32::MAX;
 /// Value slots per feature: 0..=5 profile + limits; 6, 7 pattern (circular: count, total
 /// angle; rectangular: count₁, spacing₁ along x); 8, 9 rectangular count₂, spacing₂ along y;
 /// 10 corner size (fillet radius / chamfer length of a rectangle profile); 11 reserved.
-pub const NVALS: usize = 12;
+pub const NVALS: usize = 16;
 /// Observation row width (f64) per configuration: 0 vol_lo, 1 vol_hi (bounded), 2–4 extent lo,
 /// 5–7 extent hi (bounded), 8 domain hit, 9 features, 10 goal met, 11 relative error,
 /// 12 volume estimate (sampled).
@@ -42,6 +42,27 @@ pub mod profile {
     /// boolean.add / remove / intersect: combine the pushed body (target) with the current
     /// one (tool); `op` = fop::ADD / REMOVE / INTERSECT.
     pub const COMBINE: u32 = 5;
+    /// General sketch profile (lines and arcs, one outer loop plus holes) from the design's
+    /// profile pool: v15 = pool index, v0, v1 = placement offset, v4, v5 = z0, z1.
+    pub const SKETCH: u32 = 6;
+    /// transform.mirror of the finished body (suffix node): v0 = 1 mirrors across x = 0,
+    /// v1 = 1 across y = 0 (planes through the origin, as in std).
+    pub const MIRROR: u32 = 7;
+    /// part.shaft / part.groove: full revolution of a pool sketch in (ρ, z) about the vertical
+    /// axis through (v0, v1); v15 = pool index.
+    pub const REVOLVE: u32 = 8;
+}
+
+/// Segments per pool profile and the pool stride (f32): [count, 8 floats per segment …].
+pub const MAX_SEGS: usize = 48;
+pub const PSTRIDE: usize = 1 + 8 * MAX_SEGS;
+
+/// One segment of a design sketch (f64; the device copy is f32). Arcs run from `a0` to `a1`
+/// (a1 > a0: counter-clockwise).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Seg {
+    Line { a: [f64; 2], b: [f64; 2] },
+    Arc { c: [f64; 2], r: f64, a0: f64, a1: f64 },
 }
 
 /// Bodies on the evaluation stack (document.body nesting).
@@ -64,9 +85,17 @@ pub mod nflags {
     pub const FILLET: u32 = 8;
     /// Chamfered vertical edges of a rectangle profile (v10 length).
     pub const CHAMFER: u32 = 16;
+    /// Draft of the extrusion walls (v12 = tan θ about the neutral plane z0; positive tapers
+    /// inward going up). Device-only: delivered as a certified implicit body.
+    pub const DRAFT: u32 = 32;
+    /// Rounded / chamfered top and bottom edges of the extrusion (v13 = size). Device-only.
+    pub const ROUND_Z: u32 = 64;
+    pub const CHAMFER_Z: u32 = 128;
+    /// Profile modifiers carried into the compiled node.
+    pub const MODS: u32 = FILLET | CHAMFER | DRAFT | ROUND_Z | CHAMFER_Z;
 }
 
-/// One feature of the specification tree on the device (160 B).
+/// One feature of the specification tree on the device (208 B).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct Node {
@@ -99,15 +128,17 @@ pub struct CNode {
     pub _pad: [u32; 2],
     pub v: [f32; NVALS],
     pub apothem: f32,
-    pub _pad2: [f32; 11],
+    /// cos θ of a drafted wall (1 otherwise).
+    pub cosd: f32,
+    pub _pad2: [f32; 6],
 }
 
 /// f32 entries of a node's table.
-pub const TABLE: usize = 384;
-/// Offset of the polygon normals in a node's table.
+pub const TABLE: usize = 640;
+/// Offset of the polygon normals / sketch segments in a node's table.
 pub const POLY: usize = 256;
 
-/// Arg-arena payload of a feature-creating command record (144 B).
+/// Arg-arena payload of a feature-creating command record (192 B).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct FeatureArgs {
@@ -269,7 +300,11 @@ pub struct OpTable {
     pub add: u32,
     pub remove: u32,
     pub intersect: u32,
-    pub _pad: u32,
+    pub draft: u32,
+    pub mirror: u32,
+    pub shaft: u32,
+    pub groove: u32,
+    pub _pad: [u32; 1],
 }
 
 /// Every device pointer and size; one block shared by all dops kernels.
@@ -327,6 +362,8 @@ pub struct DopsArgs {
     pub opt: u64,
     pub samp: u64,
     pub tscore: u64,
+    /// Profile pool (f32, PSTRIDE per profile).
+    pub pool: u64,
     /// CUgraphConditionalHandle of the enclosing WHILE node (0 = host-driven loop).
     pub cond_handle: u64,
     pub configs: u32,
@@ -355,7 +392,10 @@ pub struct DopsArgs {
     /// `policy::MOCK` or `policy::CMAES`; `island` = λ (configurations per CMA-ES island).
     pub policy: u32,
     pub island: u32,
-    pub _pad2: u32,
+    /// 1 if the base design has general features (sketch / revolve / mirror / draft / rounded
+    /// caps): their tapes are evaluated by a separate CUDA launch; edits introducing them are
+    /// rejected otherwise.
+    pub general_ok: u32,
     pub ops: OpTable,
 }
 
@@ -371,6 +411,9 @@ pub mod rec {
     /// part.edge_fillet / part.chamfer: args[0] = feature index (a rectangle feature), arena v10.
     /// document.deactivate: args[0] = feature index (u32::MAX = last), args[1] = 1 active / 0.
     pub const LAST: u32 = u32::MAX;
+    /// part.edge_fillet / part.chamfer: args[1] = EDGES_Z rounds / chamfers the top and bottom
+    /// edges of any extrusion (arena v13) instead of a rectangle's vertical edges (v10).
+    pub const EDGES_Z: u32 = 1;
 }
 
 /// Stage timestamps per round (ns): 0 start, 1 policy, 2 validate, 3 apply, 4 compile,

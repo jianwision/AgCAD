@@ -242,3 +242,33 @@ fn cmaes_bitwise_graph_and_scale() {
         if pol == policy::CMAES { assert!(r.done > 3500, "{}", r.done); }
     }
 }
+
+/// New operations (sketch, slot, revolve, mirror, draft, rounded caps): certify and rollouts
+/// bit-identical CUDA ≡ CPU.
+#[test]
+#[ignore = "requires NVIDIA GPU"]
+fn new_ops_bitwise() {
+    use agcad_dops::abi::policy;
+    use agcad_dops::examples::*;
+    let cuda = agcad_driver_cuda::CudaDevice::open(0).unwrap();
+    let g = ops_goal();
+    for d in [slotted_plate(), l_bracket(), stepped_shaft(), coned_shaft(), mirrored_bracket(), drafted_boss(), rounded_block()] {
+        let a = agcad_dops::studio::certify(cuda.clone(), &d, &g, 6, 1 << 17).unwrap();
+        let b = agcad_dops::studio::certify(agcad_driver_cpu::CpuDevice::new(), &d, &g, 6, 1 << 17).unwrap();
+        assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "{a:?}\n{b:?}");
+    }
+    let mut gr = ops_goal();
+    gr.vol_lo = 12_000.0;
+    gr.vol_hi = 14_000.0;
+    gr.n_params = 1;
+    gr.param_lo[0] = 5.0;
+    gr.param_hi[0] = 20.0;
+    gr.param_sign[0] = 1.0;
+    for pol in [policy::MOCK, policy::CMAES] {
+        let c = StudioConfig { policy: pol, ..cfg(32, 8) };
+        let (x, y) = (Studio::new(cuda.clone(), &l_bracket(), &gr, c).unwrap(), Studio::new(agcad_driver_cpu::CpuDevice::new(), &l_bracket(), &gr, c).unwrap());
+        assert_eq!(x.run_host_loop().unwrap(), y.run_host_loop().unwrap());
+        assert!(x.state_bytes().unwrap() == y.state_bytes().unwrap(), "policy {pol}: CUDA ≠ CPU");
+        assert!(x.results(1).unwrap().done > 0, "policy {pol}");
+    }
+}

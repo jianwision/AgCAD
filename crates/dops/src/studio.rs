@@ -35,6 +35,55 @@ pub struct Design {
     pub nodes: Vec<Node>,
     pub params: Vec<f64>,
     pub names: Vec<String>,
+    /// Sketch profiles referenced by SKETCH / REVOLVE nodes (v15): loops of segments (one
+    /// outer loop plus holes; read-only during a rollout).
+    pub profiles: Vec<Vec<Vec<Seg>>>,
+}
+
+impl Design {
+    /// Device profile pool: [profile count, then PSTRIDE f32 per profile: segment count and
+    /// 8-float records — line [0, a, b, 0, 0, 0], arc [1, a, b, c, ±r] split to sweeps ≤ π].
+    pub fn pool(&self) -> Vec<f32> {
+        let mut out = vec![self.profiles.len() as f32];
+        for prof in &self.profiles {
+            let mut recs: Vec<[f32; 8]> = Vec::new();
+            for lp in prof {
+                for sg in lp {
+                    match *sg {
+                        Seg::Line { a, b } => recs.push([0.0, a[0] as f32, a[1] as f32, b[0] as f32, b[1] as f32, 0.0, 0.0, 0.0]),
+                        Seg::Arc { c, r, a0, a1 } => {
+                            let k = ((a1 - a0).abs() / core::f64::consts::PI - 1e-9).ceil().max(1.0) as usize;
+                            for i in 0..k {
+                                let (t0, t1) = (a0 + (a1 - a0) * i as f64 / k as f64, a0 + (a1 - a0) * (i + 1) as f64 / k as f64);
+                                let (pa, pb) = ([c[0] + r * t0.cos(), c[1] + r * t0.sin()], [c[0] + r * t1.cos(), c[1] + r * t1.sin()]);
+                                let sr = if a1 > a0 { r } else { -r };
+                                recs.push([1.0, pa[0] as f32, pa[1] as f32, pb[0] as f32, pb[1] as f32, c[0] as f32, c[1] as f32, sr as f32]);
+                            }
+                        }
+                    }
+                }
+            }
+            let mut blk = vec![0.0f32; PSTRIDE];
+            let n = recs.len().min(MAX_SEGS);
+            blk[0] = n as f32;
+            for (i, r) in recs.iter().take(n).enumerate() { blk[1 + 8 * i..9 + 8 * i].copy_from_slice(r); }
+            out.extend(blk);
+        }
+        out
+    }
+
+    /// Compile every node on the host (CPU reference compile; the device compile is
+    /// bit-identical): (compiled nodes, tables).
+    pub fn compile(&self) -> (Vec<CNode>, Vec<f32>) {
+        let pool = self.pool();
+        let prm: Vec<f64> = if self.params.is_empty() { vec![0.0] } else { self.params.clone() };
+        let mut tabs = vec![0.0f32; self.nodes.len().max(1) * TABLE];
+        let mut cn: Vec<CNode> = self.nodes.iter().enumerate().map(|(i, n)| crate::math::compile_node_pool(n, &prm, &pool[1..], &mut tabs[i * TABLE..(i + 1) * TABLE])).collect();
+        if cn.is_empty() { cn.push(CNode::zeroed()); }
+        let m = crate::math::scan_mirror(&cn);
+        cn[0]._pad[0] = 0x8000_0000 | m;
+        (cn, tabs)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -92,7 +141,7 @@ struct Bufs<B> {
     // ranking scratch
     rank_keys: B, rank_vals: B,
     stamps: B,
-    wl0: B, wl1: B, cls: B, flag: B, offs: B, crank: B, start: B, lvl: B, term: B, toffs: B, tlist: B, tcount: B, opt: B, samp: B, tscore: B,
+    wl0: B, wl1: B, cls: B, flag: B, offs: B, crank: B, start: B, lvl: B, term: B, toffs: B, tlist: B, tcount: B, opt: B, samp: B, tscore: B, pool: B,
 }
 
 pub struct Studio<D: KernelExt> {
@@ -185,7 +234,8 @@ impl<D: KernelExt> Studio<D> {
             allow: up(d, &s, bytemuck::cast_slice(&crate::registry::allow_list(agcad_ir::Catalog::global())))?,
             keys: zeros(c * r * 8)?,
             compiled: zeros(c * n * std::mem::size_of::<CNode>())?,
-            tables: zeros(c * n * TABLE * 8)?,
+            tables: zeros(c * n * TABLE * 4)?,
+            pool: up(d, &s, bytemuck::cast_slice(&base.pool()))?,
             rank_keys: zeros(c * 8)?,
             rank_vals: zeros(c * 4)?,
             stamps: zeros(cfg.max_rounds as usize * STAGES * 8)?,
@@ -211,9 +261,9 @@ impl<D: KernelExt> Studio<D> {
             rev: b.rev.device_ptr(), budget: b.budget.device_ptr(), done: b.done.device_ptr(), cmds: b.cmds.device_ptr(), arena: b.arena.device_ptr(),
             status: b.status.device_ptr(), counts: b.counts.device_ptr(), domain_hit: b.domain_hit.device_ptr(), bbox: b.bbox.device_ptr(),
             obs: b.obs.device_ptr(), score: b.score.device_ptr(), trace: b.trace.device_ptr(), round: b.round.device_ptr(), active: b.active.device_ptr(), compiled: b.compiled.device_ptr(), tables: b.tables.device_ptr(),
-            wl0: b.wl0.device_ptr(), wl1: b.wl1.device_ptr(), cls: b.cls.device_ptr(), flag: b.flag.device_ptr(), offs: b.offs.device_ptr(), crank: b.crank.device_ptr(), start: b.start.device_ptr(), lvl: b.lvl.device_ptr(), term: b.term.device_ptr(), toffs: b.toffs.device_ptr(), tlist: b.tlist.device_ptr(), tcount: b.tcount.device_ptr(), opt: b.opt.device_ptr(), samp: b.samp.device_ptr(), tscore: b.tscore.device_ptr(),
+            wl0: b.wl0.device_ptr(), wl1: b.wl1.device_ptr(), cls: b.cls.device_ptr(), flag: b.flag.device_ptr(), offs: b.offs.device_ptr(), crank: b.crank.device_ptr(), start: b.start.device_ptr(), lvl: b.lvl.device_ptr(), term: b.term.device_ptr(), toffs: b.toffs.device_ptr(), tlist: b.tlist.device_ptr(), tcount: b.tcount.device_ptr(), opt: b.opt.device_ptr(), samp: b.samp.device_ptr(), tscore: b.tscore.device_ptr(), pool: b.pool.device_ptr(),
             cond_handle: handle, configs: cfg.configs, nodes: cfg.nodes, params: k as u32, records: cfg.records, coarse: cfg.coarse, levels: cfg.levels,
-            eval_trial, max_rounds: cfg.max_rounds, level, capacity: capacity as u32, cap: cfg.cap, cfg_offset, tighten: cfg.tighten, policy: cfg.policy, island: island as u32, _pad2: 0, ops: crate::registry::op_table(agcad_ir::Catalog::global()),
+            eval_trial, max_rounds: cfg.max_rounds, level, capacity: capacity as u32, cap: cfg.cap, cfg_offset, tighten: cfg.tighten, policy: cfg.policy, island: island as u32, general_ok: base.nodes.iter().any(|n| n.kind >= profile::SKETCH || n.flags & (nflags::DRAFT | nflags::ROUND_Z | nflags::CHAMFER_Z) != 0) as u32, ops: crate::registry::op_table(agcad_ir::Catalog::global()),
         };
         let a_observe = upload_params(d, &s, &mk(0, 0, 0))?;
         let host_args = mk(1, 0, 0);
@@ -237,6 +287,10 @@ impl<D: KernelExt> Studio<D> {
         let k = self.base.params.len().max(1);
         if base.nodes.len() > n || base.params.len().max(1) != k {
             return Err(EnqueueError::InvalidConfig(format!("reset: shape changed ({} nodes / {} params vs capacity {n} / {k})", base.nodes.len(), base.params.len())).into());
+        }
+        if base.pool() != self.base.pool() {
+            if base.pool().len() != self.base.pool().len() { return Err(EnqueueError::InvalidConfig("reset: profile pool size changed".into()).into()); }
+            self.dev.upload_from_host_async(&self.s, bytemuck::cast_slice(&base.pool()), &self.b.pool, 0)?;
         }
         let d = &*self.dev;
         let mut nodes = vec![Node::zeroed(); c * n];
@@ -279,6 +333,7 @@ impl<D: KernelExt> Studio<D> {
             self.scan_term.launch(d, &self.s, self.prim)?;
             d.launch(&self.s, self.lib, "ag_ad_compact", &self.per_entry(), a)?;
             d.launch(&self.s, self.lib, "ag_ad_fill", &self.per_entry(), a)?;
+            if self.host_args.general_ok != 0 { d.launch(&self.s, self.lib, "ag_ad_fill_mirror", &self.per_entry(), a)?; }
             if l + 1 < self.cfg.levels as usize {
                 d.launch(&self.s, self.lib, "ag_ad_emit", &self.per_entry(), a)?;
             }
@@ -367,7 +422,7 @@ impl<D: KernelExt> Studio<D> {
             let score: Vec<f64> = self.read(&self.b.score, i * 8, 1)?;
             let mut o = [0.0; OBS];
             o.copy_from_slice(&obs);
-            top.push(Survivor { configuration: id, score: score[0], obs: o, design: Design { nodes, params: params[..self.base.params.len()].to_vec(), names: self.base.names.clone() } });
+            top.push(Survivor { configuration: id, score: score[0], obs: o, design: Design { nodes, params: params[..self.base.params.len()].to_vec(), names: self.base.names.clone(), profiles: self.base.profiles.clone() } });
         }
         Ok(RolloutSummary { rounds: round[0], done: done.iter().filter(|x| **x != 0).count() as u32, top, in_loop_readback_bytes: self.readback.get() })
     }

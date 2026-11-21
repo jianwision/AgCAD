@@ -23,8 +23,12 @@ pub const DEVICE_OPS: &[DeviceOp] = &[
     DeviceOp { name: "transform.circular_pattern", semantics: "pattern feature args[0] (u32::MAX = last) about z: arena v6 = count, v7 = total angle", exact: true },
     DeviceOp { name: "document.deactivate", semantics: "args[0] = feature index (u32::MAX = last), args[1] = 1 activate / 0 deactivate", exact: true },
     DeviceOp { name: "transform.rectangular_pattern", semantics: "pattern feature args[0] along x / y: arena v6 = count₁, v7 = spacing₁, v8 = count₂, v9 = spacing₂ (≤ 64 instances)", exact: true },
-    DeviceOp { name: "part.edge_fillet", semantics: "round the vertical edges of rectangle feature args[0]: arena v10 = radius", exact: true },
-    DeviceOp { name: "part.chamfer", semantics: "chamfer the vertical edges of rectangle feature args[0]: arena v10 = length", exact: true },
+    DeviceOp { name: "part.edge_fillet", semantics: "round the vertical edges of rectangle feature args[0] (arena v10 = radius; exact), or with args[1] = EDGES_Z the top / bottom edges of any extrusion (v13; device-only → certified implicit)", exact: true },
+    DeviceOp { name: "part.chamfer", semantics: "chamfer the vertical edges of rectangle feature args[0] (v10; exact), or the top / bottom edges with args[1] = EDGES_Z (v13; device-only)", exact: true },
+    DeviceOp { name: "part.draft", semantics: "draft the walls of extrusion args[0]: arena v12 = tan θ about its z0 plane, |θ| ≤ 30° (device-only → certified implicit)", exact: false },
+    DeviceOp { name: "transform.mirror", semantics: "mirror the finished body across x = 0 (arena v0 = 1) and / or y = 0 (v1 = 1); exact (layered reflection + union)", exact: true },
+    DeviceOp { name: "part.shaft", semantics: "revolve pool sketch v15 (ρ, z) about the vertical axis through (v0, v1); exact for axis-aligned meridians, otherwise device-only", exact: true },
+    DeviceOp { name: "part.groove", semantics: "remove a revolution (same payload as part.shaft)", exact: true },
     DeviceOp { name: "part.shell", semantics: "hollow the current body inward (closed): arena v0 = wall thickness. Exact (2D inward offset) for a single convex pad minus cuts; otherwise device-only → certified implicit body", exact: false },
     DeviceOp { name: "document.body", semantics: "start a new body (the current body is pushed; depth ≤ 4)", exact: true },
     DeviceOp { name: "boolean.add", semantics: "combine the pushed body (target) with the current body (tool): union", exact: true },
@@ -52,7 +56,11 @@ pub fn op_table(c: &Catalog) -> OpTable {
         add: op("boolean.add"),
         remove: op("boolean.remove"),
         intersect: op("boolean.intersect"),
-        _pad: 0,
+        draft: op("part.draft"),
+        mirror: op("transform.mirror"),
+        shaft: op("part.shaft"),
+        groove: op("part.groove"),
+        _pad: [0; 1],
     }
 }
 
@@ -76,7 +84,7 @@ mod tests {
             assert!(allow[o >> 5] >> (o & 31) & 1 == 1, "{}", d.name);
         }
         // a catalog op that is not a device op stays disallowed
-        let o = c.get("part.shaft").unwrap().opcode as usize;
+        let o = c.get("part.thread").unwrap().opcode as usize;
         assert_eq!(allow[o >> 5] >> (o & 31) & 1, 0);
     }
 }

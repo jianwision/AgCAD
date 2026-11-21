@@ -97,7 +97,7 @@ pub unsafe fn ag_dop_policy(params: *const u8, _: &LaunchConfig) {
                         // rounded rectangular pocket: part.pocket (rectangle) + part.edge_fillet
                         c.args[0] = profile::RECT;
                         let h = g.hole_r;
-                        f.val = [px - h, py - h, px + h, py + h, g.hole_z0, g.hole_z1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+                        f.val = [px - h, py - h, px + h, py + h, g.hole_z0, g.hole_z1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
                         slot += 1;
                         let c2 = &mut cmds[base + slot];
                         c2.opcode = a.ops.fillet as u16;
@@ -107,7 +107,7 @@ pub unsafe fn ag_dop_policy(params: *const u8, _: &LaunchConfig) {
                         f2.val[10] = 0.4 * h;
                     } else {
                         c.args[0] = profile::CIRCLE;
-                        f.val = [px, py, g.hole_r, 0.0, g.hole_z0, g.hole_z1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+                        f.val = [px, py, g.hole_r, 0.0, g.hole_z0, g.hole_z1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
                     }
                     slot += 1;
                 }
@@ -279,6 +279,7 @@ pub unsafe fn ag_dop_apply(params: *const u8, _: &LaunchConfig) {
     let cmds = unsafe { sl::<CommandRecord>(a.cmds, cn * rn) };
     let arena = unsafe { sl::<FeatureArgs>(a.arena, cn * rn) };
     let status = unsafe { slm::<StatusRecord>(a.status, cn * rn) };
+    let npool = unsafe { sl::<f32>(a.pool, 1)[0] } as u32;
     for cfg in 0..cn {
         for i in 0..nn { tr_n[cfg * nn + i] = cur_n[cfg * nn + i]; }
         for k in 0..kn { tr_p[cfg * kn + k] = cur_p[cfg * kn + k]; }
@@ -296,13 +297,34 @@ pub unsafe fn ag_dop_apply(params: *const u8, _: &LaunchConfig) {
                     let v = if c.args[1] == rec::PARAM_ADD { tr_p[cfg * kn + k] + c.imm[0] } else { c.imm[0] };
                     tr_p[cfg * kn + k] = v;
                 }
-            } else if op == a.ops.pad || op == a.ops.pocket || op == a.ops.hole {
+            } else if op == a.ops.pad || op == a.ops.pocket || op == a.ops.hole || op == a.ops.shaft || op == a.ops.groove {
                 let f = arena[idx];
                 let bad_ref = f.pref.iter().any(|&p| p != NO_PARAM && p as usize >= kn);
-                if c.args[0] > profile::POLYGON || bad_ref { st = AgStatus::InvalidParameter.value(); }
+                let revolve = op == a.ops.shaft || op == a.ops.groove;
+                let kind = if revolve { profile::REVOLVE } else { c.args[0] };
+                // sketch / revolve profiles must name an existing pool profile (literal index)
+                let pooled = kind == profile::SKETCH || kind == profile::REVOLVE;
+                let pool_ok = !pooled || (f.pref[15] == NO_PARAM && f.val[15] >= 0.0 && (f.val[15].floor() as u64) < npool as u64);
+                if (!revolve && kind > profile::POLYGON && kind != profile::SKETCH) || bad_ref || !pool_ok { st = AgStatus::InvalidParameter.value(); }
+                else if pooled && a.general_ok == 0 { st = AgStatus::UnsupportedOp.value(); }
                 else if count as usize >= nn { st = AgStatus::CapacityExceeded.value(); }
                 else {
-                    tr_n[cfg * nn + count as usize] = Node { kind: c.args[0], op: if op == a.ops.pad { fop::ADD } else { fop::REMOVE }, flags: nflags::ACTIVE, src: r as u32, pref: f.pref, val: f.val };
+                    let add = op == a.ops.pad || op == a.ops.shaft;
+                    tr_n[cfg * nn + count as usize] = Node { kind, op: if add { fop::ADD } else { fop::REMOVE }, flags: nflags::ACTIVE, src: r as u32, pref: f.pref, val: f.val };
+                    count += 1;
+                }
+            } else if op == a.ops.mirror {
+                let f = arena[idx];
+                let mut depth = 0i32;
+                for k in 0..count as usize { let n = &tr_n[cfg * nn + k]; if n.flags & nflags::ACTIVE != 0 { if n.kind == profile::BODY { depth += 1; } else if n.kind == profile::COMBINE { depth -= 1; } } }
+                if a.general_ok == 0 { st = AgStatus::UnsupportedOp.value(); }
+                else if count as usize >= nn { st = AgStatus::CapacityExceeded.value(); }
+                else if depth != 0 { st = AgStatus::InvalidParameter.value(); }
+                else {
+                    let mut nd = Node { kind: profile::MIRROR, op: fop::ADD, flags: nflags::ACTIVE, src: r as u32, pref: [NO_PARAM; NVALS], val: [0.0; NVALS] };
+                    nd.val[0] = if f.val[0] > 0.5 { 1.0 } else { 0.0 };
+                    nd.val[1] = if f.val[1] > 0.5 { 1.0 } else { 0.0 };
+                    tr_n[cfg * nn + count as usize] = nd;
                     count += 1;
                 }
             } else if op == a.ops.shell || op == a.ops.body || op == a.ops.add || op == a.ops.remove || op == a.ops.intersect {
@@ -325,21 +347,28 @@ pub unsafe fn ag_dop_apply(params: *const u8, _: &LaunchConfig) {
                     tr_n[cfg * nn + count as usize] = nd;
                     count += 1;
                 }
-            } else if op == a.ops.circular_pattern || op == a.ops.rect_pattern || op == a.ops.fillet || op == a.ops.chamfer || op == a.ops.deactivate {
+            } else if op == a.ops.circular_pattern || op == a.ops.rect_pattern || op == a.ops.fillet || op == a.ops.chamfer || op == a.ops.deactivate || op == a.ops.draft {
                 let fi = if c.args[0] == rec::LAST { count.wrapping_sub(1) } else { c.args[0] };
                 if count == 0 || fi >= count { st = AgStatus::InvalidParameter.value(); } else {
                     let n = &mut tr_n[cfg * nn + fi as usize];
                     let f = arena[idx];
                     // value slots this op writes
-                    let (lo, hi) = if op == a.ops.circular_pattern { (6, 8) } else if op == a.ops.rect_pattern { (6, 10) } else if op == a.ops.deactivate { (0, 0) } else { (10, 11) };
+                    let edges_z = (op == a.ops.fillet || op == a.ops.chamfer) && c.args[1] == rec::EDGES_Z;
+                    let (lo, hi) = if op == a.ops.circular_pattern { (6, 8) } else if op == a.ops.rect_pattern { (6, 10) } else if op == a.ops.deactivate { (0, 0) } else if op == a.ops.draft { (12, 13) } else if edges_z { (13, 14) } else { (10, 11) };
                     let bad_ref = (lo..hi).any(|j| f.pref[j] != NO_PARAM && f.pref[j] as usize >= kn);
-                    let is_profile_op = op == a.ops.fillet || op == a.ops.chamfer;
-                    if bad_ref || (is_profile_op && n.kind != profile::RECT) { st = if bad_ref { AgStatus::InvalidParameter.value() } else { AgStatus::UnsupportedOp.value() }; }
+                    let extrusion = n.kind <= profile::POLYGON || n.kind == profile::SKETCH;
+                    let unsupported = if op == a.ops.draft || edges_z { !extrusion } else if op == a.ops.fillet || op == a.ops.chamfer { n.kind != profile::RECT } else { false };
+                    // literal range checks (|draft| ≤ 30°, non-negative cap size)
+                    let out_of_range = (op == a.ops.draft && f.pref[12] == NO_PARAM && !(f.val[12].abs() <= 0.57735)) || (edges_z && f.pref[13] == NO_PARAM && !(f.val[13] >= 0.0));
+                    if bad_ref || unsupported || ((op == a.ops.draft || edges_z) && a.general_ok == 0) { st = if bad_ref { AgStatus::InvalidParameter.value() } else { AgStatus::UnsupportedOp.value() }; }
+                    else if out_of_range { st = AgStatus::GeometryCheckFailed.value(); }
                     else if op == a.ops.deactivate { if c.args[1] != 0 { n.flags |= nflags::ACTIVE; } else { n.flags &= !nflags::ACTIVE; } }
                     else {
                         for j in lo..hi { n.pref[j] = f.pref[j]; n.val[j] = f.val[j]; }
                         if op == a.ops.circular_pattern { n.flags = (n.flags & !nflags::PATTERN_RECT) | nflags::PATTERN; }
                         else if op == a.ops.rect_pattern { n.flags = (n.flags & !nflags::PATTERN) | nflags::PATTERN_RECT; }
+                        else if op == a.ops.draft { n.flags |= nflags::DRAFT; }
+                        else if edges_z { n.flags = (n.flags & !(nflags::ROUND_Z | nflags::CHAMFER_Z)) | if op == a.ops.fillet { nflags::ROUND_Z } else { nflags::CHAMFER_Z }; }
                         else if op == a.ops.fillet { n.flags = (n.flags & !nflags::CHAMFER) | nflags::FILLET; }
                         else { n.flags = (n.flags & !nflags::FILLET) | nflags::CHAMFER; }
                     }
@@ -365,11 +394,17 @@ pub unsafe fn ag_dop_compile(params: *const u8, _: &LaunchConfig) {
     let done = unsafe { sl::<u32>(a.done, cn) };
     let out = unsafe { slm::<CNode>(a.compiled, cn * nn) };
     let tabs = unsafe { slm::<f32>(a.tables, cn * nn * TABLE) };
+    let np = unsafe { sl::<f32>(a.pool, 1)[0] } as usize;
+    let pool = unsafe { sl::<f32>(a.pool + 4, np * PSTRIDE) };
     for c in 0..cn {
         if a.eval_trial != 0 && done[c] != 0 { continue; }
         for i in 0..cnt[c] as usize {
             let t = &mut tabs[(c * nn + i) * TABLE..(c * nn + i + 1) * TABLE];
-            out[c * nn + i] = compile_node(&nodes[c * nn + i], &prm[c * kn..c * kn + kn], t);
+            out[c * nn + i] = compile_node_pool(&nodes[c * nn + i], &prm[c * kn..c * kn + kn], pool, t);
+        }
+        if cnt[c] > 0 {
+            let m = scan_mirror(&out[c * nn..c * nn + cnt[c] as usize]);
+            out[c * nn]._pad[0] = 0x8000_0000 | m;
         }
     }
 }
@@ -731,6 +766,9 @@ pub unsafe fn ag_ad_compact(params: *const u8, _: &LaunchConfig) {
     unsafe { slm::<u32>(a.tcount, 1)[0] = toffs[cap - 1] + term[cap - 1]; }
 }
 
+/// CUDA splits mirrored tapes into their own launch; the reference fill covers all cells.
+pub unsafe fn ag_ad_fill_mirror(_: *const u8, _: &LaunchConfig) {}
+
 /// FILL (level l): terminal boundary cells — rigorous tightened fractions, sampled fill,
 /// moments, engineering probes, extents and the border test.
 pub unsafe fn ag_ad_fill(params: *const u8, _: &LaunchConfig) {
@@ -1022,6 +1060,7 @@ pub const DOPS_CPU: &[(&str, CpuKernelFn)] = &[
     ("ag_ad_clip", ag_ad_clip),
     ("ag_ad_compact", ag_ad_compact),
     ("ag_ad_fill", ag_ad_fill),
+    ("ag_ad_fill_mirror", ag_ad_fill_mirror),
     ("ag_ad_start", ag_ad_start),
     ("ag_ad_emit", ag_ad_emit),
     ("ag_ad_total", ag_ad_total),

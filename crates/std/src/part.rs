@@ -69,6 +69,18 @@ impl FeatureImpl for PartOp {
             "part.shaft" | "part.groove" => {
                 let r = regions_of(ctx, req(n, "profile")?)?;
                 let reg = r.regions.first().ok_or_else(|| bad("profile has no regions"))?;
+                // vertical axis and an axis-aligned meridian: an exact layered stack of annuli
+                // (composes with pads / pockets through the exact layered booleans)
+                if r.frame.y.dot(agcad_geo::math::V3::Z) > 1.0 - 1e-12 {
+                    let o = r.frame.origin;
+                    let shifted = Profile { loops: reg.loops.iter().map(|lp| lp.iter().map(|sg| match *sg {
+                        builders::Seg2::Line { a, b } => builders::Seg2::Line { a: [a[0], a[1] + o.z], b: [b[0], b[1] + o.z] },
+                        other => other,
+                    }).collect()).collect() };
+                    if let Ok(l) = LayeredSolid::revolve_rectilinear([o.x, o.y], &shifted) {
+                        return combine(ctx, n, Solid::Layered(l), if self.0 == "part.shaft" { BoolOp2::Union } else { BoolOp2::Difference });
+                    }
+                }
                 // Profile coordinates in the sketch plane: x = radius, y = axial (revolve about sketch y).
                 let axis_frame = Frame { origin: r.frame.origin, x: r.frame.x, y: -r.frame.z, z: r.frame.y };
                 let b = builders::revolve(reg, &axis_frame);

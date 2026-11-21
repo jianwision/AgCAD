@@ -78,6 +78,17 @@ impl FeatureImpl for TransformOp {
                     "transform.rotation" => Xform::rotation(V3::ZERO, vec3(ctx, req(n, "axis")?)?, num(ctx, n, "angle")?),
                     _ => Xform::mirror(V3::ZERO, vec3(ctx, req(n, if self.0 == "transform.mirror" { "plane" } else { "ref" })?)?),
                 };
+                // exact layered mirror: plane through the origin containing the extrusion direction
+                if self.0 == "transform.mirror" {
+                    if let Solid::Layered(l) = &target {
+                        let nrm = vec3(ctx, req(n, "plane")?)?.normalized();
+                        let (nx, ny, nz) = (nrm.dot(l.frame.x), nrm.dot(l.frame.y), nrm.dot(l.frame.z));
+                        if nz.abs() < 1e-12 && l.frame.origin.dot(nrm).abs() < 1e-9 && (nx.abs() > 1.0 - 1e-12 || ny.abs() > 1.0 - 1e-12) {
+                            let m = l.reflected(if nx.abs() > 0.5 { 0 } else { 1 });
+                            return Ok(Product::Solid(Solid::Layered(l.boolean(&m, BoolOp2::Union))));
+                        }
+                    }
+                }
                 let moved = Solid::Brep(target.brep().transformed(&x));
                 if self.0 == "transform.mirror" {
                     let b = ctx.kernel.boolean(&target, &moved, BoolOp2::Union).unwrap_or(moved);

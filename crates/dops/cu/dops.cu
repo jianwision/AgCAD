@@ -6,7 +6,7 @@
 typedef unsigned long long cudaGraphConditionalHandle;
 extern "C" __device__ __attribute__((cudart_builtin)) void cudaGraphSetConditional(cudaGraphConditionalHandle handle, unsigned int value);
 
-#define NVALS 12
+#define NVALS 16
 #define OBS 32
 #define CS 20
 #define C_BLO 16
@@ -36,6 +36,11 @@ extern "C" __device__ __attribute__((cudart_builtin)) void cudaGraphSetCondition
 #define PROFILE_SHELL 3u
 #define PROFILE_BODY 4u
 #define PROFILE_COMBINE 5u
+#define PROFILE_SKETCH 6u
+#define PROFILE_MIRROR 7u
+#define PROFILE_REVOLVE 8u
+#define MAX_SEGS 48u
+#define PSTRIDE (1u + 8u * MAX_SEGS)
 #define MAX_BODIES 4
 #define FOP_INTERSECT 2u
 #define FOP_ADD 0u
@@ -45,6 +50,11 @@ extern "C" __device__ __attribute__((cudart_builtin)) void cudaGraphSetCondition
 #define NF_PATTERN_RECT 4u
 #define NF_FILLET 8u
 #define NF_CHAMFER 16u
+#define NF_DRAFT 32u
+#define NF_ROUND_Z 64u
+#define NF_CHAMFER_Z 128u
+#define NF_MODS (NF_FILLET | NF_CHAMFER | NF_DRAFT | NF_ROUND_Z | NF_CHAMFER_Z)
+#define NF_ZMODS (NF_DRAFT | NF_ROUND_Z | NF_CHAMFER_Z)
 #define PARAM_ADD 1u
 #define FAR 1.0e30
 #define TAU 6.283185307179586
@@ -52,9 +62,9 @@ extern "C" __device__ __attribute__((cudart_builtin)) void cudaGraphSetCondition
 
 struct Node { u32 kind, op, flags, src; u32 pref[NVALS]; double val[NVALS]; };
 struct FeatureArgs { u32 pref[NVALS]; double val[NVALS]; };
-struct CNode { u32 kind, op, active, count, sides, mods, _pad[2]; float v[NVALS]; float apothem; float _pad2[11]; };
+struct CNode { u32 kind, op, active, count, sides, mods, _pad[2]; float v[NVALS]; float apothem, cosd; float _pad2[6]; };
 #define FAR32 1.0e30f
-#define TABLE 384
+#define TABLE 640
 #define POLY 256
 struct Goal {
     double domain_lo[3], domain_hi[3], vol_lo, vol_hi, max_ext[3], min_wall;
@@ -66,12 +76,12 @@ struct Goal {
     double obj_scale;
 };
 struct TraceRow { u32 round, committed, accepted, rejected; double vol_lo, vol_hi; };
-struct OpTable { u32 update, parameter, pad, pocket, hole, circular_pattern, deactivate, rect_pattern, fillet, chamfer, shell, body, add, remove, intersect, _pad; };
+struct OpTable { u32 update, parameter, pad, pocket, hole, circular_pattern, deactivate, rect_pattern, fillet, chamfer, shell, body, add, remove, intersect, draft, mirror, shaft, groove, _pad[1]; };
 struct DopsArgs {
     u64 goal, cur_nodes, cur_count, cur_params, tr_nodes, tr_count, tr_params, rev, budget, done,
         cmds, arena, status, counts, domain_hit, bbox, obs, score, trace, round, active, compiled, tables,
-        wl0, wl1, cls, flag, offs, crank, start, lvl, term, toffs, tlist, tcount, opt, samp, tscore, cond_handle;
-    u32 configs, nodes, params, records, coarse, levels, eval_trial, max_rounds, level, capacity, cap, cfg_offset, tighten, policy, island, _pad2;
+        wl0, wl1, cls, flag, offs, crank, start, lvl, term, toffs, tlist, tcount, opt, samp, tscore, pool, cond_handle;
+    u32 configs, nodes, params, records, coarse, levels, eval_trial, max_rounds, level, capacity, cap, cfg_offset, tighten, policy, island, general_ok;
     OpTable ops;
 };
 #define POLICY_CMAES 1u
@@ -190,15 +200,16 @@ __device__ double tape_sdf(const Node* nodes, u32 count, const double* params, d
 }
 
 // ---- compiled tapes (twin of math.rs compile_node / prism_sdf_c / tape_sdf_c) ----
-__device__ CNode compile_node(const Node& n, const double* params, float* table) {
+__device__ CNode compile_node(const Node& n, const double* params, const float* pool, u32 npool, float* table) {
     CNode c;
     double v[NVALS];
     for (int j = 0; j < NVALS; ++j) v[j] = value_of(n, params, j);
     for (int j = 0; j < NVALS; ++j) c.v[j] = (float)v[j];
     c.kind = n.kind; c.op = n.op; c.active = ((n.flags & NF_ACTIVE) != 0u) ? 1u : 0u; c.count = 1u; c.sides = 0u;
-    c.mods = n.flags & (NF_FILLET | NF_CHAMFER);
-    c._pad[0] = c._pad[1] = 0u; c.apothem = 0.0f;
-    for (int j = 0; j < 11; ++j) c._pad2[j] = 0.0f;
+    c.mods = n.flags & NF_MODS;
+    c._pad[0] = c._pad[1] = 0u; c.apothem = 0.0f; c.cosd = 1.0f;
+    for (int j = 0; j < 6; ++j) c._pad2[j] = 0.0f;
+    if ((n.flags & NF_DRAFT) != 0u) c.cosd = (float)(1.0 / sqrt(1.0 + v[12] * v[12]));
     table[0] = 1.0f;
     table[1] = 0.0f;
     table[2] = 0.0f;
@@ -253,6 +264,15 @@ __device__ CNode compile_node(const Node& n, const double* params, float* table)
             c.sides = k;
         }
     }
+    if (n.kind == PROFILE_SKETCH || n.kind == PROFILE_REVOLVE) {
+        double idx = floor(v[15]);
+        if (idx >= 0.0 && (u64)idx < (u64)npool) {
+            const float* src = pool + (u64)idx * PSTRIDE;
+            u32 ns = (u32)src[0]; if (ns > MAX_SEGS) ns = MAX_SEGS;
+            for (u32 j = 0; j < 8u * ns; ++j) table[POLY + j] = src[1 + j];
+            c.sides = ns;
+        }
+    }
     return c;
 }
 
@@ -267,14 +287,131 @@ __device__ float extrude32(float d2, float z, float z0, float z1) {
     return sqrtf(a * a + b * b) + fminn(fmaxx(d2, dz), 0.0f);
 }
 
-__device__ float prism_sdf_c(const CNode& c, const float* table, float x, float y, float z) {
+__device__ __noinline__ float sketch2d(const float* t, u32 n, float x, float y) {
+    float dmin = FAR32;
+    bool inside = false;
+    for (u32 s = 0; s < n; ++s) {
+        const float* r = t + POLY + 8u * s;
+        float ax = r[1], ay = r[2], bx = r[3], by = r[4];
+        if ((ay > y) != (by > y)) {
+            float xi = ax + (y - ay) * (bx - ax) / (by - ay);
+            if (x < xi) inside = !inside;
+        }
+        float d;
+        if (r[0] == 0.0f) {
+            float dx = bx - ax, dy = by - ay;
+            float l2 = dx * dx + dy * dy;
+            float u = (l2 > 0.0f) ? ((x - ax) * dx + (y - ay) * dy) / l2 : 0.0f;
+            if (u < 0.0f) u = 0.0f;
+            if (u > 1.0f) u = 1.0f;
+            float px = x - (ax + u * dx), py = y - (ay + u * dy);
+            d = sqrtf(px * px + py * py);
+        } else {
+            float cx = r[5], cy = r[6], rr = fabsf(r[7]);
+            float sg = (r[7] > 0.0f) ? 1.0f : -1.0f;
+            float qx = x - cx, qy = y - cy;
+            float ux = ax - cx, uy = ay - cy, vx = bx - cx, vy = by - cy;
+            bool span = sg * (ux * qy - uy * qx) >= 0.0f && sg * (qx * vy - qy * vx) >= 0.0f;
+            float q2 = qx * qx + qy * qy;
+            if (span) {
+                d = fabsf(sqrtf(q2) - rr);
+            } else {
+                float pax = x - ax, pay = y - ay, pbx = x - bx, pby = y - by;
+                d = fminn(sqrtf(pax * pax + pay * pay), sqrtf(pbx * pbx + pby * pby));
+            }
+            float side = (bx - ax) * (y - ay) - (by - ay) * (x - ax);
+            if (side * sg < 0.0f && q2 < rr * rr) inside = !inside;
+        }
+        if (d < dmin) dmin = d;
+    }
+    return inside ? -dmin : dmin;
+}
+
+__device__ float profile_d2(const CNode& c, const float* table, float x, float y) {
+    const float* v = c.v;
+    if (c.kind == PROFILE_RECT) {
+        float x0 = fminn(v[0], v[2]), y0 = fminn(v[1], v[3]), x1 = fmaxx(v[0], v[2]), y1 = fmaxx(v[1], v[3]);
+        if (!(x1 > x0 && y1 > y0)) return FAR32;
+        float cx = 0.5f * (x0 + x1), cy = 0.5f * (y0 + y1);
+        float hx = 0.5f * (x1 - x0), hy = 0.5f * (y1 - y0);
+        float ax = fabsf(x - cx);
+        float ay = fabsf(y - cy);
+        float k = fminn(fmaxx(v[10], 0.0f), fminn(hx, hy));
+        if ((c.mods & NF_FILLET) != 0u) {
+            float qx = ax - (hx - k);
+            float qy = ay - (hy - k);
+            float a = fmaxx(qx, 0.0f);
+            float b = fmaxx(qy, 0.0f);
+            return sqrtf(a * a + b * b) + fminn(fmaxx(qx, qy), 0.0f) - k;
+        }
+        float qx = ax - hx;
+        float qy = ay - hy;
+        float a = fmaxx(qx, 0.0f);
+        float b = fmaxx(qy, 0.0f);
+        float dbox = sqrtf(a * a + b * b) + fminn(fmaxx(qx, qy), 0.0f);
+        return ((c.mods & NF_CHAMFER) != 0u) ? fmaxx(dbox, (ax + ay - (hx + hy - k)) * 0.70710678f) : dbox;
+    }
+    if (c.kind == PROFILE_CIRCLE) {
+        float r = v[2];
+        if (!(r > 0.0f)) return FAR32;
+        float dx = x - v[0];
+        float dy = y - v[1];
+        return sqrtf(dx * dx + dy * dy) - r;
+    }
+    if (c.kind == PROFILE_SKETCH) return (c.sides == 0u) ? FAR32 : sketch2d(table, c.sides, x - v[0], y - v[1]);
+    if (c.sides == 0u) return FAR32;
+    float dx = x - v[0];
+    float dy = y - v[1];
+    float d2 = -FAR32;
+    for (u32 i = 0; i < c.sides; ++i) d2 = fmaxx(d2, dx * table[POLY + 2 * i] + dy * table[POLY + 2 * i + 1] - c.apothem);
+    return d2;
+}
+
+__device__ __noinline__ float zmod(const CNode& c, float d2, float z) {
+    const float* v = c.v;
+    float z0 = v[4], z1 = v[5];
+    float d = ((c.mods & NF_DRAFT) != 0u) ? (d2 + (z - z0) * v[12]) * c.cosd : d2;
+    float dz = fmaxx(z0 - z, z - z1);
+    float r = fminn(fmaxx(v[13], 0.0f), 0.5f * (z1 - z0));
+    if ((c.mods & NF_ROUND_Z) != 0u) {
+        float qx = d + r;
+        float qy = dz + r;
+        float a = fmaxx(qx, 0.0f);
+        float b = fmaxx(qy, 0.0f);
+        return fminn(fmaxx(qx, qy), 0.0f) + sqrtf(a * a + b * b) - r;
+    }
+    if ((c.mods & NF_CHAMFER_Z) != 0u) return fmaxx(extrude32(d, z, z0, z1), (d + dz + r) * 0.70710678f);
+    return extrude32(d, z, z0, z1);
+}
+
+__device__ __noinline__ float revolve_sdf(const CNode& c, const float* table, float x, float y, float z) {
+    if (c.sides == 0u) return FAR32;
+    float dx = x - c.v[0];
+    float dy = y - c.v[1];
+    return sketch2d(table, c.sides, sqrtf(dx * dx + dy * dy), z);
+}
+
+// new profile kinds and z modifiers: out of line (the classic rect / circle / polygon path
+// below is the original hot code)
+__device__ __noinline__ float prism_sdf_rare(const CNode& c, const float* table, float x, float y, float z) {
+    if (c.kind == PROFILE_REVOLVE) return revolve_sdf(c, table, x, y, z);
+    const float* v = c.v;
+    float z0 = v[4], z1 = v[5];
+    if (!(z1 > z0)) return FAR32;
+    float d2 = profile_d2(c, table, x, y);
+    if (d2 == FAR32) return FAR32;
+    return ((c.mods & NF_ZMODS) != 0u) ? zmod(c, d2, z) : extrude32(d2, z, z0, z1);
+}
+
+// classic rect / circle / polygon prisms (tapes without general features)
+__device__ __forceinline__ float prism_sdf_plain(const CNode& c, const float* table, float x, float y, float z) {
     const float* v = c.v;
     float z0 = v[4], z1 = v[5];
     if (!(z1 > z0)) return FAR32;
     if (c.kind == PROFILE_RECT) {
         float x0 = fminn(v[0], v[2]), y0 = fminn(v[1], v[3]), x1 = fmaxx(v[0], v[2]), y1 = fmaxx(v[1], v[3]);
         if (!(x1 > x0 && y1 > y0)) return FAR32;
-        if (c.mods != 0u) {
+        if ((c.mods & (NF_FILLET | NF_CHAMFER)) != 0u) {
             float cx = 0.5f * (x0 + x1), cy = 0.5f * (y0 + y1);
             float hx = 0.5f * (x1 - x0), hy = 0.5f * (y1 - y0);
             float ax = fabsf(x - cx);
@@ -321,13 +458,19 @@ __device__ float prism_sdf_c(const CNode& c, const float* table, float x, float 
     return extrude32(d2, z, z0, z1);
 }
 
-__device__ float tape_sdf_c(const CNode* nodes, u32 count, const float* tables, float x, float y, float z) {
+__device__ float prism_sdf_c(const CNode& c, const float* table, float x, float y, float z) {
+    if (c.kind >= PROFILE_SKETCH || (c.mods & NF_ZMODS) != 0u) return prism_sdf_rare(c, table, x, y, z);
+    return prism_sdf_plain(c, table, x, y, z);
+}
+template <bool G> __device__ __forceinline__ float P_sdf(const CNode& c, const float* t, float x, float y, float z) { if (G) return prism_sdf_c(c, t, x, y, z); return prism_sdf_plain(c, t, x, y, z); }
+
+template <bool G> __device__ float tape_sdf_c_core(const CNode* nodes, u32 count, const float* tables, float x, float y, float z) {
     float f = FAR32;
     float stack[MAX_BODIES];
     int depth = 0;
     for (u32 i = 0; i < count; ++i) {
         const CNode& c = nodes[i];
-        if (c.active == 0u) continue;
+        if (c.active == 0u || c.kind == PROFILE_MIRROR) continue;
         if (c.kind == PROFILE_SHELL) { f = fmaxx(f, -f - c.v[0]); continue; }
         if (c.kind == PROFILE_BODY) { if (depth < MAX_BODIES) { stack[depth] = f; depth += 1; f = FAR32; } continue; }
         if (c.kind == PROFILE_COMBINE) {
@@ -346,11 +489,46 @@ __device__ float tape_sdf_c(const CNode* nodes, u32 count, const float* tables, 
             float qy = y - ty;
             float px = qx * co + qy * s;
             float py = qy * co - qx * s;
-            tf = fminn(tf, prism_sdf_c(c, t, px, py, z));
+            tf = fminn(tf, P_sdf<G>(c, t, px, py, z));
         }
         f = (c.op == FOP_ADD) ? fminn(f, tf) : fmaxx(f, -tf);
     }
     return f;
+}
+// tape flags: bits 0-1 mirror planes, bit 2 general features (sketch / revolve / z modifiers)
+__device__ u32 scan_mirror(const CNode* nodes, u32 count) {
+    u32 m = 0u;
+    for (u32 i = 0; i < count; ++i) {
+        if (nodes[i].active == 0u) continue;
+        if (nodes[i].kind == PROFILE_MIRROR) {
+            if (nodes[i].v[0] > 0.5f) m |= 1u;
+            if (nodes[i].v[1] > 0.5f) m |= 2u;
+        }
+        if (nodes[i].kind == PROFILE_SKETCH || nodes[i].kind == PROFILE_REVOLVE || (nodes[i].mods & NF_ZMODS) != 0u) m |= 4u;
+    }
+    return m;
+}
+__device__ __forceinline__ bool tape_general(const CNode* nodes, u32 count) {
+    if (count > 0u && (nodes[0]._pad[0] & 0x80000000u) != 0u) return (nodes[0]._pad[0] & 7u) != 0u;
+    return scan_mirror(nodes, count) != 0u;
+}
+__device__ __forceinline__ u32 mirror_mask(const CNode* nodes, u32 count) {
+    if (count > 0u && (nodes[0]._pad[0] & 0x80000000u) != 0u) return nodes[0]._pad[0] & 3u;
+    return scan_mirror(nodes, count);
+}
+// mirrored tapes: out of line, so unmirrored evaluation stays a single inlined tape
+__device__ __noinline__ float tape_sdf_mirror(const CNode* nodes, u32 count, const float* tables, u32 m, float x, float y, float z) {
+    float f = FAR32;
+    for (u32 k = 0; k < 4u; ++k) {
+        if ((k & ~m) != 0u) continue;
+        f = fminn(f, tape_sdf_c_core<true>(nodes, count, tables, (k & 1u) ? -x : x, (k & 2u) ? -y : y, z));
+    }
+    return f;
+}
+__device__ float tape_sdf_c(const CNode* nodes, u32 count, const float* tables, float x, float y, float z) {
+    u32 m = mirror_mask(nodes, count);
+    if (m == 0u) return tape_sdf_c_core<true>(nodes, count, tables, x, y, z);
+    return tape_sdf_mirror(nodes, count, tables, m, x, y, z);
 }
 
 __device__ u32 hash3(u32 a, u32 b, u32 c) {
@@ -572,6 +750,7 @@ AG_KERNEL void ag_dop_policy(const DopsArgs* a) {
 
 // ---- execute ----
 AG_KERNEL void ag_dop_apply(const DopsArgs* a) {
+    u32 npool = (u32)ag_ptr<const float>(a->pool)[0];
     u32 cfg = AG_TID;
     if (cfg >= a->configs) return;
     u32 nn = a->nodes, kn = a->params, rn = a->records;
@@ -597,17 +776,39 @@ AG_KERNEL void ag_dop_apply(const DopsArgs* a) {
                 double v = (c.args[1] == PARAM_ADD) ? tr_p[k] + c.imm[0] : c.imm[0];
                 tr_p[k] = v;
             }
-        } else if (op == a->ops.pad || op == a->ops.pocket || op == a->ops.hole) {
+        } else if (op == a->ops.pad || op == a->ops.pocket || op == a->ops.hole || op == a->ops.shaft || op == a->ops.groove) {
             const FeatureArgs f = arena[r];
             bool bad_ref = false;
             for (int j = 0; j < NVALS; ++j) if (f.pref[j] != NO_PARAM && f.pref[j] >= kn) bad_ref = true;
-            if (c.args[0] > PROFILE_POLYGON || bad_ref) st = AG_INVALID_PARAMETER;
+            bool revolve = (op == a->ops.shaft || op == a->ops.groove);
+            u32 kind = revolve ? PROFILE_REVOLVE : c.args[0];
+            bool pooled = (kind == PROFILE_SKETCH || kind == PROFILE_REVOLVE);
+            bool pool_ok = !pooled || (f.pref[15] == NO_PARAM && f.val[15] >= 0.0 && (u64)floor(f.val[15]) < (u64)npool);
+            if ((!revolve && kind > PROFILE_POLYGON && kind != PROFILE_SKETCH) || bad_ref || !pool_ok) st = AG_INVALID_PARAMETER;
+            else if (pooled && a->general_ok == 0u) st = AG_UNSUPPORTED_OP;
             else if (count >= nn) st = AG_CAPACITY_EXCEEDED;
             else {
                 Node n;
-                n.kind = c.args[0]; n.op = (op == a->ops.pad) ? FOP_ADD : FOP_REMOVE; n.flags = NF_ACTIVE; n.src = r;
+                bool add = (op == a->ops.pad || op == a->ops.shaft);
+                n.kind = kind; n.op = add ? FOP_ADD : FOP_REMOVE; n.flags = NF_ACTIVE; n.src = r;
                 for (int j = 0; j < NVALS; ++j) { n.pref[j] = f.pref[j]; n.val[j] = f.val[j]; }
                 tr_n[count] = n;
+                count += 1u;
+            }
+        } else if (op == a->ops.mirror) {
+            const FeatureArgs f = arena[r];
+            int depth = 0;
+            for (u32 k = 0; k < count; ++k) { const Node& m = tr_n[k]; if ((m.flags & NF_ACTIVE) != 0u) { if (m.kind == PROFILE_BODY) depth += 1; else if (m.kind == PROFILE_COMBINE) depth -= 1; } }
+            if (a->general_ok == 0u) st = AG_UNSUPPORTED_OP;
+            else if (count >= nn) st = AG_CAPACITY_EXCEEDED;
+            else if (depth != 0) st = AG_INVALID_PARAMETER;
+            else {
+                Node nd;
+                nd.kind = PROFILE_MIRROR; nd.op = FOP_ADD; nd.flags = NF_ACTIVE; nd.src = r;
+                for (int j = 0; j < NVALS; ++j) { nd.pref[j] = NO_PARAM; nd.val[j] = 0.0; }
+                nd.val[0] = (f.val[0] > 0.5) ? 1.0 : 0.0;
+                nd.val[1] = (f.val[1] > 0.5) ? 1.0 : 0.0;
+                tr_n[count] = nd;
                 count += 1u;
             }
         } else if (op == a->ops.shell || op == a->ops.body || op == a->ops.add || op == a->ops.remove || op == a->ops.intersect) {
@@ -633,25 +834,34 @@ AG_KERNEL void ag_dop_apply(const DopsArgs* a) {
                 tr_n[count] = nd;
                 count += 1u;
             }
-        } else if (op == a->ops.circular_pattern || op == a->ops.rect_pattern || op == a->ops.fillet || op == a->ops.chamfer || op == a->ops.deactivate) {
+        } else if (op == a->ops.circular_pattern || op == a->ops.rect_pattern || op == a->ops.fillet || op == a->ops.chamfer || op == a->ops.deactivate || op == a->ops.draft) {
             u32 fi = (c.args[0] == LAST) ? count - 1u : c.args[0];
             if (count == 0u || fi >= count) st = AG_INVALID_PARAMETER; else {
                 Node& n = tr_n[fi];
                 const FeatureArgs f = arena[r];
+                bool edges_z = (op == a->ops.fillet || op == a->ops.chamfer) && c.args[1] == 1u;
                 int lo, hi;
                 if (op == a->ops.circular_pattern) { lo = 6; hi = 8; }
                 else if (op == a->ops.rect_pattern) { lo = 6; hi = 10; }
                 else if (op == a->ops.deactivate) { lo = 0; hi = 0; }
+                else if (op == a->ops.draft) { lo = 12; hi = 13; }
+                else if (edges_z) { lo = 13; hi = 14; }
                 else { lo = 10; hi = 11; }
                 bool bad_ref = false;
                 for (int j = lo; j < hi; ++j) if (f.pref[j] != NO_PARAM && f.pref[j] >= kn) bad_ref = true;
                 bool is_profile_op = (op == a->ops.fillet || op == a->ops.chamfer);
-                if (bad_ref || (is_profile_op && n.kind != PROFILE_RECT)) st = bad_ref ? AG_INVALID_PARAMETER : AG_UNSUPPORTED_OP;
+                bool extrusion = n.kind <= PROFILE_POLYGON || n.kind == PROFILE_SKETCH;
+                bool unsupported = (op == a->ops.draft || edges_z) ? !extrusion : (is_profile_op ? n.kind != PROFILE_RECT : false);
+                bool out_of_range = (op == a->ops.draft && f.pref[12] == NO_PARAM && !(fabs(f.val[12]) <= 0.57735)) || (edges_z && f.pref[13] == NO_PARAM && !(f.val[13] >= 0.0));
+                if (bad_ref || unsupported || ((op == a->ops.draft || edges_z) && a->general_ok == 0u)) st = bad_ref ? AG_INVALID_PARAMETER : AG_UNSUPPORTED_OP;
+                else if (out_of_range) st = AG_GEOMETRY_CHECK_FAILED;
                 else if (op == a->ops.deactivate) { if (c.args[1] != 0u) n.flags |= NF_ACTIVE; else n.flags &= ~NF_ACTIVE; }
                 else {
                     for (int j = lo; j < hi; ++j) { n.pref[j] = f.pref[j]; n.val[j] = f.val[j]; }
                     if (op == a->ops.circular_pattern) n.flags = (n.flags & ~NF_PATTERN_RECT) | NF_PATTERN;
                     else if (op == a->ops.rect_pattern) n.flags = (n.flags & ~NF_PATTERN) | NF_PATTERN_RECT;
+                    else if (op == a->ops.draft) n.flags |= NF_DRAFT;
+                    else if (edges_z) n.flags = (n.flags & ~(NF_ROUND_Z | NF_CHAMFER_Z)) | ((op == a->ops.fillet) ? NF_ROUND_Z : NF_CHAMFER_Z);
                     else if (op == a->ops.fillet) n.flags = (n.flags & ~NF_CHAMFER) | NF_FILLET;
                     else n.flags = (n.flags & ~NF_FILLET) | NF_CHAMFER;
                 }
@@ -675,7 +885,10 @@ AG_KERNEL void ag_dop_compile(const DopsArgs* a) {
     const double* prm = ag_ptr<const double>(a->eval_trial ? a->tr_params : a->cur_params) + (u64)c * kn;
     CNode* out = ag_ptr<CNode>(a->compiled) + (u64)c * nn;
     float* tabs = ag_ptr<float>(a->tables) + (u64)c * nn * TABLE;
-    for (u32 i = 0; i < cnt; ++i) out[i] = compile_node(nodes[i], prm, tabs + (u64)i * TABLE);
+    const float* pool = ag_ptr<const float>(a->pool);
+    u32 np = (u32)pool[0];
+    for (u32 i = 0; i < cnt; ++i) out[i] = compile_node(nodes[i], prm, pool + 1, np, tabs + (u64)i * TABLE);
+    if (cnt > 0u) out[0]._pad[0] = 0x80000000u | scan_mirror(out, cnt);
 }
 
 // ---- evaluate ----
@@ -719,15 +932,44 @@ __device__ Iv extrude_iv(Iv d2, Iv z, float z0, float z1) {
     return iv_add(iv_sqrt(iv_add(iv_sq(a), iv_sq(b))), iv_minc(iv_max(d2, dz), 0.0f));
 }
 
-__device__ Iv prism_iv(const CNode& c, const float* table, Iv x, Iv y, Iv z) {
+__device__ __forceinline__ float iv_mid(Iv a) { return 0.5f * (a.lo + a.hi); }
+__device__ __forceinline__ float iv_wid(Iv a) { return a.hi - a.lo; }
+__device__ __forceinline__ Iv center_iv(float f, float r) { return mkiv(f - r, f + r); }
+
+// Lipschitz-centre intervals of the rare profiles (kept out of line: the hot rect / circle /
+// polygon path stays small).
+__device__ __noinline__ Iv prism_iv_rare(const CNode& c, const float* table, Iv x, Iv y, Iv z) {
     const float* v = c.v;
-    float z0 = v[4], z1 = v[5];
     Iv far = mkiv(FAR32, FAR32);
+    if (c.kind == PROFILE_REVOLVE) {
+        if (c.sides == 0u) return far;
+        Iv rho = iv_sqrt(iv_add(iv_sq(iv_sub_ic(x, v[0])), iv_sq(iv_sub_ic(y, v[1]))));
+        float wr = iv_wid(rho), wz = iv_wid(z);
+        return center_iv(sketch2d(table, c.sides, iv_mid(rho), iv_mid(z)), 0.5f * sqrtf(wr * wr + wz * wz));
+    }
+    float z0 = v[4], z1 = v[5];
+    if (!(z1 > z0)) return far;
+    if ((c.mods & NF_ZMODS) != 0u) {
+        float wx = iv_wid(x), wy = iv_wid(y), wz = iv_wid(z);
+        float f = prism_sdf_c(c, table, iv_mid(x), iv_mid(y), iv_mid(z));
+        if (f == FAR32) return far;
+        return center_iv(f, 0.5f * sqrtf(wx * wx + wy * wy + wz * wz));
+    }
+    if (c.sides == 0u) return far;
+    float wx = iv_wid(x), wy = iv_wid(y);
+    float d = sketch2d(table, c.sides, iv_mid(x) - v[0], iv_mid(y) - v[1]);
+    return extrude_iv(center_iv(d, 0.5f * sqrtf(wx * wx + wy * wy)), z, z0, z1);
+}
+
+__device__ __forceinline__ Iv prism_iv_plain(const CNode& c, const float* table, Iv x, Iv y, Iv z) {
+    const float* v = c.v;
+    Iv far = mkiv(FAR32, FAR32);
+    float z0 = v[4], z1 = v[5];
     if (!(z1 > z0)) return far;
     if (c.kind == PROFILE_RECT) {
         float x0 = fminn(v[0], v[2]), y0 = fminn(v[1], v[3]), x1 = fmaxx(v[0], v[2]), y1 = fmaxx(v[1], v[3]);
         if (!(x1 > x0 && y1 > y0)) return far;
-        if (c.mods != 0u) {
+        if ((c.mods & (NF_FILLET | NF_CHAMFER)) != 0u) {
             float cx = 0.5f * (x0 + x1), cy = 0.5f * (y0 + y1);
             float hx = 0.5f * (x1 - x0), hy = 0.5f * (y1 - y0);
             Iv ax = iv_abs(iv_sub_ic(x, cx));
@@ -771,13 +1013,19 @@ __device__ Iv prism_iv(const CNode& c, const float* table, Iv x, Iv y, Iv z) {
     return extrude_iv(d2, z, z0, z1);
 }
 
-__device__ Iv tape_iv(const CNode* nodes, u32 count, const float* tables, Iv x, Iv y, Iv z) {
+__device__ Iv prism_iv(const CNode& c, const float* table, Iv x, Iv y, Iv z) {
+    if (c.kind == PROFILE_REVOLVE || c.kind == PROFILE_SKETCH || (c.mods & NF_ZMODS) != 0u) return prism_iv_rare(c, table, x, y, z);
+    return prism_iv_plain(c, table, x, y, z);
+}
+template <bool G> __device__ __forceinline__ Iv P_iv(const CNode& c, const float* t, Iv x, Iv y, Iv z) { if (G) return prism_iv(c, t, x, y, z); return prism_iv_plain(c, t, x, y, z); }
+
+template <bool G> __device__ Iv tape_iv_core(const CNode* nodes, u32 count, const float* tables, Iv x, Iv y, Iv z) {
     Iv f = mkiv(FAR32, FAR32);
     Iv stack[MAX_BODIES];
     int depth = 0;
     for (u32 i = 0; i < count; ++i) {
         const CNode& c = nodes[i];
-        if (c.active == 0u) continue;
+        if (c.active == 0u || c.kind == PROFILE_MIRROR) continue;
         if (c.kind == PROFILE_SHELL) { f = iv_max(f, iv_sub_ic(iv_neg(f), c.v[0])); continue; }
         if (c.kind == PROFILE_BODY) { if (depth < MAX_BODIES) { stack[depth] = f; depth += 1; f = mkiv(FAR32, FAR32); } continue; }
         if (c.kind == PROFILE_COMBINE) {
@@ -796,11 +1044,24 @@ __device__ Iv tape_iv(const CNode* nodes, u32 count, const float* tables, Iv x, 
             Iv qy = iv_sub_ic(y, ty);
             Iv px = iv_add(iv_scale(qx, co), iv_scale(qy, s));
             Iv py = iv_sub(iv_scale(qy, co), iv_scale(qx, s));
-            tf = iv_min(tf, prism_iv(c, t, px, py, z));
+            tf = iv_min(tf, P_iv<G>(c, t, px, py, z));
         }
         f = (c.op == FOP_ADD) ? iv_min(f, tf) : iv_max(f, iv_neg(tf));
     }
     return f;
+}
+__device__ __noinline__ Iv tape_iv_mirror(const CNode* nodes, u32 count, const float* tables, u32 m, Iv x, Iv y, Iv z) {
+    Iv f = mkiv(FAR32, FAR32);
+    for (u32 k = 0; k < 4u; ++k) {
+        if ((k & ~m) != 0u) continue;
+        f = iv_min(f, tape_iv_core<true>(nodes, count, tables, (k & 1u) ? iv_neg(x) : x, (k & 2u) ? iv_neg(y) : y, z));
+    }
+    return f;
+}
+__device__ Iv tape_iv(const CNode* nodes, u32 count, const float* tables, Iv x, Iv y, Iv z) {
+    u32 m = mirror_mask(nodes, count);
+    if (m == 0u) return tape_iv_core<true>(nodes, count, tables, x, y, z);
+    return tape_iv_mirror(nodes, count, tables, m, x, y, z);
 }
 
 // ---- per-cell tape pruning (twin of math.rs Prune) ----
@@ -810,23 +1071,23 @@ __device__ __forceinline__ void prune_none(Prune& p) { p.skip = 0u; for (u32 i =
 __device__ __forceinline__ bool pr_skipped(const Prune& p, u32 i) { return i < PRUNE_NODES && ((p.skip >> i) & 1u) != 0u; }
 __device__ __forceinline__ bool pr_keeps(const Prune& p, u32 i, u32 k) { return i >= PRUNE_NODES || k >= 64u || ((p.inst[i] >> k) & 1ull) != 0ull; }
 
-__device__ __forceinline__ Iv inst_iv(const CNode& c, const float* t, u32 k, Iv x, Iv y, Iv z) {
+template <bool G> __device__ __forceinline__ Iv inst_iv(const CNode& c, const float* t, u32 k, Iv x, Iv y, Iv z) {
     float co = t[4 * k], s = t[4 * k + 1], tx = t[4 * k + 2], ty = t[4 * k + 3];
     Iv qx = iv_sub_ic(x, tx);
     Iv qy = iv_sub_ic(y, ty);
     Iv px = iv_add(iv_scale(qx, co), iv_scale(qy, s));
     Iv py = iv_sub(iv_scale(qy, co), iv_scale(qx, s));
-    return prism_iv(c, t, px, py, z);
+    return P_iv<G>(c, t, px, py, z);
 }
 
-__device__ Iv tape_iv_prune(const CNode* nodes, u32 count, const float* tables, Iv x, Iv y, Iv z, float m, Prune& pr) {
+template <bool G> __device__ Iv tape_iv_prune_core(const CNode* nodes, u32 count, const float* tables, Iv x, Iv y, Iv z, float m, Prune& pr) {
     prune_none(pr);
     Iv f = mkiv(FAR32, FAR32);
     Iv stack[MAX_BODIES];
     int depth = 0;
     for (u32 i = 0; i < count; ++i) {
         const CNode& c = nodes[i];
-        if (c.active == 0u) continue;
+        if (c.active == 0u || c.kind == PROFILE_MIRROR) continue;
         if (c.kind == PROFILE_SHELL) { f = iv_max(f, iv_sub_ic(iv_neg(f), c.v[0])); continue; }
         if (c.kind == PROFILE_BODY) { if (depth < MAX_BODIES) { stack[depth] = f; depth += 1; f = mkiv(FAR32, FAR32); } continue; }
         if (c.kind == PROFILE_COMBINE) {
@@ -839,11 +1100,11 @@ __device__ Iv tape_iv_prune(const CNode* nodes, u32 count, const float* tables, 
         }
         const float* t = tables + (u64)i * TABLE;
         Iv tf = mkiv(FAR32, FAR32);
-        for (u32 k = 0; k < c.count; ++k) tf = iv_min(tf, inst_iv(c, t, k, x, y, z));
+        for (u32 k = 0; k < c.count; ++k) tf = iv_min(tf, inst_iv<G>(c, t, k, x, y, z));
         if (i < PRUNE_NODES) {
             if (c.count > 1u && c.count <= 64u) {
                 u64 mask = 0ull;
-                for (u32 k = 0; k < c.count; ++k) { Iv r = inst_iv(c, t, k, x, y, z); if (!(r.lo > tf.hi + m)) mask |= 1ull << k; }
+                for (u32 k = 0; k < c.count; ++k) { Iv r = inst_iv<G>(c, t, k, x, y, z); if (!(r.lo > tf.hi + m)) mask |= 1ull << k; }
                 pr.inst[i] = mask;
             }
             bool dominated = (c.op == FOP_ADD) ? (tf.lo > f.hi + m) : (-tf.lo < f.lo - m);
@@ -853,14 +1114,19 @@ __device__ Iv tape_iv_prune(const CNode* nodes, u32 count, const float* tables, 
     }
     return f;
 }
+__device__ Iv tape_iv_prune(const CNode* nodes, u32 count, const float* tables, Iv x, Iv y, Iv z, float m, Prune& pr) {
+    u32 mm = mirror_mask(nodes, count);
+    if (mm != 0u) { prune_none(pr); return tape_iv_mirror(nodes, count, tables, mm, x, y, z); }
+    return tape_iv_prune_core<true>(nodes, count, tables, x, y, z, m, pr);
+}
 
-__device__ float tape_sdf_p(const CNode* nodes, u32 count, const float* tables, const Prune& pr, float x, float y, float z) {
+template <bool G> __device__ float tape_sdf_p_core(const CNode* nodes, u32 count, const float* tables, const Prune& pr, float x, float y, float z) {
     float f = FAR32;
     float stack[MAX_BODIES];
     int depth = 0;
     for (u32 i = 0; i < count; ++i) {
         const CNode& c = nodes[i];
-        if (c.active == 0u) continue;
+        if (c.active == 0u || c.kind == PROFILE_MIRROR) continue;
         if (c.kind == PROFILE_SHELL) { f = fmaxx(f, -f - c.v[0]); continue; }
         if (c.kind == PROFILE_BODY) { if (depth < MAX_BODIES) { stack[depth] = f; depth += 1; f = FAR32; } continue; }
         if (c.kind == PROFILE_COMBINE) {
@@ -881,20 +1147,25 @@ __device__ float tape_sdf_p(const CNode* nodes, u32 count, const float* tables, 
             float qy = y - ty;
             float px = qx * co + qy * s;
             float py = qy * co - qx * s;
-            tf = fminn(tf, prism_sdf_c(c, t, px, py, z));
+            tf = fminn(tf, P_sdf<G>(c, t, px, py, z));
         }
         f = (c.op == FOP_ADD) ? fminn(f, tf) : fmaxx(f, -tf);
     }
     return f;
 }
+__device__ float tape_sdf_p(const CNode* nodes, u32 count, const float* tables, const Prune& pr, float x, float y, float z) {
+    u32 mm = mirror_mask(nodes, count);
+    if (mm != 0u) return tape_sdf_mirror(nodes, count, tables, mm, x, y, z);
+    return tape_sdf_p_core<true>(nodes, count, tables, pr, x, y, z);
+}
 
-__device__ Iv tape_iv_p(const CNode* nodes, u32 count, const float* tables, const Prune& pr, Iv x, Iv y, Iv z) {
+template <bool G> __device__ Iv tape_iv_p_core(const CNode* nodes, u32 count, const float* tables, const Prune& pr, Iv x, Iv y, Iv z) {
     Iv f = mkiv(FAR32, FAR32);
     Iv stack[MAX_BODIES];
     int depth = 0;
     for (u32 i = 0; i < count; ++i) {
         const CNode& c = nodes[i];
-        if (c.active == 0u) continue;
+        if (c.active == 0u || c.kind == PROFILE_MIRROR) continue;
         if (c.kind == PROFILE_SHELL) { f = iv_max(f, iv_sub_ic(iv_neg(f), c.v[0])); continue; }
         if (c.kind == PROFILE_BODY) { if (depth < MAX_BODIES) { stack[depth] = f; depth += 1; f = mkiv(FAR32, FAR32); } continue; }
         if (c.kind == PROFILE_COMBINE) {
@@ -908,10 +1179,15 @@ __device__ Iv tape_iv_p(const CNode* nodes, u32 count, const float* tables, cons
         if (pr_skipped(pr, i)) continue;
         const float* t = tables + (u64)i * TABLE;
         Iv tf = mkiv(FAR32, FAR32);
-        for (u32 k = 0; k < c.count; ++k) { if (pr_keeps(pr, i, k)) tf = iv_min(tf, inst_iv(c, t, k, x, y, z)); }
+        for (u32 k = 0; k < c.count; ++k) { if (pr_keeps(pr, i, k)) tf = iv_min(tf, inst_iv<G>(c, t, k, x, y, z)); }
         f = (c.op == FOP_ADD) ? iv_min(f, tf) : iv_max(f, iv_neg(tf));
     }
     return f;
+}
+__device__ Iv tape_iv_p(const CNode* nodes, u32 count, const float* tables, const Prune& pr, Iv x, Iv y, Iv z) {
+    u32 mm = mirror_mask(nodes, count);
+    if (mm != 0u) return tape_iv_mirror(nodes, count, tables, mm, x, y, z);
+    return tape_iv_p_core<true>(nodes, count, tables, pr, x, y, z);
 }
 
 // ---- adaptive evaluation (twin of reference.rs ag_ad_*) ----
@@ -940,15 +1216,23 @@ __device__ void cell_box(const Grid& gr, u32 level, u32 ix, u32 iy, u32 iz, Iv* 
     }
 }
 
+// Mirror dispatch hoisted out of the evaluators: M = false compiles the plain tape (the hot
+// path carries no mirror code); M = true handles mirrored tapes.
+template <bool M> __device__ __forceinline__ float T_sdf(const CNode* n, u32 c, const float* t, float x, float y, float z) { if (M) return tape_sdf_c(n, c, t, x, y, z); return tape_sdf_c_core<false>(n, c, t, x, y, z); }
+template <bool M> __device__ __forceinline__ Iv T_iv(const CNode* n, u32 c, const float* t, Iv x, Iv y, Iv z) { if (M) return tape_iv(n, c, t, x, y, z); return tape_iv_core<false>(n, c, t, x, y, z); }
+template <bool M> __device__ __forceinline__ Iv T_iv_prune(const CNode* n, u32 c, const float* t, Iv x, Iv y, Iv z, float m, Prune& pr) { if (M) return tape_iv_prune(n, c, t, x, y, z, m, pr); return tape_iv_prune_core<false>(n, c, t, x, y, z, m, pr); }
+template <bool M> __device__ __forceinline__ float T_sdf_p(const CNode* n, u32 c, const float* t, const Prune& pr, float x, float y, float z) { if (M) return tape_sdf_p(n, c, t, pr, x, y, z); return tape_sdf_p_core<false>(n, c, t, pr, x, y, z); }
+template <bool M> __device__ __forceinline__ Iv T_iv_p(const CNode* n, u32 c, const float* t, const Prune& pr, Iv x, Iv y, Iv z) { if (M) return tape_iv_p(n, c, t, pr, x, y, z); return tape_iv_p_core<false>(n, c, t, pr, x, y, z); }
+
 struct Surface { float f, g[3], gl, w; };
 
-__device__ Surface surface_p(const CNode* nodes, u32 cnt, const float* tabs, const Prune& pr, float x, float y, float z, const float* d) {
+template <bool M> __device__ Surface surface_p(const CNode* nodes, u32 cnt, const float* tabs, const Prune& pr, float x, float y, float z, const float* d) {
     Surface s;
-    s.f = tape_sdf_p(nodes, cnt, tabs, pr, x, y, z);
+    s.f = T_sdf_p<M>(nodes, cnt, tabs, pr, x, y, z);
     float h = 0.25f * fminn(fminn(d[0], d[1]), d[2]);
-    float gx = tape_sdf_p(nodes, cnt, tabs, pr, x + h, y, z) - tape_sdf_p(nodes, cnt, tabs, pr, x - h, y, z);
-    float gy = tape_sdf_p(nodes, cnt, tabs, pr, x, y + h, z) - tape_sdf_p(nodes, cnt, tabs, pr, x, y - h, z);
-    float gz = tape_sdf_p(nodes, cnt, tabs, pr, x, y, z + h) - tape_sdf_p(nodes, cnt, tabs, pr, x, y, z - h);
+    float gx = T_sdf_p<M>(nodes, cnt, tabs, pr, x + h, y, z) - T_sdf_p<M>(nodes, cnt, tabs, pr, x - h, y, z);
+    float gy = T_sdf_p<M>(nodes, cnt, tabs, pr, x, y + h, z) - T_sdf_p<M>(nodes, cnt, tabs, pr, x, y - h, z);
+    float gz = T_sdf_p<M>(nodes, cnt, tabs, pr, x, y, z + h) - T_sdf_p<M>(nodes, cnt, tabs, pr, x, y, z - h);
     s.g[0] = gx; s.g[1] = gy; s.g[2] = gz;
     s.gl = sqrtf(gx * gx + gy * gy + gz * gz);
     s.w = (s.gl > 1e-30f) ? (fabsf(gx) * d[0] + fabsf(gy) * d[1] + fabsf(gz) * d[2]) / s.gl : 0.0f;
@@ -957,7 +1241,7 @@ __device__ Surface surface_p(const CNode* nodes, u32 cnt, const float* tabs, con
 
 __device__ Surface surface(const CNode* nodes, u32 cnt, const float* tabs, float x, float y, float z, const float* d) {
     Prune pr; prune_none(pr);
-    return surface_p(nodes, cnt, tabs, pr, x, y, z, d);
+    return surface_p<true>(nodes, cnt, tabs, pr, x, y, z, d);
 }
 
 __device__ u64 fill_of(const Surface& s) {
@@ -974,11 +1258,11 @@ __device__ u64 fill_q(const CNode* nodes, u32 cnt, const float* tabs, float x, f
 
 __device__ __forceinline__ u64 qarea(float a) { return (u64)floor((double)a * 1024.0 + 0.5); }
 
-__device__ float march(const CNode* nodes, u32 cnt, const float* tabs, const float* p, const float* dir, bool inside, float t0, float tmax, float hmin) {
+template <bool M> __device__ float march(const CNode* nodes, u32 cnt, const float* tabs, const float* p, const float* dir, bool inside, float t0, float tmax, float hmin) {
     float t = t0;
     for (u32 i = 0; i < MARCH_STEPS; ++i) {
         if (t >= tmax) return tmax;
-        float f = tape_sdf_c(nodes, cnt, tabs, p[0] + dir[0] * t, p[1] + dir[1] * t, p[2] + dir[2] * t);
+        float f = T_sdf<M>(nodes, cnt, tabs, p[0] + dir[0] * t, p[1] + dir[1] * t, p[2] + dir[2] * t);
         float s = inside ? -f : f;
         if (s <= 0.0f) return t;
         t = t + ((s > hmin) ? s : hmin);
@@ -988,7 +1272,7 @@ __device__ float march(const CNode* nodes, u32 cnt, const float* tabs, const flo
 
 struct Probe { float area, wall, gap; bool thin, narrow, undercut; };
 
-__device__ Probe probe(const CNode* nodes, u32 cnt, const float* tabs, const Goal& goal, const Surface& s, const float* c, const float* d) {
+template <bool M> __device__ Probe probe(const CNode* nodes, u32 cnt, const float* tabs, const Goal& goal, const Surface& s, const float* c, const float* d) {
     Probe pr; pr.area = 0.0f; pr.wall = FAR32; pr.gap = FAR32; pr.thin = false; pr.narrow = false; pr.undercut = false;
     if (!(s.gl > 1e-30f) || !(fabsf(s.f) < 0.5f * s.w)) return pr;
     pr.area = d[0] * d[1] * d[2] / s.w;
@@ -997,20 +1281,20 @@ __device__ Probe probe(const CNode* nodes, u32 cnt, const float* tabs, const Goa
     float p[3] = {c[0] - n[0] * s.f, c[1] - n[1] * s.f, c[2] - n[2] * s.f};
     float dm = fminn(fminn(d[0], d[1]), d[2]);
     float hmin = 0.1f * dm;
-    if (!(fabsf(tape_sdf_c(nodes, cnt, tabs, p[0], p[1], p[2])) <= hmin)) return pr;
+    if (!(fabsf(T_sdf<M>(nodes, cnt, tabs, p[0], p[1], p[2])) <= hmin)) return pr;
     float mh = -hmin;
-    float fin = tape_sdf_c(nodes, cnt, tabs, p[0] + n[0] * mh, p[1] + n[1] * mh, p[2] + n[2] * mh);
-    float fout = tape_sdf_c(nodes, cnt, tabs, p[0] + n[0] * hmin, p[1] + n[1] * hmin, p[2] + n[2] * hmin);
+    float fin = T_sdf<M>(nodes, cnt, tabs, p[0] + n[0] * mh, p[1] + n[1] * mh, p[2] + n[2] * mh);
+    float fout = T_sdf<M>(nodes, cnt, tabs, p[0] + n[0] * hmin, p[1] + n[1] * hmin, p[2] + n[2] * hmin);
     if (!(fin < 0.0f && fout > 0.0f)) return pr;
     if (goal.min_wall > 0.0) {
         float tw = (float)goal.min_wall;
         float nd[3] = {-n[0], -n[1], -n[2]};
-        pr.wall = march(nodes, cnt, tabs, p, nd, true, hmin, tw, hmin);
+        pr.wall = march<M>(nodes, cnt, tabs, p, nd, true, hmin, tw, hmin);
         pr.thin = pr.wall < tw;
     }
     if (goal.min_gap > 0.0) {
         float tg = (float)goal.min_gap;
-        pr.gap = march(nodes, cnt, tabs, p, n, false, hmin, tg, hmin);
+        pr.gap = march<M>(nodes, cnt, tabs, p, n, false, hmin, tg, hmin);
         pr.narrow = pr.gap < tg;
     }
     if (goal.machining_3ax != 0u) {
@@ -1018,12 +1302,12 @@ __device__ Probe probe(const CNode* nodes, u32 cnt, const float* tabs, const Goa
         bool up = n[2] >= -0.25f;
         float dir[3] = {0.0f, 0.0f, up ? 1.0f : -1.0f};
         float tmax = up ? (float)goal.domain_hi[2] - q[2] : q[2] - (float)goal.domain_lo[2];
-        if (tmax > 0.0f && tape_sdf_c(nodes, cnt, tabs, q[0], q[1], q[2]) > 0.0f) pr.undercut = march(nodes, cnt, tabs, q, dir, false, 0.0f, tmax, 0.5f * dm) < tmax;
+        if (tmax > 0.0f && T_sdf<M>(nodes, cnt, tabs, q[0], q[1], q[2]) > 0.0f) pr.undercut = march<M>(nodes, cnt, tabs, q, dir, false, 0.0f, tmax, 0.5f * dm) < tmax;
     }
     return pr;
 }
 
-__device__ void tighten_cell(const CNode* nodes, u32 cnt, const float* tabs, const Prune& pr, const Iv* b, const float* g, float e, u32 budget, u64* olo, u64* ohi) {
+template <bool M> __device__ void tighten_cell(const CNode* nodes, u32 cnt, const float* tabs, const Prune& pr, const Iv* b, const float* g, float e, u32 budget, u64* olo, u64* ohi) {
     u64 full = 1ull << TQ;
     *olo = 0ull; *ohi = full;
     if (budget < 2u) return;
@@ -1053,7 +1337,7 @@ __device__ void tighten_cell(const CNode* nodes, u32 cnt, const float* tabs, con
             Iv c[3] = {pb[0], pb[1], pb[2]};
             if (half == 0) c[ax].hi = mid; else c[ax].lo = mid;
             evals += 1u;
-            Iv r = tape_iv_p(nodes, cnt, tabs, pr, c[0], c[1], c[2]);
+            Iv r = T_iv_p<M>(nodes, cnt, tabs, pr, c[0], c[1], c[2]);
             if (r.lo - e > 0.0f) continue;
             double v = (double)(c[0].hi - c[0].lo) * (double)(c[1].hi - c[1].lo) * (double)(c[2].hi - c[2].lo) / cv * (double)full;
             if (r.hi + e < 0.0f) { lo += (u64)floor(v); hi += (u64)ceil(v); continue; }
@@ -1070,7 +1354,7 @@ __device__ void tighten_cell(const CNode* nodes, u32 cnt, const float* tabs, con
 
 __device__ __forceinline__ u64 enc(u32 cfg, u32 ix, u32 iy, u32 iz) { return ((u64)cfg << 32) | ((u64)ix << 20) | ((u64)iy << 10) | (u64)iz; }
 
-__device__ bool border_hit(const Grid& gr, const CNode* nodes, u32 cnt, const float* tabs, u32 level, const u32* idx, const Iv* b, bool inside) {
+template <bool M> __device__ bool border_hit(const Grid& gr, const CNode* nodes, u32 cnt, const float* tabs, u32 level, const u32* idx, const Iv* b, bool inside) {
     for (int ax = 0; ax < 3; ++ax) {
         u32 res = gr.r[ax] << level;
         for (u32 side = 0; side < 2u; ++side) {
@@ -1079,7 +1363,7 @@ __device__ bool border_hit(const Grid& gr, const CNode* nodes, u32 cnt, const fl
             Iv f[3] = {b[0], b[1], b[2]};
             float face = (side == 0u) ? b[ax].lo : b[ax].hi;
             f[ax] = mkiv(face, face);
-            Iv r = tape_iv(nodes, cnt, tabs, f[0], f[1], f[2]);
+            Iv r = T_iv<M>(nodes, cnt, tabs, f[0], f[1], f[2]);
             if (r.lo - (float)gr.eps <= 0.0f) return true;
         }
     }
@@ -1208,7 +1492,8 @@ AG_KERNEL __launch_bounds__(256, 3) void ag_ad_classify(const DopsArgs* a) {
             u32 c = cnt[cfg];
             Iv b[3];
             cell_box(gr, l, ix, iy, iz, b);
-            Iv r = tape_iv(tape, c, tb, b[0], b[1], b[2]);
+            bool mir = tape_general(tape, c);
+            Iv r = mir ? T_iv<true>(tape, c, tb, b[0], b[1], b[2]) : T_iv<false>(tape, c, tb, b[0], b[1], b[2]);
             if (!(r.lo - e > 0.0f)) {
                 if (r.hi + e < 0.0f) {
                     ct.has = true;
@@ -1217,7 +1502,7 @@ AG_KERNEL __launch_bounds__(256, 3) void ag_ad_classify(const DopsArgs* a) {
                     u32 lo[3] = {ix << sh, iy << sh, iz << sh};
                     contrib_bbox(ct, lo, 1u << sh, true);
                     u32 idx[3] = {ix, iy, iz};
-                    if (border_hit(gr, tape, c, tb, l, idx, b, true)) ct.dom = 1u;
+                    if (mir ? border_hit<true>(gr, tape, c, tb, l, idx, b, true) : border_hit<false>(gr, tape, c, tb, l, idx, b, true)) ct.dom = 1u;
                 } else {
                     cls[i] = 1u;
                 }
@@ -1272,7 +1557,29 @@ AG_KERNEL void ag_ad_compact(const DopsArgs* a) {
     }
 }
 
-AG_KERNEL __launch_bounds__(256, 3) void ag_ad_fill(const DopsArgs* a) {
+// One terminal boundary cell (body of ag_ad_fill), compiled with (M) or without mirror support.
+template <bool M> __device__ __forceinline__ void fill_cell(const DopsArgs* a, const Goal& goal, const Grid& gr, const CNode* tape, u32 c, const float* tb, u32 l, u32 sh, u32 ix, u32 iy, u32 iz, const Iv* b, u64 w, const float* d, const float* cxyz, Contrib& ct) {
+    Prune pru;
+    (void)T_iv_prune<M>(tape, c, tb, b[0], b[1], b[2], (float)gr.eps, pru);
+    Surface sf = surface_p<M>(tape, c, tb, pru, cxyz[0], cxyz[1], cxyz[2], d);
+    u64 tlo, thi;
+    tighten_cell<M>(tape, c, tb, pru, b, sf.g, (float)gr.eps, a->tighten, &tlo, &thi);
+    ct.v[C_BLO] = tlo * w;
+    ct.v[C_BHI] = thi * w;
+    u64 fq = fill_of(sf);
+    if (fq < (tlo >> 4)) fq = tlo >> 4;
+    if (fq > ((thi + 15ull) >> 4)) fq = (thi + 15ull) >> 4;
+    ct.v[C_FILL] = fq * w;
+    contrib_moments(ct, ix, iy, iz, sh, fq);
+    Probe pr = probe<M>(tape, c, tb, goal, sf, cxyz, d);
+    contrib_probe(ct, pr);
+    u32 lo[3] = {ix << sh, iy << sh, iz << sh};
+    contrib_bbox(ct, lo, 1u << sh, false);
+    u32 idx[3] = {ix, iy, iz};
+    if (border_hit<M>(gr, tape, c, tb, l, idx, b, false)) ct.dom = 1u;
+}
+
+template <bool MIR> __device__ __forceinline__ void fill_kernel(const DopsArgs* a) {
     u32 nn = a->nodes;
     const u32* cnt = ag_ptr<const u32>(a->eval_trial ? a->tr_count : a->cur_count);
     const CNode* cnodes = ag_ptr<const CNode>(a->compiled);
@@ -1291,6 +1598,7 @@ AG_KERNEL __launch_bounds__(256, 3) void ag_ad_fill(const DopsArgs* a) {
         u32 cfg = (u32)(en >> 32), ix = (u32)((en >> 20) & 1023u), iy = (u32)((en >> 10) & 1023u), iz = (u32)(en & 1023u);
         Contrib ct;
         contrib_init(ct);
+        if (tape_general(cnodes + (u64)cfg * nn, cnt[cfg]) != MIR) continue; // the other launch
         {
             {
                 const CNode* tape = cnodes + (u64)cfg * nn;
@@ -1303,29 +1611,17 @@ AG_KERNEL __launch_bounds__(256, 3) void ag_ad_fill(const DopsArgs* a) {
                 ct.v[C_BOUNDARY] = w;
                 float d[3] = {b[0].hi - b[0].lo, b[1].hi - b[1].lo, b[2].hi - b[2].lo};
                 float cxyz[3] = {0.5f * (b[0].lo + b[0].hi), 0.5f * (b[1].lo + b[1].hi), 0.5f * (b[2].lo + b[2].hi)};
-                Prune pru;
-                (void)tape_iv_prune(tape, c, tb, b[0], b[1], b[2], (float)gr.eps, pru);
-                Surface sf = surface_p(tape, c, tb, pru, cxyz[0], cxyz[1], cxyz[2], d);
-                u64 tlo, thi;
-                tighten_cell(tape, c, tb, pru, b, sf.g, (float)gr.eps, a->tighten, &tlo, &thi);
-                ct.v[C_BLO] = tlo * w;
-                ct.v[C_BHI] = thi * w;
-                u64 fq = fill_of(sf);
-                if (fq < (tlo >> 4)) fq = tlo >> 4;
-                if (fq > ((thi + 15ull) >> 4)) fq = (thi + 15ull) >> 4;
-                ct.v[C_FILL] = fq * w;
-                contrib_moments(ct, ix, iy, iz, sh, fq);
-                Probe pr = probe(tape, c, tb, goal, sf, cxyz, d);
-                contrib_probe(ct, pr);
-                u32 lo[3] = {ix << sh, iy << sh, iz << sh};
-                contrib_bbox(ct, lo, 1u << sh, false);
-                u32 idx[3] = {ix, iy, iz};
-                if (border_hit(gr, tape, c, tb, l, idx, b, false)) ct.dom = 1u;
+                fill_cell<MIR>(a, goal, gr, tape, c, tb, l, sh, ix, iy, iz, b, w, d, cxyz, ct);
             }
         }
         contrib_flush(a, cfg, ct);
     }
 }
+
+// Terminal boundary cells: plain tapes here, mirrored tapes in ag_ad_fill_mirror (separate
+// launches keep mirror code out of the hot kernel; the CPU reference does both in one).
+AG_KERNEL __launch_bounds__(256, 3) void ag_ad_fill(const DopsArgs* a) { fill_kernel<false>(a); }
+AG_KERNEL __launch_bounds__(256, 3) void ag_ad_fill_mirror(const DopsArgs* a) { fill_kernel<true>(a); }
 
 AG_KERNEL void ag_ad_start(const DopsArgs* a) {
     u32 l = a->level;

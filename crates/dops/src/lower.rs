@@ -54,6 +54,67 @@ fn polygon(pts: &[[f64; 2]]) -> Profile {
     Profile { loops: vec![(0..n).map(|i| Seg2::Line { a: pts[i], b: pts[(i + 1) % n] }).collect()] }.normalize()
 }
 
+fn seg_end(s: &Seg, end: bool) -> [f64; 2] {
+    match *s {
+        Seg::Line { a, b } => if end { b } else { a },
+        Seg::Arc { c, r, a0, a1 } => { let t = if end { a1 } else { a0 }; [c[0] + r * t.cos(), c[1] + r * t.sin()] }
+    }
+}
+
+fn seg2_of(s: &Seg, dx: f64, dy: f64, a: f64) -> Seg2 {
+    match *s {
+        Seg::Line { a: p, b: q } => Seg2::Line { a: rot([p[0] + dx, p[1] + dy], a), b: rot([q[0] + dx, q[1] + dy], a) },
+        Seg::Arc { c, r, a0, a1 } => {
+            let c = rot([c[0] + dx, c[1] + dy], a);
+            if (a1 - a0).abs() >= core::f64::consts::TAU - 1e-12 { Seg2::Circle { c, r, ccw: a1 > a0 } } else { Seg2::Arc { c, r, a0: a0 + a, a1: a1 + a } }
+        }
+    }
+}
+
+/// Exact profile of a pool sketch (one outer loop plus holes), translated by (dx, dy), then
+/// rotated by `a` about the origin (the device convention).
+pub fn sketch_profile(loops: &[Vec<Seg>], dx: f64, dy: f64, a: f64) -> Result<Profile, String> {
+    if loops.is_empty() { return Err("empty sketch".into()); }
+    let p = Profile { loops: loops.iter().map(|lp| lp.iter().map(|s| seg2_of(s, dx, dy, a)).collect()).collect() }.normalize();
+    for lp in &p.loops[1..] {
+        let probe = match lp[0] { Seg2::Line { a, b } => [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])], Seg2::Arc { c, r, a0, a1 } => { let t = 0.5 * (a0 + a1); [c[0] + r * t.cos(), c[1] + r * t.sin()] } Seg2::Circle { c, r, .. } => [c[0] + r, c[1]] };
+        if agcad_geo::region2d::winding(&p.loops[..1], probe).round() as i64 <= 0 { return Err("sketch with several outer loops: use one feature per island".into()); }
+    }
+    Ok(p)
+}
+
+/// Group sketch segments into closed loops (endpoints matched within 1e-6; segments are
+/// reversed as needed).
+pub fn close_loops(segs: &[Seg]) -> Result<Vec<Vec<Seg>>, String> {
+    let near = |p: [f64; 2], q: [f64; 2]| (p[0] - q[0]).abs() < 1e-6 && (p[1] - q[1]).abs() < 1e-6;
+    let rev = |s: &Seg| match *s { Seg::Line { a, b } => Seg::Line { a: b, b: a }, Seg::Arc { c, r, a0, a1 } => Seg::Arc { c, r, a0: a1, a1: a0 } };
+    let mut used = vec![false; segs.len()];
+    let mut loops = Vec::new();
+    for i in 0..segs.len() {
+        if used[i] { continue; }
+        used[i] = true;
+        let mut lp = vec![segs[i]];
+        let start = seg_end(&segs[i], false);
+        // a full circle closes on itself
+        while !near(seg_end(lp.last().unwrap(), true), start) {
+            let e = seg_end(lp.last().unwrap(), true);
+            let Some(j) = (0..segs.len()).find(|&j| !used[j] && (near(seg_end(&segs[j], false), e) || near(seg_end(&segs[j], true), e))) else {
+                return Err(format!("open sketch loop at ({:.4}, {:.4})", e[0], e[1]));
+            };
+            used[j] = true;
+            lp.push(if near(seg_end(&segs[j], false), e) { segs[j] } else { rev(&segs[j]) });
+        }
+        loops.push(lp);
+    }
+    Ok(loops)
+}
+
+fn pool_index(d: &Design, n: &Node, i: usize) -> Result<usize, String> {
+    let idx = value(n, &d.params, 15).floor();
+    if idx < 0.0 || idx as usize >= d.profiles.len() { return Err(format!("feature {i}: sketch profile {idx} missing from the design")); }
+    Ok(idx as usize)
+}
+
 /// Profile of one feature instance rotated by `a` about the z axis.
 fn profile_of(kind: u32, v: &[f64; NVALS], a: f64) -> Result<Profile, String> {
     match kind {
@@ -125,9 +186,39 @@ pub fn to_layered(d: &Design) -> Result<Solid, String> {
     // the device shell is max(f, −f − t): the geometric shell exactly when the body's field is
     // an exact interior distance — one convex unpatterned pad followed only by cuts
     let mut exact_interior = false;
+    let mut mirror = 0u32;
     for (i, n) in d.nodes.iter().enumerate() {
         if n.flags & nflags::ACTIVE == 0 { continue; }
+        if n.flags & (nflags::DRAFT | nflags::ROUND_Z | nflags::CHAMFER_Z) != 0 {
+            return Err(format!("feature {i}: draft / rounded or chamfered caps are device-only (no exact layered form); certify it and deliver the certified implicit body"));
+        }
         match n.kind {
+            profile::MIRROR => {
+                // the device mirrors the finished body: applied after every other feature
+                if value(n, &d.params, 0) > 0.5 { mirror |= 1; }
+                if value(n, &d.params, 1) > 0.5 { mirror |= 2; }
+                continue;
+            }
+            profile::REVOLVE => {
+                let mut v = [0.0; NVALS];
+                for (j, x) in v.iter_mut().enumerate() { *x = value(n, &d.params, j); }
+                let meridian = sketch_profile(&d.profiles[pool_index(d, n, i)?], 0.0, 0.0, 0.0)?;
+                let mut tool: Option<Solid> = None;
+                for (a, tx, ty) in instances(n, &v) {
+                    let axis = rot([v[0] + tx, v[1] + ty], a);
+                    let l = LayeredSolid::revolve_rectilinear(axis, &meridian).map_err(|e| format!("feature {i}: part.shaft is device-only here ({e}); certify it and deliver the certified implicit body"))?;
+                    let inst = Solid::Layered(l);
+                    tool = Some(match tool { None => inst, Some(t) => k.boolean(&t, &inst, BoolOp2::Union).map_err(|e| format!("feature {i}: {}", e.message))? });
+                }
+                let Some(tool) = tool else { continue };
+                if n.op == fop::ADD { exact_interior = false; }
+                body = match (body.take(), n.op) {
+                    (None, fop::ADD) => Some(tool),
+                    (None, _) => None,
+                    (Some(b), op) => Some(k.boolean(&b, &tool, if op == fop::ADD { BoolOp2::Union } else { BoolOp2::Difference }).map_err(|e| format!("feature {i}: {}", e.message))?),
+                };
+                continue;
+            }
             profile::SHELL => {
                 let t = value(n, &d.params, 0);
                 let why = |m: String| format!("feature {i}: part.shell is device-only here ({m}); certify it and deliver the certified implicit body");
@@ -162,6 +253,8 @@ pub fn to_layered(d: &Design) -> Result<Solid, String> {
             let p = if corner > 0.0 {
                 let (x0, y0, x1, y1) = (w[0].min(w[2]), w[1].min(w[3]), w[0].max(w[2]), w[1].max(w[3]));
                 treated_rect(x0, y0, x1, y1, corner, n.flags & nflags::FILLET != 0, a)
+            } else if n.kind == profile::SKETCH {
+                sketch_profile(&d.profiles[pool_index(d, n, i)?], w[0], w[1], a).map_err(|e| format!("feature {i}: {e}"))?
             } else {
                 let Ok(p) = profile_of(n.kind, &w, a) else { continue };
                 p
@@ -176,6 +269,14 @@ pub fn to_layered(d: &Design) -> Result<Solid, String> {
             (None, fop::ADD) => Some(tool),
             (None, _) => None, // removing from nothing (as on the device: no material)
             (Some(b), op) => Some(k.boolean(&b, &tool, if op == fop::ADD { BoolOp2::Union } else { BoolOp2::Difference }).map_err(|e| format!("feature {i}: {}", e.message))?),
+        };
+    }
+    for ax in 0..2 {
+        if mirror >> ax & 1 == 0 { continue; }
+        body = match body.take() {
+            Some(Solid::Layered(l)) if l.frame == Frame::WORLD => { let m = l.reflected(ax); Some(Solid::Layered(l.boolean(&m, BoolOp2::Union))) }
+            Some(_) => return Err("mirror of a non-prismatic body needs the general kernel".into()),
+            None => None,
         };
     }
     body.ok_or_else(|| "design has no material".into())
@@ -213,9 +314,49 @@ pub fn to_program(d: &Design, requirements_rev: u32, expected_revision: u32) -> 
     let mut body_stack: Vec<u32> = Vec::new();
     let mut last_of: std::collections::BTreeMap<u32, String> = std::collections::BTreeMap::new();
     let tag = |mut v: J, b: u32| -> J { if b != 0 { v["args"]["$body"] = json!(b); } v };
+    let mut mirror = 0u32;
+    let mm = |x: f64| J::String(format!("{x} mm"));
+    let chain = |st: &mut Vec<J>, sk: &str, loops: &[Vec<Seg>], dx: f64, dy: f64, pfx: &str| -> String {
+        let mut prev = sk.to_string();
+        let mut k = 0usize;
+        for lp in loops {
+            for sg in lp {
+                let id = format!("{pfx}_{k}");
+                k += 1;
+                let stmt = match *sg {
+                    Seg::Line { a, b } => json!({"id": id, "op": "sketch.line", "args": {"sketch": format!("%{prev}"), "a": [mm(a[0] + dx), mm(a[1] + dy)], "b": [mm(b[0] + dx), mm(b[1] + dy)]}}),
+                    Seg::Arc { c, r, a0, a1 } if (a1 - a0).abs() >= core::f64::consts::TAU - 1e-12 => json!({"id": id, "op": "sketch.circle", "args": {"sketch": format!("%{prev}"), "mode": "center_radius", "pts": [[mm(c[0] + dx), mm(c[1] + dy)]], "r": mm(r)}}),
+                    Seg::Arc { c, r, a0, a1 } => {
+                        let (t0, t1) = if a1 > a0 { (a0, a1) } else { (a1, a0) }; // std arcs run counter-clockwise
+                        json!({"id": id, "op": "sketch.arc", "args": {"sketch": format!("%{prev}"), "mode": "center_start_end", "pts": [[mm(c[0] + dx), mm(c[1] + dy)], [mm(c[0] + dx + r * t0.cos()), mm(c[1] + dy + r * t0.sin())], [mm(c[0] + dx + r * t1.cos()), mm(c[1] + dy + r * t1.sin())]]}})
+                    }
+                };
+                st.push(stmt);
+                prev = id;
+            }
+        }
+        prev
+    };
     for (i, n) in d.nodes.iter().enumerate() {
         if n.flags & nflags::ACTIVE == 0 { continue; }
         match n.kind {
+            profile::MIRROR => {
+                if value(n, &d.params, 0) > 0.5 { mirror |= 1; }
+                if value(n, &d.params, 1) > 0.5 { mirror |= 2; }
+                continue;
+            }
+            profile::REVOLVE => {
+                let Some(loops) = d.profiles.get(value(n, &d.params, 15).floor().max(0.0) as usize) else { continue };
+                let (sk, rg, ft) = (format!("dev_sk{i}"), format!("dev_rg{i}"), format!("dev_f{i}"));
+                let first = st.len();
+                st.push(json!({"id": sk, "op": "sketch.create", "args": {"support": "yz"}}));
+                let last = chain(&mut st, &sk, loops, 0.0, 0.0, &format!("dev_rv{i}"));
+                st.push(json!({"id": rg, "op": "sketch.regions", "args": {"sketch": format!("%{last}")}}));
+                st.push(json!({"id": ft, "op": if n.op == fop::ADD { "part.shaft" } else { "part.groove" }, "args": {"profile": format!("%{rg}"), "axis": "z", "angles": ["0 deg", "360 deg"]}}));
+                if cur_body != 0 { for x in st[first..].iter_mut() { x["args"]["$body"] = json!(cur_body); } }
+                last_of.insert(cur_body, ft);
+                continue;
+            }
             profile::SHELL => {
                 let id = format!("dev_sh{i}");
                 st.push(tag(json!({"id": id, "op": "part.shell", "args": {"remove": [], "inner": length(d, n, 0)}}), cur_body));
@@ -240,6 +381,11 @@ pub fn to_program(d: &Design, requirements_rev: u32, expected_revision: u32) -> 
         let first = st.len();
         st.push(json!({"id": sk, "op": "sketch.create", "args": {"support": "xy"}}));
         let prof = match n.kind {
+            profile::SKETCH => {
+                let Some(loops) = d.profiles.get(value(n, &d.params, 15).floor().max(0.0) as usize) else { continue };
+                let last = chain(&mut st, &sk, loops, value(n, &d.params, 0), value(n, &d.params, 1), &format!("dev_sg{i}"));
+                json!({"id": pr, "op": "sketch.solve", "args": {"sketch": format!("%{last}")}})
+            }
             profile::RECT => json!({"id": pr, "op": "sketch.rectangle", "args": {"sketch": format!("%{sk}"), "mode": "corners", "pts": [[length(d, n, 0), length(d, n, 1)], [length(d, n, 2), length(d, n, 3)]]}}),
             profile::CIRCLE => json!({"id": pr, "op": "sketch.circle", "args": {"sketch": format!("%{sk}"), "mode": "center_radius", "pts": [[length(d, n, 0), length(d, n, 1)]], "r": length(d, n, 2)}}),
             _ => json!({"id": pr, "op": "sketch.polygon", "args": {"sketch": format!("%{sk}"), "center": [length(d, n, 0), length(d, n, 1)], "sides": plain(d, n, 3, ""), "r": length(d, n, 2)}}),
@@ -269,6 +415,15 @@ pub fn to_program(d: &Design, requirements_rev: u32, expected_revision: u32) -> 
         let last = st.last().and_then(|x| x["id"].as_str()).unwrap_or_default().to_string();
         if cur_body != 0 { for x in st[first..].iter_mut() { x["args"]["$body"] = json!(cur_body); } }
         last_of.insert(cur_body, last);
+    }
+    for (ax, plane) in [(0, [1.0, 0.0, 0.0]), (1, [0.0, 1.0, 0.0])] {
+        // the whole body: mirror its latest feature's product
+        if mirror >> ax & 1 != 0 {
+            let Some(last) = last_of.get(&0).cloned() else { continue };
+            let id = format!("dev_mir{ax}");
+            st.push(json!({"id": id, "op": "transform.mirror", "args": {"items": [format!("%{last}")], "plane": plane}}));
+            last_of.insert(0, id);
+        }
     }
     json!({"agir": "0.2", "requirements_rev": requirements_rev, "expected_revision": expected_revision, "program": st})
 }
@@ -316,6 +471,9 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
     let mut profiles: BTreeMap<u32, (u32, [(u32, f64); 4])> = BTreeMap::new(); // sketch-element feature → (kind, values)
     let mut regions: BTreeMap<u32, u32> = BTreeMap::new(); // regions feature → profile feature
     let mut feat_node: BTreeMap<u32, usize> = BTreeMap::new();
+    // sketch statement → (support plane, accumulated segments): general sketches
+    let mut chains: BTreeMap<u32, (String, Vec<Seg>)> = BTreeMap::new();
+    let mut mirrored = false;
     let refid = |v: Option<&Value>| -> Option<u32> { match v { Some(Value::Ref { id, .. }) => id.trim_start_matches('f').parse().ok(), _ => None } };
     let list = |v: Option<&Value>| -> Vec<Value> { match v { Some(Value::List(l)) => l.clone(), _ => vec![] } };
     let mut cur_body = 0usize;
@@ -326,7 +484,10 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
         let f = &part.features[&id];
         if !f.active { continue; }
         let a = &f.args;
-        let solid_feature = matches!(f.op.as_str(), "part.pad" | "part.pocket" | "part.shell");
+        let solid_feature = matches!(f.op.as_str(), "part.pad" | "part.pocket" | "part.shell" | "part.shaft" | "part.groove");
+        if mirrored && (solid_feature || f.op.starts_with("transform.") && f.op != "transform.mirror") {
+            return Err(format!("{}: features after a mirror are not device-representable (the device mirrors the finished body)", f.feature_ref()));
+        }
         if solid_feature && f.container != cur_body {
             if seen_bodies.insert(f.container) && body_stack.len() < MAX_BODIES {
                 body_stack.push(cur_body);
@@ -357,7 +518,85 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
                 d.params.push(v);
                 pvals.insert(name.clone(), v);
             }
-            "sketch.create" | "document.edit" | "document.checkpoint" => {}
+            "sketch.create" => {
+                let sup = match a.get("support") { Some(Value::String(x)) => x.clone(), _ => "xy".into() };
+                chains.insert(id, (sup, vec![]));
+            }
+            "document.edit" | "document.checkpoint" | "sketch.solve" => {
+                if f.op == "sketch.solve" { if let Some(p) = refid(a.get("sketch")) { if let Some(c) = chains.get(&p).cloned() { chains.insert(id, c); } if let Some(pr) = profiles.get(&p).copied() { profiles.insert(id, pr); } } }
+            }
+            "sketch.line" | "sketch.arc" | "sketch.profile" | "sketch.elongated_hole" => {
+                let parent = refid(a.get("sketch")).ok_or(format!("{}: no sketch", f.feature_ref()))?;
+                let (sup, mut segs) = chains.get(&parent).cloned().unwrap_or(("xy".into(), vec![]));
+                let lit = |v: &Value, w: &mut Vec<String>| -> Result<f64, String> {
+                    let (p, x) = raise_value(v, &d.names, &pvals, w)?;
+                    if p != NO_PARAM { return Err(format!("{}: parametric coordinates in general sketches are not device-representable (use rectangle / circle / polygon sketches for parametric profiles)", f.feature_ref())); }
+                    Ok(x)
+                };
+                let pt = |v: &Value, w: &mut Vec<String>| -> Result<[f64; 2], String> { let l = match v { Value::List(l) => l.clone(), _ => vec![] }; Ok([lit(l.first().ok_or("point")?, w)?, lit(l.get(1).ok_or("point")?, w)?]) };
+                match f.op.as_str() {
+                    "sketch.line" => {
+                        if matches!(a.get("construction"), Some(Value::Bool(true))) { chains.insert(id, (sup, segs)); continue; }
+                        segs.push(Seg::Line { a: pt(a.get("a").ok_or("line a")?, &mut warnings)?, b: pt(a.get("b").ok_or("line b")?, &mut warnings)? });
+                    }
+                    "sketch.arc" => {
+                        let ps = list(a.get("pts"));
+                        if ps.len() < 3 { return Err("arc needs center, start, end".into()); }
+                        let (c, p0, p1) = (pt(&ps[0], &mut warnings)?, pt(&ps[1], &mut warnings)?, pt(&ps[2], &mut warnings)?);
+                        let r = (p0[0] - c[0]).hypot(p0[1] - c[1]);
+                        let t0 = (p0[1] - c[1]).atan2(p0[0] - c[0]);
+                        let mut t1 = (p1[1] - c[1]).atan2(p1[0] - c[0]);
+                        while t1 <= t0 { t1 += core::f64::consts::TAU; } // counter-clockwise, as std
+                        segs.push(Seg::Arc { c, r, a0: t0, a1: t1 });
+                    }
+                    "sketch.profile" => {
+                        let ps: Vec<[f64; 2]> = list(a.get("pts")).iter().map(|v| pt(v, &mut warnings)).collect::<Result<_, _>>()?;
+                        for k in 0..ps.len() { segs.push(Seg::Line { a: ps[k], b: ps[(k + 1) % ps.len()] }); }
+                    }
+                    _ => {
+                        // slot (stadium): two lines and two half circles
+                        let ps = list(a.get("pts"));
+                        let (p0, p1) = (pt(ps.first().ok_or("slot start")?, &mut warnings)?, pt(ps.get(1).ok_or("slot end")?, &mut warnings)?);
+                        let w = lit(a.get("width").ok_or("slot width")?, &mut warnings)? / 2.0;
+                        let ang = (p1[1] - p0[1]).atan2(p1[0] - p0[0]);
+                        let (nx, ny) = (-ang.sin() * w, ang.cos() * w);
+                        let hp = core::f64::consts::FRAC_PI_2;
+                        segs.push(Seg::Line { a: [p0[0] - nx, p0[1] - ny], b: [p1[0] - nx, p1[1] - ny] });
+                        segs.push(Seg::Arc { c: p1, r: w, a0: ang - hp, a1: ang + hp });
+                        segs.push(Seg::Line { a: [p1[0] + nx, p1[1] + ny], b: [p0[0] + nx, p0[1] + ny] });
+                        segs.push(Seg::Arc { c: p0, r: w, a0: ang + hp, a1: ang + 3.0 * hp });
+                    }
+                }
+                chains.insert(id, (sup, segs));
+            }
+            "transform.mirror" => {
+                // the whole body: no items, or the body's latest solid feature
+                if let Some(it) = a.get("items") {
+                    let ids: Vec<u32> = list(Some(it)).iter().filter_map(|v| refid(Some(v))).collect();
+                    let latest = d.nodes.last().map(|n| n.src);
+                    if ids.len() != 1 || Some(ids[0]) != latest { return Err(format!("{}: mirroring selected items is not device-representable (only the whole body)", f.feature_ref())); }
+                }
+                let pl: Vec<f64> = list(a.get("plane")).iter().filter_map(|v| v.as_f64()).collect();
+                let mut m = blank(profile::MIRROR, fop::ADD, id);
+                match pl.as_slice() {
+                    [x, y, z] if x.abs() > 1.0 - 1e-9 && y.abs() < 1e-9 && z.abs() < 1e-9 => m.val[0] = 1.0,
+                    [x, y, z] if y.abs() > 1.0 - 1e-9 && x.abs() < 1e-9 && z.abs() < 1e-9 => m.val[1] = 1.0,
+                    _ => return Err(format!("{}: only mirror planes x = 0 / y = 0 (normal [1,0,0] / [0,1,0]) are device-representable", f.feature_ref())),
+                }
+                if body_stack.is_empty() && seen_bodies.len() == 1 { d.nodes.push(m); mirrored = true; } else { return Err(format!("{}: mirror with several bodies is not device-representable", f.feature_ref())); }
+            }
+            "part.shaft" | "part.groove" => {
+                let rg = refid(a.get("profile")).and_then(|r| regions.get(&r)).ok_or(format!("{}: profile is not a sketch region", f.feature_ref()))?;
+                let (sup, segs) = chains.get(rg).cloned().ok_or(format!("{}: profile sketch not found", f.feature_ref()))?;
+                if !matches!(sup.as_str(), "yz" | "yz_plane" | "YZ") { return Err(format!("{}: only revolutions about the vertical axis (sketch on the yz plane) are device-representable", f.feature_ref())); }
+                let loops = close_loops(&segs).map_err(|e| format!("{}: {e}", f.feature_ref()))?;
+                if d.profiles.len() >= 64 { return Err("too many sketch profiles".into()); }
+                let mut n = blank(profile::REVOLVE, if f.op == "part.shaft" { fop::ADD } else { fop::REMOVE }, id);
+                n.val[15] = d.profiles.len() as f64;
+                d.profiles.push(loops);
+                feat_node.insert(id, d.nodes.len());
+                d.nodes.push(n);
+            }
             "sketch.circle" | "sketch.rectangle" | "sketch.polygon" => {
                 let rv = |v: &Value, w: &mut Vec<String>| raise_value(v, &d.names, &pvals, w);
                 let pts = list(a.get("pts"));
@@ -367,11 +606,42 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
                     "sketch.rectangle" => { let p0 = xy(pts.first().ok_or("corner")?, &mut warnings)?; let p1 = xy(pts.get(1).ok_or("corner")?, &mut warnings)?; (profile::RECT, [p0[0], p0[1], p1[0], p1[1]]) }
                     _ => { let c = xy(a.get("center").ok_or("polygon centre")?, &mut warnings)?; (profile::POLYGON, [c[0], c[1], rv(a.get("r").ok_or("polygon r")?, &mut warnings)?, rv(a.get("sides").ok_or("sides")?, &mut warnings)?]) }
                 };
-                profiles.insert(id, entry);
+                // also as segments, for sketches mixing primitives with lines / arcs
+                let parent = refid(a.get("sketch"));
+                let (sup, mut segs) = parent.and_then(|p| chains.get(&p).cloned()).unwrap_or(("xy".into(), vec![]));
+                let fresh = segs.is_empty();
+                let (kind, pv) = entry;
+                let lits: Vec<f64> = pv.iter().map(|(_, v)| *v).collect();
+                let parametric = pv.iter().any(|(p, _)| *p != NO_PARAM);
+                if !parametric {
+                    match kind {
+                        profile::CIRCLE => segs.push(Seg::Arc { c: [lits[0], lits[1]], r: lits[2], a0: 0.0, a1: core::f64::consts::TAU }),
+                        profile::RECT => { let q = [[lits[0], lits[1]], [lits[2], lits[1]], [lits[2], lits[3]], [lits[0], lits[3]]]; for k in 0..4 { segs.push(Seg::Line { a: q[k], b: q[(k + 1) % 4] }); } }
+                        _ => { let kk = lits[3].floor() as usize; for k in 0..kk { let (t0, t1) = (core::f64::consts::TAU * k as f64 / kk as f64, core::f64::consts::TAU * (k + 1) as f64 / kk as f64); segs.push(Seg::Line { a: [lits[0] + lits[2] * t0.cos(), lits[1] + lits[2] * t0.sin()], b: [lits[0] + lits[2] * t1.cos(), lits[1] + lits[2] * t1.sin()] }); } }
+                    }
+                }
+                chains.insert(id, (sup, segs));
+                if fresh { profiles.insert(id, entry); }
             }
             "sketch.regions" => { if let Some(p) = refid(a.get("sketch")) { regions.insert(id, p); } }
             "part.pad" | "part.pocket" => {
-                let prof = refid(a.get("profile")).and_then(|r| regions.get(&r)).and_then(|p| profiles.get(p)).ok_or(format!("{}: profile is not a single circle/rectangle/polygon sketch", f.feature_ref()))?;
+                let rg = refid(a.get("profile")).and_then(|r| regions.get(&r).copied()).ok_or(format!("{}: profile is not a sketch region", f.feature_ref()))?;
+                if let Some((sup, _)) = chains.get(&rg) { if !matches!(sup.as_str(), "xy" | "xy_plane" | "XY") { return Err(format!("{}: only sketches on the xy plane are device-representable for pads / pockets", f.feature_ref())); } }
+                let general;
+                let prof = match profiles.get(&rg) {
+                    Some(p) => p,
+                    None => {
+                        let segs = chains.get(&rg).map(|c| c.1.clone()).unwrap_or_default();
+                        let loops = close_loops(&segs).map_err(|e| format!("{}: {e}", f.feature_ref()))?;
+                        if loops.is_empty() { return Err(format!("{}: empty sketch", f.feature_ref())); }
+                        if d.profiles.len() >= 64 { return Err("too many sketch profiles".into()); }
+                        let mut pv = [(NO_PARAM, 0.0); 4];
+                        pv[3] = (NO_PARAM, d.profiles.len() as f64); // carried to v15 below
+                        d.profiles.push(loops);
+                        general = (profile::SKETCH, pv);
+                        &general
+                    }
+                };
                 let (z0, z1) = match a.get("limits") {
                     Some(Value::Map(m)) => {
                         let ty = match m.get("type") { Some(Value::String(s)) => s.as_str(), _ => "dimension" };
@@ -388,6 +658,7 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
                 let (kind, pv) = *prof;
                 let mut n = Node { kind, op: if f.op == "part.pad" { fop::ADD } else { fop::REMOVE }, flags: nflags::ACTIVE, src: id, pref: [NO_PARAM; NVALS], val: [0.0; NVALS] };
                 for (j, (p, v)) in pv.iter().enumerate() { n.pref[j] = *p; n.val[j] = *v; }
+                if kind == profile::SKETCH { n.val[15] = pv[3].1; n.val[3] = 0.0; }
                 (n.pref[4], n.val[4]) = z0;
                 (n.pref[5], n.val[5]) = z1;
                 feat_node.insert(id, d.nodes.len());
@@ -451,6 +722,6 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
             other => warnings.push(format!("{}: {other} has no device equivalent yet; skipped in the rollout", f.feature_ref())),
         }
     }
-    if d.nodes.is_empty() { return Err("no device-representable features (pad/pocket over circle/rectangle/polygon sketches)".into()); }
+    if d.nodes.is_empty() { return Err("no device-representable features (pad / pocket / shaft over xy / yz sketches)".into()); }
     Ok((d, warnings))
 }

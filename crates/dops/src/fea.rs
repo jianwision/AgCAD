@@ -11,7 +11,6 @@
 //! spread uniformly over the used nodes of the max face.
 
 use crate::abi::*;
-use crate::math::compile_node;
 use crate::studio::{dops_library, Design};
 use agcad_driver::*;
 use agcad_kernels::params::upload_params;
@@ -162,11 +161,7 @@ pub fn stiffness<D: KernelExt>(dev: Arc<D>, design: &Design, lc: &LoadCase) -> D
     let nd = 3 * nn;
     if nv > 4_000_000 { return Err(EnqueueError::InvalidConfig(format!("FEA grid {:?} too large", lc.dims)).into()); }
     // tape compiled on the host (the CPU reference compile; the device compile is bit-identical)
-    let mut cn = Vec::with_capacity(design.nodes.len());
-    let mut tabs = vec![0.0f32; design.nodes.len().max(1) * TABLE];
-    let prm: Vec<f64> = if design.params.is_empty() { vec![0.0] } else { design.params.clone() };
-    for (i, n) in design.nodes.iter().enumerate() { cn.push(compile_node(n, &prm, &mut tabs[i * TABLE..(i + 1) * TABLE])); }
-    if cn.is_empty() { cn.push(CNode::zeroed()); }
+    let (cn, tabs) = design.compile();
     let up = |bytes: &[u8]| -> DriverResult<D::Buffer> { let b = d.alloc_bytes(&s, bytes.len().max(16))?; d.upload_from_host_async(&s, bytes, &b, 0)?; Ok(b) };
     let zeros = |bytes: usize| -> DriverResult<D::Buffer> { let b = d.alloc_bytes(&s, bytes.max(16))?; d.memset_async(&s, &b, 0, bytes.max(16), 0)?; Ok(b) };
     let tape = up(bytemuck::cast_slice(&cn))?;

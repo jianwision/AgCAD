@@ -236,10 +236,21 @@ pub fn deliver_implicit(design: &agcad_dops::Design, goal: &Goal, reason: &str, 
     run(cert, m.map_err(|e| e.to_string()))
 }
 
-/// The exactly-lowerable part of a design (device-only nodes removed) for the document.
+/// The exactly-lowerable part of a design for the document: device-only nodes removed
+/// (non-exact shells, revolutions of sloped / curved meridians) and device-only modifiers
+/// cleared (drafts, rounded / chamfered caps).
 pub fn exact_part(d: &agcad_dops::Design) -> agcad_dops::Design {
-    let exact = |k: u32| k != agcad_dops::abi::profile::SHELL;
-    agcad_dops::Design { nodes: d.nodes.iter().copied().filter(|n| exact(n.kind)).collect(), ..d.clone() }
+    use agcad_dops::abi::{nflags, profile};
+    let rectilinear = |n: &agcad_dops::Node| {
+        let idx = n.val[15].floor().max(0.0) as usize;
+        d.profiles.get(idx).and_then(|lp| agcad_dops::lower::sketch_profile(lp, 0.0, 0.0, 0.0).ok()).is_some_and(|p| agcad_geo::layered::LayeredSolid::revolve_rectilinear([0.0, 0.0], &p).is_ok())
+    };
+    let nodes = d.nodes.iter().filter(|n| n.kind != profile::SHELL && (n.kind != profile::REVOLVE || rectilinear(n))).map(|n| {
+        let mut m = *n;
+        m.flags &= !(nflags::DRAFT | nflags::ROUND_Z | nflags::CHAMFER_Z);
+        m
+    }).collect();
+    agcad_dops::Design { nodes, ..d.clone() }
 }
 
 /// Exact check of a survivor (escalation) without touching the document.

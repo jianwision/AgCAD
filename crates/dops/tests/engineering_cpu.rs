@@ -10,7 +10,7 @@ use agcad_driver_cpu::CpuDevice;
 
 fn plain_box() -> Design {
     let b = feature(profile::RECT, fop::ADD, [(NO_PARAM, 0.0), (NO_PARAM, 0.0), (NO_PARAM, 100.0), (NO_PARAM, 60.0), (NO_PARAM, 0.0), (NO_PARAM, 10.0)]);
-    Design { nodes: vec![b], params: vec![], names: vec![] }
+    Design { nodes: vec![b], params: vec![], names: vec![], profiles: vec![] }
 }
 
 fn obs(d: &Design, g: &Goal) -> [f64; agcad_dops::abi::OBS] { certify(CpuDevice::new(), d, g, 6, 1 << 16).unwrap() }

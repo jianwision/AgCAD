@@ -343,6 +343,44 @@ fn near_segment(s: &Seg2, p: [f64; 2], tol: f64) -> bool {
     }
 }
 
+/// Carrier of a segment (circle centre and radius, or a line's unit direction up to sign and
+/// its offset): two pieces of the same wall share a carrier.
+fn carrier(s: &Seg2) -> [f64; 4] {
+    match *s {
+        Seg2::Line { a, b } => {
+            let d = sub(b, a);
+            let l = (d[0] * d[0] + d[1] * d[1]).sqrt();
+            let (mut ux, mut uy) = (d[0] / l, d[1] / l);
+            if ux < -1e-12 || (ux.abs() <= 1e-12 && uy < 0.0) { ux = -ux; uy = -uy; }
+            [0.0, ux, uy, a[0] * uy - a[1] * ux]
+        }
+        Seg2::Arc { c, r, .. } | Seg2::Circle { c, r, .. } => [1.0 + r, c[0], c[1], r],
+    }
+}
+
+/// Smooth (G1) junctions of consecutive segments: (point, carriers of the two pieces). A wall
+/// that continues across a layer boundary meets itself tangentially there by construction.
+pub fn smooth_junctions(loops: &[Vec<Seg2>]) -> Vec<([f64; 2], [[f64; 4]; 2])> {
+    let mut out = Vec::new();
+    for lp in loops {
+        for i in 0..lp.len() {
+            let (p, q) = (&lp[i], &lp[(i + 1) % lp.len()]);
+            if matches!(p, Seg2::Line { .. }) && matches!(q, Seg2::Line { .. }) { continue; }
+            let (u, v) = (end_dir(p), start_dir(q));
+            let (nu, nv) = ((u[0] * u[0] + u[1] * u[1]).sqrt(), (v[0] * v[0] + v[1] * v[1]).sqrt());
+            if nu > 0.0 && nv > 0.0 && (u[0] * v[1] - u[1] * v[0]).abs() < 1e-9 * nu * nv && u[0] * v[0] + u[1] * v[1] > 0.0 { out.push((p.end(), [carrier(p), carrier(q)])); }
+        }
+    }
+    out
+}
+
+/// Junction points of `a` that are the same wall junction in `b` (same point, same carriers).
+pub fn shared_junctions(a: &[Vec<Seg2>], b: &[Vec<Seg2>], tol: f64) -> Vec<[f64; 2]> {
+    let jb = smooth_junctions(b);
+    let same = |x: &[f64; 4], y: &[f64; 4]| (0..4).all(|k| (x[k] - y[k]).abs() < tol);
+    smooth_junctions(a).into_iter().filter(|(p, ca)| jb.iter().any(|(q, cb)| dist(*p, *q) < tol && ca.iter().all(|x| cb.iter().any(|y| same(x, y))))).map(|(p, _)| p).collect()
+}
+
 /// Point where two segments touch tangentially (zero-angle contact), if any.
 fn tangent_point(x: &Seg2, y: &Seg2, tol: f64) -> Option<[f64; 2]> {
     match (*x, *y) {

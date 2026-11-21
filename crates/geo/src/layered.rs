@@ -93,7 +93,8 @@ impl LayeredSolid {
             let a: Vec<Vec<Seg2>> = self.regions_at(zm).iter().flat_map(region2d::expand).collect();
             let b: Vec<Vec<Seg2>> = other.regions_at(zm).iter().flat_map(region2d::expand).collect();
             if a.is_empty() || b.is_empty() { continue; }
-            let inner: Vec<[f64; 2]> = region2d::tangent_contacts(&a, TOL).into_iter().chain(region2d::tangent_contacts(&b, TOL)).collect();
+            let mut inner: Vec<[f64; 2]> = region2d::tangent_contacts(&a, TOL).into_iter().chain(region2d::tangent_contacts(&b, TOL)).collect();
+            inner.extend(region2d::shared_junctions(&a, &b, TOL));
             let both: Vec<Vec<Seg2>> = a.iter().chain(&b).cloned().collect();
             for p in region2d::tangent_contacts(&both, TOL) {
                 if !inner.iter().any(|q| (q[0] - p[0]).hypot(q[1] - p[1]) < TOL) && !out.iter().any(|q: &[f64; 3]| (q[0] - p[0]).hypot(q[1] - p[1]) < TOL) { out.push([p[0], p[1], zm]); }
@@ -115,7 +116,9 @@ impl LayeredSolid {
                 // contacts between this layer's and the next layer's boundaries at the shared level
                 let up: Vec<Vec<Seg2>> = n.regions.iter().flat_map(region2d::expand).collect();
                 let both: Vec<Vec<Seg2>> = own.iter().chain(&up).cloned().collect();
-                let inner: Vec<[f64; 2]> = region2d::tangent_contacts(&own, TOL).into_iter().chain(region2d::tangent_contacts(&up, TOL)).collect();
+                let mut inner: Vec<[f64; 2]> = region2d::tangent_contacts(&own, TOL).into_iter().chain(region2d::tangent_contacts(&up, TOL)).collect();
+                // a smooth junction of a wall present on both sides of the level is not a contact
+                inner.extend(region2d::shared_junctions(&own, &up, TOL));
                 for p in region2d::tangent_contacts(&both, TOL) {
                     if !inner.iter().any(|q| (q[0] - p[0]).hypot(q[1] - p[1]) < TOL) { out.push([p[0], p[1], l.z1]); }
                 }
@@ -428,5 +431,64 @@ impl LayeredSolid {
         if core.is_empty() { return Ok(self.clone()); }
         let core = LayeredSolid { frame: self.frame, layers: vec![Layer { z0: layer.z0 + t, z1: layer.z1 - t, regions: core }] };
         Ok(self.boolean(&core, BoolOp2::Difference))
+    }
+}
+
+impl LayeredSolid {
+    /// Full revolution about the vertical axis through `axis` (world frame) of a meridian
+    /// region given in (ρ, z) coordinates (ρ ≥ 0). Exact as a layered solid when every meridian
+    /// segment is axis-aligned (cylinders and annular caps); otherwise `Err` (cones / tori need
+    /// the general kernel).
+    pub fn revolve_rectilinear(axis: [f64; 2], meridian: &Profile) -> Result<LayeredSolid, String> {
+        let loops = region2d::expand(meridian);
+        let (mut zs, mut rs): (Vec<f64>, Vec<(f64, f64, f64)>) = (Vec::new(), Vec::new());
+        for lp in &loops {
+            for s in lp {
+                let Seg2::Line { a, b } = *s else { return Err("meridian has arcs (tori / spheres): not a layered solid".into()) };
+                if a[0] < -1e-9 || b[0] < -1e-9 { return Err("meridian crosses the axis (ρ < 0)".into()); }
+                if (a[0] - b[0]).abs() < 1e-12 { rs.push((a[0], a[1].min(b[1]), a[1].max(b[1]))); } else if (a[1] - b[1]).abs() >= 1e-12 { return Err("sloped meridian segment (cone): not a layered solid".into()); }
+                zs.push(a[1]);
+                zs.push(b[1]);
+            }
+        }
+        zs.sort_by(|p, q| p.partial_cmp(q).unwrap());
+        zs.dedup_by(|p, q| (*p - *q).abs() < 1e-12);
+        let mut layers: Vec<Layer> = Vec::new();
+        for w in zs.windows(2) {
+            let zm = 0.5 * (w[0] + w[1]);
+            // radii of the vertical walls crossing this slab, and the inside intervals between them
+            let mut cut: Vec<f64> = rs.iter().filter(|(_, z0, z1)| *z0 < zm && zm < *z1).map(|(r, _, _)| *r).collect();
+            cut.push(0.0);
+            cut.sort_by(|p, q| p.partial_cmp(q).unwrap());
+            cut.dedup_by(|p, q| (*p - *q).abs() < 1e-12);
+            let mut regions: Vec<Profile> = Vec::new();
+            for iv in cut.windows(2) {
+                if region2d::winding(&loops, [0.5 * (iv[0] + iv[1]), zm]).round() as i64 <= 0 { continue; }
+                let outer = Profile::circle(axis[0], axis[1], iv[1]);
+                regions.push(if iv[0] > 1e-12 { outer.with_hole(Profile::circle(axis[0], axis[1], iv[0])) } else { outer.normalize() });
+            }
+            if regions.is_empty() { continue; }
+            if let Some(last) = layers.last_mut() {
+                if (last.z1 - w[0]).abs() < 1e-12 && same_regions(&last.regions, &regions) { last.z1 = w[1]; continue; }
+            }
+            layers.push(Layer { z0: w[0], z1: w[1], regions });
+        }
+        if layers.is_empty() { return Err("empty revolution".into()); }
+        Ok(LayeredSolid { frame: Frame::WORLD, layers })
+    }
+
+    /// Reflection across the plane x = 0 (`axis` 0) or y = 0 (`axis` 1) of the frame.
+    pub fn reflected(&self, axis: usize) -> LayeredSolid {
+        let f = |p: [f64; 2]| if axis == 0 { [-p[0], p[1]] } else { [p[0], -p[1]] };
+        let ang = |t: f64| if axis == 0 { std::f64::consts::PI - t } else { -t };
+        let refl = |s: &Seg2| match *s {
+            Seg2::Line { a, b } => Seg2::Line { a: f(a), b: f(b) },
+            Seg2::Arc { c, r, a0, a1 } => Seg2::Arc { c: f(c), r, a0: ang(a0), a1: ang(a1) },
+            Seg2::Circle { c, r, ccw } => Seg2::Circle { c: f(c), r, ccw: !ccw },
+        };
+        LayeredSolid {
+            frame: self.frame,
+            layers: self.layers.iter().map(|l| Layer { z0: l.z0, z1: l.z1, regions: l.regions.iter().map(|p| Profile { loops: p.loops.iter().map(|lp| lp.iter().map(refl).collect()).collect() }.normalize()).collect() }).collect(),
+        }
     }
 }

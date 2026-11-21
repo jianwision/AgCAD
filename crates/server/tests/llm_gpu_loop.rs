@@ -210,3 +210,43 @@ fn llm_asks_for_lightest_part_meeting_constraints() {
     assert_eq!(r["applied"]["status"], "ACCEPTED", "{}", r["applied"]);
     assert_eq!(r["applied"]["exact_within_device_bounds"], true);
 }
+
+#[test]
+fn llm_sketches_slots_mirrors_and_shafts_reach_the_device() {
+    let req = Requirements::parse(r#"{"id":"r","rev":1,"deliver":{"body_type":"SolidBody"}}"#).unwrap();
+    let mut s = Server::new(req, "bracket");
+    s.session.out_dir = std::env::temp_dir().join(format!("agcad-ops-{}", std::process::id()));
+    // plate with a slot, an arc-cornered pocket, a boss revolved about z, mirrored across x = 0
+    let prog = json!({"requirements_rev": 1, "expected_revision": 0, "program": [
+        {"id": "pt", "op": "knowledge.parameter", "args": {"name": "t", "value": "10 mm"}},
+        {"id": "s1", "op": "sketch.create", "args": {"support": "xy"}},
+        {"id": "r1", "op": "sketch.rectangle", "args": {"sketch": "%s1", "mode": "corners", "pts": [["10 mm", "-30 mm"], ["70 mm", "30 mm"]]}},
+        {"id": "g1", "op": "sketch.regions", "args": {"sketch": "%r1"}},
+        {"id": "pad", "op": "part.pad", "args": {"profile": "%g1", "limits": "$t"}},
+        {"id": "s2", "op": "sketch.create", "args": {"support": "xy"}},
+        {"id": "sl", "op": "sketch.elongated_hole", "args": {"sketch": "%s2", "mode": "center_to_center", "pts": [["25 mm", "-15 mm"], ["55 mm", "-15 mm"]], "width": "8 mm"}},
+        {"id": "g2", "op": "sketch.regions", "args": {"sketch": "%sl"}},
+        {"id": "slot", "op": "part.pocket", "args": {"profile": "%g2", "limits": {"type": "two_sided", "d": "11 mm", "d2": "1 mm"}}},
+        {"id": "s3", "op": "sketch.create", "args": {"support": "xy"}},
+        {"id": "l1", "op": "sketch.line", "args": {"sketch": "%s3", "a": ["30 mm", "5 mm"], "b": ["50 mm", "5 mm"]}},
+        {"id": "a1", "op": "sketch.arc", "args": {"sketch": "%l1", "mode": "center_start_end", "pts": [["50 mm", "15 mm"], ["50 mm", "5 mm"], ["50 mm", "25 mm"]]}},
+        {"id": "l2", "op": "sketch.line", "args": {"sketch": "%a1", "a": ["50 mm", "25 mm"], "b": ["30 mm", "25 mm"]}},
+        {"id": "l3", "op": "sketch.line", "args": {"sketch": "%l2", "a": ["30 mm", "25 mm"], "b": ["30 mm", "5 mm"]}},
+        {"id": "g3", "op": "sketch.regions", "args": {"sketch": "%l3"}},
+        {"id": "pk", "op": "part.pocket", "args": {"profile": "%g3", "limits": {"type": "two_sided", "d": "11 mm", "d2": "-5 mm"}}},
+        {"id": "s4", "op": "sketch.create", "args": {"support": "yz"}},
+        {"id": "b1", "op": "sketch.profile", "args": {"sketch": "%s4", "pts": [["0 mm", "10 mm"], ["6 mm", "10 mm"], ["6 mm", "18 mm"], ["0 mm", "18 mm"]]}},
+        {"id": "g4", "op": "sketch.regions", "args": {"sketch": "%b1"}},
+        {"id": "boss", "op": "part.shaft", "args": {"profile": "%g4", "axis": "z", "angles": ["0 deg", "360 deg"]}},
+        {"id": "mir", "op": "transform.mirror", "args": {"items": ["%boss"], "plane": [1, 0, 0]}}
+    ]});
+    let r = tool(&mut s, "run_program", json!({"program": prog})).unwrap();
+    assert_eq!(r["report"]["status"], "ACCEPTED", "{r}");
+    let g = tool(&mut s, "set_goal", json!({"target_volume": [60_000, 80_000], "parameters": {"t": {"min": 6, "max": 16}}})).unwrap();
+    assert_eq!(g["raise_warnings"], json!([]), "every feature reaches the device: {g}");
+    assert_eq!(g["device_features"], 5, "{g}");
+    let out = tool(&mut s, "device_rollout", json!({"configurations": 16, "rounds": 10, "device": "cpu", "resolution": 64})).unwrap();
+    assert_eq!(out["top"][0]["goal_met"], true, "{out}");
+    assert_eq!(out["applied"]["status"], "ACCEPTED", "{}", out["applied"]);
+    assert_eq!(out["applied"]["exact_within_device_bounds"], true, "{}", out["applied"]);
+}

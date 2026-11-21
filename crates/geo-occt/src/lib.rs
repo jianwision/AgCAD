@@ -61,3 +61,41 @@ pub fn parity(body: &agcad_geo::Brep, rel_tol: f64) -> Result<Value, String> {
     let pass = o["valid"] == true && ((ov - v).abs() / v.abs().max(1e-12) <= rel_tol) && ((oa - a).abs() / a.abs().max(1e-12) <= rel_tol);
     Ok(serde_json::json!({ "pass": pass, "agcad": { "volume": v, "area": a }, "occt": o }))
 }
+
+
+pub const OFFSET_PY: &str = r#"
+import json, sys
+from OCP.STEPControl import STEPControl_Reader
+from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeOffsetShape
+from OCP.BRepOffset import BRepOffset_Skin
+from OCP.GeomAbs import GeomAbs_Arc
+from OCP.GProp import GProp_GProps
+from OCP.BRepGProp import BRepGProp
+r = STEPControl_Reader()
+if r.ReadFile(sys.argv[1]) != 1:
+    print(json.dumps({"ok": False, "error": "read failed"})); sys.exit(0)
+r.TransferRoots(); s = r.OneShape()
+m = BRepOffsetAPI_MakeOffsetShape()
+m.PerformByJoin(s, float(sys.argv[2]), 1e-7, BRepOffset_Skin, False, False, GeomAbs_Arc, False)
+if not m.IsDone():
+    print(json.dumps({"ok": False, "error": "offset failed"})); sys.exit(0)
+vp = GProp_GProps(); BRepGProp.VolumeProperties_s(m.Shape(), vp)
+print(json.dumps({"ok": True, "volume": abs(vp.Mass())}))
+"#;
+
+/// Volume of OCCT's offset of a body by `d` (negative: inward; arc joins at concave edges).
+/// Oracle for the exact closed shell: shell volume = V − offset_volume(−t).
+pub fn offset_volume(body: &agcad_geo::Brep, d: f64) -> Result<f64, String> {
+    let dir = std::env::temp_dir().join("agcad-occt");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let script = dir.join("offset.py");
+    std::fs::write(&script, OFFSET_PY).map_err(|e| e.to_string())?;
+    let (txt, _) = agcad_geo::step_write::write_step(body, &Default::default());
+    let path = dir.join(format!("offset-{}-{}.stp", std::process::id(), d.to_bits()));
+    std::fs::write(&path, txt).map_err(|e| e.to_string())?;
+    let out = Command::new(python()).arg("-I").arg(&script).arg(&path).arg(format!("{d}")).output().map_err(|e| e.to_string())?;
+    if !out.status.success() { return Err(String::from_utf8_lossy(&out.stderr).into_owned()); }
+    let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("oracle output: {e}"))?;
+    if v["ok"] != true { return Err(format!("{}", v["error"])); }
+    v["volume"].as_f64().ok_or_else(|| "no volume".into())
+}

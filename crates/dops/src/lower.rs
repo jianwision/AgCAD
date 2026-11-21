@@ -211,14 +211,27 @@ pub fn to_layered(d: &Design) -> Result<Solid, String> {
     // an exact interior distance — one convex unpatterned pad followed only by cuts
     let mut exact_interior = false;
     let mut mirror = 0u32;
+    // a mirror reflects the body built so far (document order), when its stage ends
+    let flush = |body: &mut Option<Solid>, mirror: &mut u32| -> Result<(), String> {
+        for ax in 0..2 {
+            if *mirror >> ax & 1 == 0 { continue; }
+            *body = match body.take() {
+                Some(Solid::Layered(l)) if l.frame == Frame::WORLD => { let m = l.reflected(ax); Some(Solid::Layered(l.boolean(&m, BoolOp2::Union))) }
+                Some(_) => return Err("mirror of a non-prismatic body needs the general kernel".into()),
+                None => None,
+            };
+        }
+        *mirror = 0;
+        Ok(())
+    };
     for (i, n) in d.nodes.iter().enumerate() {
+        if n.kind != profile::MIRROR && mirror != 0 { flush(&mut body, &mut mirror)?; }
         if n.flags & nflags::ACTIVE == 0 { continue; }
         if n.flags & (nflags::DRAFT | nflags::ROUND_Z | nflags::CHAMFER_Z) != 0 {
             return Err(format!("feature {i}: draft / rounded or chamfered caps are device-only (no exact layered form); certify it and deliver the certified implicit body"));
         }
         match n.kind {
             profile::MIRROR => {
-                // the device mirrors the finished body: applied after every other feature
                 if value(n, &d.params, 0) > 0.5 { mirror |= 1; }
                 if value(n, &d.params, 1) > 0.5 { mirror |= 2; }
                 continue;
@@ -301,14 +314,7 @@ pub fn to_layered(d: &Design) -> Result<Solid, String> {
             (Some(b), op) => Some(k.boolean(&b, &tool, if op == fop::ADD { BoolOp2::Union } else { BoolOp2::Difference }).map_err(|e| format!("feature {i}: {}", e.message))?),
         };
     }
-    for ax in 0..2 {
-        if mirror >> ax & 1 == 0 { continue; }
-        body = match body.take() {
-            Some(Solid::Layered(l)) if l.frame == Frame::WORLD => { let m = l.reflected(ax); Some(Solid::Layered(l.boolean(&m, BoolOp2::Union))) }
-            Some(_) => return Err("mirror of a non-prismatic body needs the general kernel".into()),
-            None => None,
-        };
-    }
+    if mirror != 0 { flush(&mut body, &mut mirror)?; }
     body.ok_or_else(|| "design has no material".into())
 }
 
@@ -367,7 +373,19 @@ pub fn to_program(d: &Design, requirements_rev: u32, expected_revision: u32) -> 
         }
         prev
     };
+    // the whole body so far: mirror its latest feature's product, where the stage ends
+    let emit_mirror = |st: &mut Vec<J>, last_of: &mut std::collections::BTreeMap<u32, String>, mirror: &mut u32, at: usize| {
+        for (ax, plane) in [(0, [1.0, 0.0, 0.0]), (1, [0.0, 1.0, 0.0])] {
+            if *mirror >> ax & 1 == 0 { continue; }
+            let Some(last) = last_of.get(&0).cloned() else { continue };
+            let id = format!("dev_mir{at}_{ax}");
+            st.push(json!({"id": id, "op": "transform.mirror", "args": {"items": [format!("%{last}")], "plane": plane}}));
+            last_of.insert(0, id);
+        }
+        *mirror = 0;
+    };
     for (i, n) in d.nodes.iter().enumerate() {
+        if n.kind != profile::MIRROR && mirror != 0 { emit_mirror(&mut st, &mut last_of, &mut mirror, i); }
         if n.flags & nflags::ACTIVE == 0 { continue; }
         match n.kind {
             profile::MIRROR => {
@@ -379,7 +397,15 @@ pub fn to_program(d: &Design, requirements_rev: u32, expected_revision: u32) -> 
                 let Some(loops) = d.profiles.get(value(n, &d.params, 15).floor().max(0.0) as usize) else { continue };
                 let (sk, rg, ft) = (format!("dev_sk{i}"), format!("dev_rg{i}"), format!("dev_f{i}"));
                 let first = st.len();
-                st.push(json!({"id": sk, "op": "sketch.create", "args": {"support": "yz"}}));
+                let (cx, cy) = (value(n, &d.params, 0), value(n, &d.params, 1));
+                if cx != 0.0 || cy != 0.0 {
+                    // axis off the origin: sketch on a yz-parallel datum plane through it
+                    let dp = format!("dev_dp{i}");
+                    st.push(json!({"id": dp, "op": "datum.plane", "args": {"mode": "through", "refs": ["yz"], "value": [mm(cx), mm(cy), mm(0.0)]}}));
+                    st.push(json!({"id": sk, "op": "sketch.create", "args": {"support": format!("%{dp}")}}));
+                } else {
+                    st.push(json!({"id": sk, "op": "sketch.create", "args": {"support": "yz"}}));
+                }
                 let last = chain(&mut st, &sk, loops, 0.0, 0.0, &format!("dev_rv{i}"));
                 st.push(json!({"id": rg, "op": "sketch.regions", "args": {"sketch": format!("%{last}")}}));
                 st.push(json!({"id": ft, "op": if n.op == fop::ADD { "part.shaft" } else { "part.groove" }, "args": {"profile": format!("%{rg}"), "axis": "z", "angles": ["0 deg", "360 deg"]}}));
@@ -455,15 +481,7 @@ pub fn to_program(d: &Design, requirements_rev: u32, expected_revision: u32) -> 
         if cur_body != 0 { for x in st[first..].iter_mut() { x["args"]["$body"] = json!(cur_body); } }
         last_of.insert(cur_body, last);
     }
-    for (ax, plane) in [(0, [1.0, 0.0, 0.0]), (1, [0.0, 1.0, 0.0])] {
-        // the whole body: mirror its latest feature's product
-        if mirror >> ax & 1 != 0 {
-            let Some(last) = last_of.get(&0).cloned() else { continue };
-            let id = format!("dev_mir{ax}");
-            st.push(json!({"id": id, "op": "transform.mirror", "args": {"items": [format!("%{last}")], "plane": plane}}));
-            last_of.insert(0, id);
-        }
-    }
+    if mirror != 0 { emit_mirror(&mut st, &mut last_of, &mut mirror, d.nodes.len()); }
     json!({"agir": "0.2", "requirements_rev": requirements_rev, "expected_revision": expected_revision, "program": st})
 }
 
@@ -512,7 +530,15 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
     let mut feat_node: BTreeMap<u32, usize> = BTreeMap::new();
     // sketch statement → (support plane, accumulated segments): general sketches
     let mut chains: BTreeMap<u32, (String, Vec<Seg>)> = BTreeMap::new();
+    let mut datums: BTreeMap<u32, String> = BTreeMap::new();
     let mut mirrored = false;
+    // the device has one mirror stage: features may follow it, a later mirror may not
+    let mut mirror_closed = false;
+    let mut mirror_at = usize::MAX;
+    let before_mirror = |ni: usize, mirror_at: usize, what: &str| -> Result<(), String> {
+        if mirror_at != usize::MAX && ni < mirror_at { return Err(format!("{what}: modifying a feature that precedes the mirror is not device-representable")); }
+        Ok(())
+    };
     let refid = |v: Option<&Value>| -> Option<u32> { match v { Some(Value::Ref { id, .. }) => id.trim_start_matches('f').parse().ok(), _ => None } };
     let list = |v: Option<&Value>| -> Vec<Value> { match v { Some(Value::List(l)) => l.clone(), _ => vec![] } };
     let mut cur_body = 0usize;
@@ -524,9 +550,7 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
         if !f.active { continue; }
         let a = &f.args;
         let solid_feature = matches!(f.op.as_str(), "part.pad" | "part.pocket" | "part.shell" | "part.shaft" | "part.groove" | "part.hole");
-        if mirrored && (solid_feature || f.op.starts_with("transform.") && f.op != "transform.mirror") {
-            return Err(format!("{}: features after a mirror are not device-representable (the device mirrors the finished body)", f.feature_ref()));
-        }
+        if mirrored && solid_feature { mirror_closed = true; }
         if solid_feature && f.container != cur_body {
             if seen_bodies.insert(f.container) && body_stack.len() < MAX_BODIES {
                 body_stack.push(cur_body);
@@ -558,8 +582,29 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
                 pvals.insert(name.clone(), v);
             }
             "sketch.create" => {
-                let sup = match a.get("support") { Some(Value::String(x)) => x.clone(), _ => "xy".into() };
+                let sup = match a.get("support") {
+                    Some(Value::String(x)) => x.clone(),
+                    Some(r @ Value::Ref { .. }) => refid(Some(r)).and_then(|d| datums.get(&d).cloned()).ok_or(format!("{}: sketch support must be a base plane or a datum.plane through a point", f.feature_ref()))?,
+                    _ => "xy".into(),
+                };
                 chains.insert(id, (sup, vec![]));
+            }
+            "datum.plane" => {
+                // mode "through": a base plane moved to a literal point → "yz@x,y,z"
+                let mode = match a.get("mode") { Some(Value::String(m)) => m.as_str(), _ => "offset" };
+                let base = match list(a.get("refs")).first() { Some(Value::String(b)) => b.clone(), _ => "xy".into() };
+                if mode == "through" {
+                    let pt = list(a.get("value"));
+                    let mut o = [0.0; 3];
+                    for (k, v) in pt.iter().take(3).enumerate() {
+                        let (p, x) = raise_value(v, &d.names, &pvals, &mut warnings)?;
+                        if p != NO_PARAM { return Err(format!("{}: parametric datum points are not device-representable", f.feature_ref())); }
+                        o[k] = x;
+                    }
+                    datums.insert(id, format!("{base}@{},{},{}", o[0], o[1], o[2]));
+                } else {
+                    warnings.push(format!("{}: datum.plane mode {mode} has no device equivalent; sketches on it are not raised", f.feature_ref()));
+                }
             }
             "document.edit" | "document.checkpoint" | "sketch.solve" => {
                 if f.op == "sketch.solve" { if let Some(p) = refid(a.get("sketch")) { if let Some(c) = chains.get(&p).cloned() { chains.insert(id, c); } if let Some(pr) = profiles.get(&p).copied() { profiles.insert(id, pr); } } }
@@ -622,15 +667,26 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
                     [x, y, z] if y.abs() > 1.0 - 1e-9 && x.abs() < 1e-9 && z.abs() < 1e-9 => m.val[1] = 1.0,
                     _ => return Err(format!("{}: only mirror planes x = 0 / y = 0 (normal [1,0,0] / [0,1,0]) are device-representable", f.feature_ref())),
                 }
-                if body_stack.is_empty() && seen_bodies.len() == 1 { d.nodes.push(m); mirrored = true; } else { return Err(format!("{}: mirror with several bodies is not device-representable", f.feature_ref())); }
+                if mirror_closed { return Err(format!("{}: a second mirror after further features is not device-representable (one mirror stage)", f.feature_ref())); }
+                if body_stack.is_empty() && seen_bodies.len() == 1 { if !mirrored { mirror_at = d.nodes.len(); } d.nodes.push(m); mirrored = true; } else { return Err(format!("{}: mirror with several bodies is not device-representable", f.feature_ref())); }
             }
             "part.shaft" | "part.groove" => {
                 let rg = refid(a.get("profile")).and_then(|r| regions.get(&r)).ok_or(format!("{}: profile is not a sketch region", f.feature_ref()))?;
                 let (sup, segs) = chains.get(rg).cloned().ok_or(format!("{}: profile sketch not found", f.feature_ref()))?;
-                if !matches!(sup.as_str(), "yz" | "yz_plane" | "YZ") { return Err(format!("{}: only revolutions about the vertical axis (sketch on the yz plane) are device-representable", f.feature_ref())); }
-                let loops = close_loops(&segs).map_err(|e| format!("{}: {e}", f.feature_ref()))?;
+                let (plane, origin) = match sup.split_once('@') {
+                    Some((p, o)) => { let v: Vec<f64> = o.split(',').filter_map(|x| x.parse().ok()).collect(); (p.to_string(), [v[0], v[1], v[2]]) }
+                    None => (sup.clone(), [0.0; 3]),
+                };
+                if !matches!(plane.as_str(), "yz" | "yz_plane" | "YZ") { return Err(format!("{}: only revolutions about a vertical axis (sketch on the yz plane or a yz-parallel datum) are device-representable", f.feature_ref())); }
+                let mut loops = close_loops(&segs).map_err(|e| format!("{}: {e}", f.feature_ref()))?;
+                if origin[2] != 0.0 {
+                    // the meridian's z is relative to the datum origin
+                    for lp in loops.iter_mut() { for sg in lp.iter_mut() { match sg { Seg::Line { a, b } => { a[1] += origin[2]; b[1] += origin[2]; } Seg::Arc { c, .. } => c[1] += origin[2] } } }
+                }
                 if d.profiles.len() >= 64 { return Err("too many sketch profiles".into()); }
                 let mut n = blank(profile::REVOLVE, if f.op == "part.shaft" { fop::ADD } else { fop::REMOVE }, id);
+                n.val[0] = origin[0];
+                n.val[1] = origin[1];
                 n.val[15] = d.profiles.len() as f64;
                 d.profiles.push(loops);
                 feat_node.insert(id, d.nodes.len());
@@ -707,6 +763,7 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
                 for it in list(a.get("items")) {
                     let fid = refid(Some(&it)).ok_or("pattern item must reference a feature")?;
                     let ni = *feat_node.get(&fid).ok_or(format!("pattern item #{fid} is not a device feature"))?;
+                    before_mirror(ni, mirror_at, &f.feature_ref())?;
                     let count = raise_value(a.get("count").ok_or("count")?, &d.names, &pvals, &mut warnings)?;
                     let angle = raise_value(a.get("angle").unwrap_or(&Value::Float(core::f64::consts::TAU)), &d.names, &pvals, &mut warnings)?;
                     let n = &mut d.nodes[ni];
@@ -766,6 +823,7 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
                 for it in list(a.get("items")) {
                     let fid = refid(Some(&it)).ok_or("pattern item must reference a feature")?;
                     let ni = *feat_node.get(&fid).ok_or(format!("pattern item #{fid} is not a device feature"))?;
+                    before_mirror(ni, mirror_at, &f.feature_ref())?;
                     if d.profiles.len() >= 64 { return Err("too many sketch profiles".into()); }
                     let n = &mut d.nodes[ni];
                     n.flags = (n.flags & !(nflags::PATTERN | nflags::PATTERN_RECT)) | nflags::PATTERN_USER;
@@ -784,6 +842,7 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
                 for it in list(a.get("items")) {
                     let fid = refid(Some(&it)).ok_or("pattern item must reference a feature")?;
                     let ni = *feat_node.get(&fid).ok_or(format!("pattern item #{fid} is not a device feature"))?;
+                    before_mirror(ni, mirror_at, &f.feature_ref())?;
                     let c1 = raise_value(counts.first().ok_or("counts")?, &d.names, &pvals, &mut warnings)?;
                     let s1 = raise_value(spacing.first().ok_or("spacing")?, &d.names, &pvals, &mut warnings)?;
                     let c2 = match counts.get(1) { Some(v) => raise_value(v, &d.names, &pvals, &mut warnings)?, None => (NO_PARAM, 1.0) };
@@ -801,6 +860,7 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
                 let size = raise_value(a.get(if f.op == "part.edge_fillet" { "r" } else { "a" }).ok_or("fillet size")?, &d.names, &pvals, &mut warnings)?;
                 let pts: Vec<[f64; 2]> = list(a.get("edges")).iter().filter_map(|e| match e { Value::List(c) if c.len() == 2 => Some([c[0].as_f64()?, c[1].as_f64()?]), _ => None }).collect();
                 let target = d.nodes.iter().rposition(|n| n.kind == profile::RECT);
+                if let Some(t) = target { before_mirror(t, mirror_at, &f.feature_ref())?; }
                 let matched = target.is_some_and(|ti| {
                     let n = &d.nodes[ti];
                     let mut v = [0.0; NVALS];

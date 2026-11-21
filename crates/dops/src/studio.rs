@@ -81,7 +81,9 @@ impl Design {
         let mut cn: Vec<CNode> = self.nodes.iter().enumerate().map(|(i, n)| crate::math::compile_node_pool(n, &prm, &pool[1..], &mut tabs[i * TABLE..(i + 1) * TABLE])).collect();
         if cn.is_empty() { cn.push(CNode::zeroed()); }
         let m = crate::math::scan_mirror(&cn);
+        let (s0, e) = crate::math::scan_stage(&cn);
         cn[0]._pad[0] = 0x8000_0000 | m;
+        cn[0]._pad[1] = s0 as u32 | (e as u32) << 16;
         (cn, tabs)
     }
 }

@@ -480,8 +480,8 @@ __device__ float prism_sdf_c(const CNode& c, const float* table, float x, float 
 }
 template <bool G> __device__ __forceinline__ float P_sdf(const CNode& c, const float* t, float x, float y, float z) { if (G) return prism_sdf_c(c, t, x, y, z); return prism_sdf_plain(c, t, x, y, z); }
 
-template <bool G> __device__ float tape_sdf_c_core(const CNode* nodes, u32 count, const float* tables, float x, float y, float z) {
-    float f = FAR32;
+template <bool G> __device__ float tape_sdf_c_core(const CNode* nodes, u32 count, const float* tables, float x, float y, float z, float f0 = FAR32) {
+    float f = f0;
     float stack[MAX_BODIES];
     int depth = 0;
     for (u32 i = 0; i < count; ++i) {
@@ -533,12 +533,24 @@ __device__ __forceinline__ u32 mirror_mask(const CNode* nodes, u32 count) {
     return scan_mirror(nodes, count);
 }
 // mirrored tapes: out of line, so unmirrored evaluation stays a single inlined tape
+// mirror stage [s0, e): the body built by nodes[..s0] is reflected; nodes[e..] follow
+__device__ __forceinline__ void mirror_stage(const CNode* nodes, u32 count, u32* s0, u32* e) {
+    if (count > 0u && (nodes[0]._pad[0] & 0x80000000u) != 0u) { *s0 = nodes[0]._pad[1] & 0xFFFFu; *e = nodes[0]._pad[1] >> 16; return; }
+    u32 m = count;
+    for (u32 i = 0; i < count; ++i) if (nodes[i].active != 0u && nodes[i].kind == PROFILE_MIRROR) { m = i; break; }
+    u32 q = m;
+    while (q < count && nodes[q].kind == PROFILE_MIRROR) q += 1u;
+    *s0 = m; *e = q;
+}
 __device__ __noinline__ float tape_sdf_mirror(const CNode* nodes, u32 count, const float* tables, u32 m, float x, float y, float z) {
+    u32 s0, e;
+    mirror_stage(nodes, count, &s0, &e);
     float f = FAR32;
     for (u32 k = 0; k < 4u; ++k) {
         if ((k & ~m) != 0u) continue;
-        f = fminn(f, tape_sdf_c_core<true>(nodes, count, tables, (k & 1u) ? -x : x, (k & 2u) ? -y : y, z));
+        f = fminn(f, tape_sdf_c_core<true>(nodes, s0, tables, (k & 1u) ? -x : x, (k & 2u) ? -y : y, z));
     }
+    if (e < count) f = tape_sdf_c_core<true>(nodes + e, count - e, tables + (u64)e * TABLE, x, y, z, f);
     return f;
 }
 __device__ float tape_sdf_c(const CNode* nodes, u32 count, const float* tables, float x, float y, float z) {
@@ -936,9 +948,12 @@ AG_KERNEL void ag_dop_apply(const DopsArgs* a) {
             const FeatureArgs f = arena[r];
             int depth = 0;
             for (u32 k = 0; k < count; ++k) { const Node& m = tr_n[k]; if ((m.flags & NF_ACTIVE) != 0u) { if (m.kind == PROFILE_BODY) depth += 1; else if (m.kind == PROFILE_COMBINE) depth -= 1; } }
+            bool has = false;
+            for (u32 k = 0; k < count; ++k) if (tr_n[k].kind == PROFILE_MIRROR) has = true;
+            bool ends = count > 0u && tr_n[count - 1u].kind == PROFILE_MIRROR;
             if (a->general_ok == 0u) st = AG_UNSUPPORTED_OP;
             else if (count >= nn) st = AG_CAPACITY_EXCEEDED;
-            else if (depth != 0) st = AG_INVALID_PARAMETER;
+            else if (depth != 0 || (has && !ends)) st = AG_INVALID_PARAMETER;
             else {
                 Node nd;
                 nd.kind = PROFILE_MIRROR; nd.op = FOP_ADD; nd.flags = NF_ACTIVE; nd.src = r;
@@ -1025,7 +1040,14 @@ AG_KERNEL void ag_dop_compile(const DopsArgs* a) {
     const float* pool = ag_ptr<const float>(a->pool);
     u32 np = (u32)pool[0];
     for (u32 i = 0; i < cnt; ++i) out[i] = compile_node(nodes[i], prm, pool + 1, np, tabs + (u64)i * TABLE);
-    if (cnt > 0u) out[0]._pad[0] = 0x80000000u | scan_mirror(out, cnt);
+    if (cnt > 0u) {
+        u32 s0 = cnt, e = cnt;
+        for (u32 i = 0; i < cnt; ++i) if (out[i].active != 0u && out[i].kind == PROFILE_MIRROR) { s0 = i; break; }
+        e = s0;
+        while (e < cnt && out[e].kind == PROFILE_MIRROR) e += 1u;
+        out[0]._pad[0] = 0x80000000u | scan_mirror(out, cnt);
+        out[0]._pad[1] = s0 | (e << 16);
+    }
 }
 
 // ---- evaluate ----
@@ -1156,8 +1178,8 @@ __device__ Iv prism_iv(const CNode& c, const float* table, Iv x, Iv y, Iv z) {
 }
 template <bool G> __device__ __forceinline__ Iv P_iv(const CNode& c, const float* t, Iv x, Iv y, Iv z) { if (G) return prism_iv(c, t, x, y, z); return prism_iv_plain(c, t, x, y, z); }
 
-template <bool G> __device__ Iv tape_iv_core(const CNode* nodes, u32 count, const float* tables, Iv x, Iv y, Iv z) {
-    Iv f = mkiv(FAR32, FAR32);
+template <bool G> __device__ Iv tape_iv_core(const CNode* nodes, u32 count, const float* tables, Iv x, Iv y, Iv z, Iv f0 = Iv{FAR32, FAR32}) {
+    Iv f = f0;
     Iv stack[MAX_BODIES];
     int depth = 0;
     for (u32 i = 0; i < count; ++i) {
@@ -1188,11 +1210,14 @@ template <bool G> __device__ Iv tape_iv_core(const CNode* nodes, u32 count, cons
     return f;
 }
 __device__ __noinline__ Iv tape_iv_mirror(const CNode* nodes, u32 count, const float* tables, u32 m, Iv x, Iv y, Iv z) {
+    u32 s0, e;
+    mirror_stage(nodes, count, &s0, &e);
     Iv f = mkiv(FAR32, FAR32);
     for (u32 k = 0; k < 4u; ++k) {
         if ((k & ~m) != 0u) continue;
-        f = iv_min(f, tape_iv_core<true>(nodes, count, tables, (k & 1u) ? iv_neg(x) : x, (k & 2u) ? iv_neg(y) : y, z));
+        f = iv_min(f, tape_iv_core<true>(nodes, s0, tables, (k & 1u) ? iv_neg(x) : x, (k & 2u) ? iv_neg(y) : y, z));
     }
+    if (e < count) f = tape_iv_core<true>(nodes + e, count - e, tables + (u64)e * TABLE, x, y, z, f);
     return f;
 }
 __device__ Iv tape_iv(const CNode* nodes, u32 count, const float* tables, Iv x, Iv y, Iv z) {

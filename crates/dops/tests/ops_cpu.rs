@@ -175,3 +175,26 @@ fn user_pattern_and_two_island_sketch_are_sound() {
     sound("user-pattern", &d, v);
     round_trip("user-pattern", &d);
 }
+
+#[test]
+fn features_after_a_mirror_follow_document_order() {
+    let d = mirrored_then_pocket();
+    let want = 2.0 * (30.0 * 40.0 - 25.0 * PI) * 8.0 - 16.0 * PI * 8.0;
+    let v = exact(&d);
+    assert!((v - want).abs() / want < 2e-3, "{v} vs {want}");
+    sound("mirror-then-pocket", &d, v);
+    round_trip("mirror-then-pocket", &d);
+    // the pocket really is one-sided: not mirrored to x < 0
+    let (cn, tb) = d.compile();
+    assert!(agcad_dops::math::tape_sdf_c(&cn, &tb, 25.0, 12.0, 4.0) > 0.0, "pocketed side");
+    assert!(agcad_dops::math::tape_sdf_c(&cn, &tb, -25.0, 12.0, 4.0) < 0.0, "mirrored side keeps material");
+}
+
+#[test]
+fn off_axis_revolve_is_exact_and_round_trips() {
+    let d = off_axis_shaft();
+    let want = PI * (400.0 * 10.0 + 144.0 * 30.0);
+    assert!((exact(&d) - want).abs() / want < 2e-3);
+    sound("off-axis shaft", &d, want);
+    round_trip("off-axis shaft", &d);
+}

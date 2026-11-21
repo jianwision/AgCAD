@@ -225,3 +225,19 @@ pub fn user_pattern_plate() -> Design {
     let islands = vec![vec![Seg::Arc { c: [50.0, 30.0], r: 4.0, a0: 0.0, a1: tau }], vec![Seg::Arc { c: [85.0, 15.0], r: 3.0, a0: 0.0, a1: tau }]];
     Design { nodes: vec![plate, sq, two], params: vec![], names: vec![], profiles: vec![vec![entry], islands] }
 }
+
+/// Mirrored bracket followed by a pocket on one side only (features after a mirror are not
+/// mirrored). Volume 2·(30·40 − 25π)·8 − 16π·8.
+pub fn mirrored_then_pocket() -> Design {
+    let mut d = mirrored_bracket();
+    d.nodes.push(feature(profile::CIRCLE, fop::REMOVE, [(NO_PARAM, 25.0), (NO_PARAM, 12.0), (NO_PARAM, 4.0), (NO_PARAM, 0.0), (NO_PARAM, -1.0), (NO_PARAM, 9.0)]));
+    d
+}
+
+/// The stepped shaft about the vertical axis through (30, −20).
+pub fn off_axis_shaft() -> Design {
+    let mut d = stepped_shaft();
+    d.nodes[0].val[0] = 30.0;
+    d.nodes[0].val[1] = -20.0;
+    d
+}

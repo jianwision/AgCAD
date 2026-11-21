@@ -45,7 +45,9 @@ This is the loop **LLM observes → sets a goal → GPU model plans and executes
   - **Multi-body:** `document.body` plus `boolean.add/remove/intersect`. Lowered with `$body` containers.
   - **General sketches:** lines and arcs, one outer loop plus holes, from a per-design profile pool. The device uses an exact transcendental-free SDF: crossing parity combined with circular-segment parity. `raise` reads LLM sketches built from `sketch.line` / `arc` / `profile` / `elongated_hole` (slots) and mixed primitives. They lower exactly to layered extrusions and back to std sketches.
   - **Revolve** (`part.shaft` / `part.groove` about the vertical axis): exact as a stack of annuli when the meridian is axis-aligned (`LayeredSolid::revolve_rectilinear`, also used by std for composable shafts). Sloped or curved meridians are device-only.
-  - **Mirror** (`transform.mirror`, planes x = 0 / y = 0, whole body): exact layered reflection plus union. This also fixes std, which dropped the original body for layered mirrors.
+  - **Mirror** (`transform.mirror`, planes x = 0 / y = 0): exact layered reflection plus union. It follows document order: the body built so far is reflected, and later features are not mirrored (one mirror stage per design). This also fixes std, which dropped the original body for layered mirrors.
+  - **Revolve about an off-origin vertical axis:** via `datum.plane {mode: "through"}` (new std mode).
+  - **Exact closed shell:** cross-checked against OCCT's own inward offset on 30 fuzzed holed plates, worst relative difference 1.5e-15 (`agcad-geo-occt::offset_volume`).
   - **Draft** and **rounded / chamfered top and bottom edges:** device-only (Lipschitz-1 fields), delivered as certified implicit bodies. The document keeps the exact base features.
   - **Fast path:** tapes with general features run in their own CUDA launch, so plain designs keep full speed.
   - **Kernel fix:** a smooth (G1) junction of the same wall, continuing across a layer boundary, is no longer misreported as a tangential contact. Carrier-checked: genuinely tangent operands are still rejected.

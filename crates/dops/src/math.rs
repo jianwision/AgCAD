@@ -365,8 +365,11 @@ pub fn prism_sdf_c(c: &CNode, table: &[f32], x: f32, y: f32, z: f32) -> f32 {
 }
 
 /// Signed-distance bound of a compiled tape (f32).
-fn tape_sdf_c_core(nodes: &[CNode], tables: &[f32], x: f32, y: f32, z: f32) -> f32 {
-    let mut f = FAR32;
+fn tape_sdf_c_core(nodes: &[CNode], tables: &[f32], x: f32, y: f32, z: f32) -> f32 { tape_sdf_c_from(nodes, tables, FAR32, x, y, z) }
+
+/// The tape folded onto a start value `f0` (the suffix after a mirror stage).
+fn tape_sdf_c_from(nodes: &[CNode], tables: &[f32], f0: f32, x: f32, y: f32, z: f32) -> f32 {
+    let mut f = f0;
     let mut stack = [FAR32; MAX_BODIES];
     let mut depth = 0usize;
     for (i, c) in nodes.iter().enumerate() {
@@ -555,8 +558,10 @@ pub fn prism_iv(c: &CNode, table: &[f32], x: Iv, y: Iv, z: Iv) -> Iv {
 
 /// Interval of a compiled tape's distance bound over a box (pattern instances rotate the box
 /// conservatively to its axis-aligned hull).
-fn tape_iv_core(nodes: &[CNode], tables: &[f32], x: Iv, y: Iv, z: Iv) -> Iv {
-    let mut f = iv(FAR32, FAR32);
+fn tape_iv_core(nodes: &[CNode], tables: &[f32], x: Iv, y: Iv, z: Iv) -> Iv { tape_iv_from(nodes, tables, iv(FAR32, FAR32), x, y, z) }
+
+fn tape_iv_from(nodes: &[CNode], tables: &[f32], f0: Iv, x: Iv, y: Iv, z: Iv) -> Iv {
+    let mut f = f0;
     let mut stack = [iv(FAR32, FAR32); MAX_BODIES];
     let mut depth = 0usize;
     for (i, c) in nodes.iter().enumerate() {
@@ -731,6 +736,21 @@ pub fn mirror_mask(nodes: &[CNode]) -> u32 {
     match nodes.first() { Some(c) if c._pad[0] & 0x8000_0000 != 0 => c._pad[0] & 3, _ => scan_mirror(nodes) }
 }
 
+/// Mirror stage [m, e): the first run of consecutive mirror nodes (cached by the compile pass
+/// in node 0's `_pad[1]` as m | e << 16). The mirror reflects the body built by nodes[..m];
+/// nodes[e..] are applied afterwards (document order).
+pub fn mirror_stage(nodes: &[CNode]) -> (usize, usize) {
+    if let Some(c) = nodes.first() { if c._pad[0] & 0x8000_0000 != 0 { return ((c._pad[1] & 0xFFFF) as usize, (c._pad[1] >> 16) as usize); } }
+    scan_stage(nodes)
+}
+
+pub fn scan_stage(nodes: &[CNode]) -> (usize, usize) {
+    let Some(m) = nodes.iter().position(|c| c.active != 0 && c.kind == profile::MIRROR) else { return (nodes.len(), nodes.len()) };
+    let mut e = m;
+    while e < nodes.len() && nodes[e].kind == profile::MIRROR { e += 1; }
+    (m, e)
+}
+
 /// Scan a tape for mirror nodes (compile pass).
 pub fn scan_mirror(nodes: &[CNode]) -> u32 {
     let mut m = 0u32;
@@ -749,11 +769,14 @@ pub fn scan_mirror(nodes: &[CNode]) -> u32 {
 pub fn tape_sdf_c(nodes: &[CNode], tables: &[f32], x: f32, y: f32, z: f32) -> f32 {
     let m = mirror_mask(nodes);
     if m == 0 { return tape_sdf_c_core(nodes, tables, x, y, z); }
+    let (s0, e) = mirror_stage(nodes);
+    let (pre, tpre) = (&nodes[..s0], &tables[..s0 * TABLE]);
     let mut f = FAR32;
     for k in 0..4u32 {
         if k & !m != 0 { continue; }
-        f = f.min(tape_sdf_c_core(nodes, tables, if k & 1 != 0 { -x } else { x }, if k & 2 != 0 { -y } else { y }, z));
+        f = f.min(tape_sdf_c_core(pre, tpre, if k & 1 != 0 { -x } else { x }, if k & 2 != 0 { -y } else { y }, z));
     }
+    if e < nodes.len() { f = tape_sdf_c_from(&nodes[e..], &tables[e * TABLE..], f, x, y, z); }
     f
 }
 
@@ -762,11 +785,14 @@ pub fn tape_sdf_c(nodes: &[CNode], tables: &[f32], x: f32, y: f32, z: f32) -> f3
 pub fn tape_iv(nodes: &[CNode], tables: &[f32], x: Iv, y: Iv, z: Iv) -> Iv {
     let m = mirror_mask(nodes);
     if m == 0 { return tape_iv_core(nodes, tables, x, y, z); }
+    let (s0, e) = mirror_stage(nodes);
+    let (pre, tpre) = (&nodes[..s0], &tables[..s0 * TABLE]);
     let mut f = iv(FAR32, FAR32);
     for k in 0..4u32 {
         if k & !m != 0 { continue; }
-        f = imin(f, tape_iv_core(nodes, tables, if k & 1 != 0 { neg(x) } else { x }, if k & 2 != 0 { neg(y) } else { y }, z));
+        f = imin(f, tape_iv_core(pre, tpre, if k & 1 != 0 { neg(x) } else { x }, if k & 2 != 0 { neg(y) } else { y }, z));
     }
+    if e < nodes.len() { f = tape_iv_from(&nodes[e..], &tables[e * TABLE..], f, x, y, z); }
     f
 }
 

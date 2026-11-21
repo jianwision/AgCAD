@@ -252,7 +252,7 @@ fn new_ops_bitwise() {
     use agcad_dops::examples::*;
     let cuda = agcad_driver_cuda::CudaDevice::open(0).unwrap();
     let g = ops_goal();
-    for d in [slotted_plate(), l_bracket(), stepped_shaft(), coned_shaft(), mirrored_bracket(), drafted_boss(), rounded_block(), user_pattern_plate()] {
+    for d in [slotted_plate(), l_bracket(), stepped_shaft(), coned_shaft(), mirrored_bracket(), drafted_boss(), rounded_block(), user_pattern_plate(), mirrored_then_pocket(), off_axis_shaft()] {
         let a = agcad_dops::studio::certify(cuda.clone(), &d, &g, 6, 1 << 17).unwrap();
         let b = agcad_dops::studio::certify(agcad_driver_cpu::CpuDevice::new(), &d, &g, 6, 1 << 17).unwrap();
         assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "{a:?}\n{b:?}");

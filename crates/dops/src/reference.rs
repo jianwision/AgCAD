@@ -456,9 +456,12 @@ pub unsafe fn ag_dop_apply(params: *const u8, _: &LaunchConfig) {
                 let f = arena[idx];
                 let mut depth = 0i32;
                 for k in 0..count as usize { let n = &tr_n[cfg * nn + k]; if n.flags & nflags::ACTIVE != 0 { if n.kind == profile::BODY { depth += 1; } else if n.kind == profile::COMBINE { depth -= 1; } } }
+                // one mirror stage: allowed while the tape has no mirror or ends with one
+                let has = (0..count as usize).any(|k| tr_n[cfg * nn + k].kind == profile::MIRROR);
+                let ends = count > 0 && tr_n[cfg * nn + count as usize - 1].kind == profile::MIRROR;
                 if a.general_ok == 0 { st = AgStatus::UnsupportedOp.value(); }
                 else if count as usize >= nn { st = AgStatus::CapacityExceeded.value(); }
-                else if depth != 0 { st = AgStatus::InvalidParameter.value(); }
+                else if depth != 0 || (has && !ends) { st = AgStatus::InvalidParameter.value(); }
                 else {
                     let mut nd = Node { kind: profile::MIRROR, op: fop::ADD, flags: nflags::ACTIVE, src: r as u32, pref: [NO_PARAM; NVALS], val: [0.0; NVALS] };
                     nd.val[0] = if f.val[0] > 0.5 { 1.0 } else { 0.0 };
@@ -543,7 +546,9 @@ pub unsafe fn ag_dop_compile(params: *const u8, _: &LaunchConfig) {
         }
         if cnt[c] > 0 {
             let m = scan_mirror(&out[c * nn..c * nn + cnt[c] as usize]);
+            let (s0, e) = scan_stage(&out[c * nn..c * nn + cnt[c] as usize]);
             out[c * nn]._pad[0] = 0x8000_0000 | m;
+            out[c * nn]._pad[1] = s0 as u32 | (e as u32) << 16;
         }
     }
 }

@@ -26,9 +26,11 @@ impl FeatureImpl for KnowledgeOp {
             "datum.plane" | "datum.axis_system" => {
                 let mode = text(n, "mode").unwrap_or("offset");
                 let base = match arg(n, "refs") { Some(r) => frame(ctx, list(r).first().ok_or_else(|| bad("plane needs a reference"))?)?, None => Frame::WORLD };
-                let off = num_or(ctx, n, "value", 0.0)?;
+                let off = if mode == "offset" { num_or(ctx, n, "value", 0.0)? } else { 0.0 };
                 match mode {
                     "offset" => Ok(Product::Frame(Frame { origin: base.origin + base.z * off, ..base })),
+                    // parallel to the reference plane, through a point (value = [x, y, z])
+                    "through" => Ok(Product::Frame(Frame { origin: vec3(ctx, req(n, "value")?)?, ..base })),
                     _ => Err(FeatureError::new(AgStatus::UnsupportedOp, format!("datum plane mode '{mode}' not implemented yet"))),
                 }
             }

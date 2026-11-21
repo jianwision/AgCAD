@@ -161,6 +161,14 @@ pub unsafe fn ag_dop_policy(params: *const u8, _: &LaunchConfig) {
 /// Free (non-fixed) parameter j of the goal.
 fn free(g: &Goal, j: usize) -> bool { g.param_hi[j] > g.param_lo[j] }
 
+/// Parameter j searched by a CMA-ES island: a free design parameter, or the structural slot
+/// of a move the island has made (slots n_params + 3k … of move k; see `structural_slots`).
+pub fn active(g: &Goal, st: &OptState, j: usize, kn: usize) -> bool {
+    let n = g.n_params as usize;
+    if j >= kn.min(MAX_PARAMS) || !free(g, j) { return false; }
+    j < n || (j - n) / 3 < st.structs as usize
+}
+
 /// Irwin–Hall standard-normal approximation from 12 hashed uniforms (no transcendentals).
 pub fn normal12(seed: u32, gcfg: u32, idx: u32) -> f64 {
     let mut s = 0.0f64;
@@ -181,8 +189,9 @@ unsafe fn cma_sample(a: &DopsArgs, g: &Goal, cfg: usize, gcfg: u32, round: u32, 
     let pr = unsafe { sl::<f64>(a.cur_params, cn * kn) };
     let np = (g.n_params as usize).min(kn).min(MAX_PARAMS);
     let idle = unsafe { sl::<u32>(a.done, cn)[cfg] != 0 || sl::<u32>(a.budget, cn)[cfg] == 0 };
+    let _ = np;
     if idle {
-        for j in 0..MAX_PARAMS { samp[cfg * MAX_PARAMS + j] = if j < np && free(g, j) { (pr[cfg * kn + j] - g.param_lo[j]) / (g.param_hi[j] - g.param_lo[j]) } else { 0.0 }; }
+        for j in 0..MAX_PARAMS { samp[cfg * MAX_PARAMS + j] = if active(g, &st, j, kn) { (pr[cfg * kn + j] - g.param_lo[j]) / (g.param_hi[j] - g.param_lo[j]) } else { 0.0 }; }
         tscore[cfg] = unsafe { sl::<f64>(a.score, cn)[cfg] };
         return;
     }
@@ -196,7 +205,7 @@ unsafe fn cma_sample(a: &DopsArgs, g: &Goal, cfg: usize, gcfg: u32, round: u32, 
     }
     for j in 0..MAX_PARAMS {
         let mut u = 0.0;
-        if j < np && free(g, j) {
+        if active(g, &st, j, kn) {
             let z = normal12(g.seed, gcfg, round.wrapping_mul(16).wrapping_add(j as u32));
             u = st.mean[j] + st.sigma * st.diag[j].sqrt() * z;
             if u < 0.0 { u = 0.0; }
@@ -229,6 +238,12 @@ unsafe fn struct_move(a: &DopsArgs, g: &Goal, cfg: usize, gi: u32, k: u32, remov
     let two = cmds.len() >= 2 && count + 1 < nn;
     let blank = |f: &mut FeatureArgs| { f.pref = [NO_PARAM; NVALS]; f.val = [0.0; NVALS]; };
     blank(&mut arena[0]);
+    // structural parameter slots of this move (radius, x, y), when the design has them
+    let n0 = g.n_params as usize + 3 * k as usize;
+    let slot = |w: usize| -> u32 { let j = n0 + w; if j < kn.min(MAX_PARAMS) && free(g, j) { j as u32 } else { NO_PARAM } };
+    let (jr, jx, jy) = (slot(0), slot(1), slot(2));
+    // a value (offset, literal fallback) bound to slot j
+    let bind = |f: &mut FeatureArgs, i: usize, j: u32, off: f64, lit: f64| { if j != NO_PARAM { f.pref[i] = j; f.val[i] = off; } else { f.val[i] = lit; } };
     if remove {
         let kind = if two { (gi + k) % 4 } else { 0 };
         cmds[0].opcode = a.ops.pocket as u16;
@@ -236,7 +251,8 @@ unsafe fn struct_move(a: &DopsArgs, g: &Goal, cfg: usize, gi: u32, k: u32, remov
         if kind == 1 || kind == 2 {
             cmds[0].args[0] = profile::RECT;
             let (hx, hy) = if kind == 1 { (h, h) } else { (2.0 * h, 0.5 * h) };
-            f.val[0] = px - hx; f.val[1] = py - hy; f.val[2] = px + hx; f.val[3] = py + hy; f.val[4] = g.hole_z0; f.val[5] = g.hole_z1;
+            bind(f, 0, jx, -hx, px - hx); bind(f, 1, jy, -hy, py - hy); bind(f, 2, jx, hx, px + hx); bind(f, 3, jy, hy, py + hy);
+            f.val[4] = g.hole_z0; f.val[5] = g.hole_z1;
             cmds[1].opcode = a.ops.fillet as u16;
             cmds[1].args[0] = rec::LAST;
             blank(&mut arena[1]);
@@ -244,7 +260,8 @@ unsafe fn struct_move(a: &DopsArgs, g: &Goal, cfg: usize, gi: u32, k: u32, remov
             return 2;
         }
         cmds[0].args[0] = profile::CIRCLE;
-        f.val[0] = px; f.val[1] = py; f.val[4] = g.hole_z0; f.val[5] = g.hole_z1;
+        bind(f, 0, jx, 0.0, px); bind(f, 1, jy, 0.0, py);
+        f.val[4] = g.hole_z0; f.val[5] = g.hole_z1;
         if kind == 3 {
             f.val[2] = 0.5 * h;
             cmds[1].opcode = a.ops.circular_pattern as u16;
@@ -254,7 +271,7 @@ unsafe fn struct_move(a: &DopsArgs, g: &Goal, cfg: usize, gi: u32, k: u32, remov
             arena[1].val[7] = core::f64::consts::TAU;
             return 2;
         }
-        f.val[2] = h;
+        bind(f, 2, jr, 0.0, h);
         return 1;
     }
     let nodes = unsafe { sl::<Node>(a.cur_nodes, cn * nn) };
@@ -264,7 +281,8 @@ unsafe fn struct_move(a: &DopsArgs, g: &Goal, cfg: usize, gi: u32, k: u32, remov
     cmds[0].opcode = a.ops.pad as u16;
     cmds[0].args[0] = profile::CIRCLE;
     let f = &mut arena[0];
-    f.val[0] = px; f.val[1] = py; f.val[2] = h; f.val[4] = top; f.val[5] = top + h;
+    bind(f, 0, jx, 0.0, px); bind(f, 1, jy, 0.0, py); bind(f, 2, jr, 0.0, h);
+    f.val[4] = top; f.val[5] = top + h;
     1
 }
 
@@ -309,17 +327,17 @@ pub unsafe fn ag_opt_update(params: *const u8, _: &LaunchConfig) {
     let obs = unsafe { sl::<f64>(a.obs, cn * OBS) };
     let ni = cn.div_ceil(lam);
     let opt = unsafe { slm::<OptState>(a.opt, ni) };
-    let np = (g.n_params as usize).min(a.params as usize).min(MAX_PARAMS);
     for (i, st) in opt.iter_mut().enumerate() {
         let m0 = i * lam;
         let m = lam.min(cn - m0);
         let errs: Vec<f64> = (m0..m0 + m).map(|c| obs[c * OBS + ob::ERR]).collect();
-        island_update(st, &samp[m0 * MAX_PARAMS..(m0 + m) * MAX_PARAMS], &tscore[m0..m0 + m], &errs, &g, np, (a.cfg_offset as usize / lam + i) as u32, round);
+        island_update(st, &samp[m0 * MAX_PARAMS..(m0 + m) * MAX_PARAMS], &tscore[m0..m0 + m], &errs, &g, a.params as usize, (a.cfg_offset as usize / lam + i) as u32, round);
     }
 }
 
 /// One island's update (shared by the kernel and the reference test).
-pub fn island_update(st: &mut OptState, samp: &[f64], fs: &[f64], errs: &[f64], g: &Goal, np: usize, gi: u32, round: u32) {
+pub fn island_update(st: &mut OptState, samp: &[f64], fs: &[f64], errs: &[f64], g: &Goal, kn: usize, gi: u32, round: u32) {
+    let np = kn.min(MAX_PARAMS);
     let m = fs.len();
     if m == 0 { return; }
     // a structural round just happened: new structure, new baseline
@@ -341,7 +359,7 @@ pub fn island_update(st: &mut OptState, samp: &[f64], fs: &[f64], errs: &[f64], 
     if fs[order[0]] < st.best { st.best = fs[order[0]]; }
     let old = st.mean;
     for j in 0..np {
-        if !free(g, j) { continue; }
+        if !active(g, st, j, kn) { continue; }
         let mut mj = 0.0;
         let mut var = 0.0;
         for r in 0..mu {
@@ -370,13 +388,17 @@ pub fn island_update(st: &mut OptState, samp: &[f64], fs: &[f64], errs: &[f64], 
         let e = errs.get(order[0]).copied().unwrap_or(0.0);
         if e != 0.0 {
             st.pending = if e > 0.0 { 1 } else { 2 };
+            // the new move's slots start at its hashed placement and nominal radius
+            let n0 = g.n_params as usize + 3 * st.structs as usize;
+            let (ux, uy) = (unit(hash3(g.seed ^ 0x5717_0C7A, gi, 2 * st.structs)), unit(hash3(g.seed ^ 0x5717_0C7A, gi, 2 * st.structs + 1)));
+            for (w, u) in [0.5, ux, uy].into_iter().enumerate() { if n0 + w < MAX_PARAMS { st.mean[n0 + w] = u; st.diag[n0 + w] = 1.0; } }
             st.structs += 1;
             st.stall = 0;
             return;
         }
     }
     if st.sigma < 1e-3 && st.best >= 1000.0 {
-        for j in 0..np { if free(g, j) { st.mean[j] = unit(hash3(g.seed ^ 0x0CA1_5EED, gi, (round.wrapping_add(1) << 4) | j as u32)); st.diag[j] = 1.0; } }
+        for j in 0..np { if active(g, st, j, kn) { st.mean[j] = unit(hash3(g.seed ^ 0x0CA1_5EED, gi, (round.wrapping_add(1) << 4) | j as u32)); st.diag[j] = 1.0; } }
         st.sigma = 0.3;
         st.restarts += 1;
     }

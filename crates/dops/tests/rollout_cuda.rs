@@ -265,7 +265,7 @@ fn new_ops_bitwise() {
     gr.param_hi[0] = 20.0;
     gr.param_sign[0] = 1.0;
     for pol in [policy::MOCK, policy::CMAES] {
-        let c = StudioConfig { policy: pol, ..cfg(32, 8) };
+        let c = StudioConfig { policy: pol, records: 10, budget: 80, ..cfg(32, 8) };
         let (x, y) = (Studio::new(cuda.clone(), &l_bracket(), &gr, c).unwrap(), Studio::new(agcad_driver_cpu::CpuDevice::new(), &l_bracket(), &gr, c).unwrap());
         assert_eq!(x.run_host_loop().unwrap(), y.run_host_loop().unwrap());
         assert!(x.state_bytes().unwrap() == y.state_bytes().unwrap(), "policy {pol}: CUDA ≠ CPU");
@@ -305,7 +305,7 @@ fn structural_cmaes_bitwise() {
     g.param_hi[..3].copy_from_slice(&[62.0, 12.0, 6.0]);
     g.place = [-28.0, -28.0, 28.0, 28.0];
     g.hole_r = 9.0;
-    let c = StudioConfig { records: 6, nodes: 14, policy: policy::CMAES, ..cfg(64, 40) };
+    let c = StudioConfig { records: 10, nodes: 14, budget: 400, policy: policy::CMAES, ..cfg(64, 40) };
     let cuda = agcad_driver_cuda::CudaDevice::open(0).unwrap();
     let (x, y) = (Studio::new(cuda.clone(), &base, &g, c).unwrap(), Studio::new(agcad_driver_cpu::CpuDevice::new(), &base, &g, c).unwrap());
     assert_eq!(x.run_host_loop().unwrap(), y.run_host_loop().unwrap());

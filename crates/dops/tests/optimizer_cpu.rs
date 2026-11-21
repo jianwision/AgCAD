@@ -117,7 +117,7 @@ fn cmaes_changes_structure_when_parameters_cannot_reach_the_goal() {
         g
     };
     let run = |g: &Goal| {
-        let c = StudioConfig { records: 6, nodes: 14, ..cfg(64, 40, policy::CMAES) };
+        let c = StudioConfig { records: 10, nodes: 14, ..cfg(64, 40, policy::CMAES) };
         let st = Studio::new(CpuDevice::new(), &base, g, c).unwrap();
         st.run_host_loop().unwrap();
         st.results(4).unwrap()
@@ -126,9 +126,27 @@ fn cmaes_changes_structure_when_parameters_cannot_reach_the_goal() {
     eprintln!("unreachable by parameters: cmaes {}/64, cmaes + structure {}/64", plain.done, structural.done);
     assert_eq!(plain.done, 0);
     assert!(structural.done >= 16, "{}", structural.done);
+    let mut tuned = 0;
     for sv in structural.top.iter().filter(|s| s.obs[ob::MET] == 1.0) {
         assert!(sv.design.nodes.len() > 2, "structure was added");
         let v = exact(&sv.design);
         assert!(sv.obs[0] <= v && v <= sv.obs[1], "exact {v} ∉ [{}, {}]", sv.obs[0], sv.obs[1]);
+        // added features reference structural parameters (s{k}_r / _x / _y) ...
+        let refs: Vec<u32> = sv.design.nodes[2..].iter().flat_map(|n| n.pref.iter().copied()).filter(|&p| p != agcad_dops::abi::NO_PARAM && p >= 3).collect();
+        assert!(!refs.is_empty(), "structural features are parametric");
+        for &p in &refs { assert!(sv.design.names[p as usize].starts_with('s'), "{}", sv.design.names[p as usize]); }
+        // ... that CMA-ES moved away from their nominal values
+        if refs.iter().any(|&p| { let j = p as usize; let mid = 0.5 * (mk(9.0).param_lo[j] + mk(9.0).param_hi[j]); (sv.design.params[j] - mid).abs() > 1e-6 }) { tuned += 1; }
+        // lowered documents keep them as parameters and round-trip
+        let prog = agcad_dops::lower::to_program(&sv.design, 1, 0).to_string();
+        for &p in &refs { let nm = &sv.design.names[p as usize]; assert!(prog.contains(&format!("${nm}")) || prog.contains(&format!("={nm}")), "{nm} stays a parameter in the document"); }
+        let req = agcad_harness::Requirements::parse(r#"{"id":"r","rev":1,"deliver":{"body_type":"SolidBody"}}"#).unwrap();
+        let mut sess = agcad_harness::HarnessSession::new(req, "p");
+        let out = sess.run_program("main", &agcad_ir::json::decode_program(&prog, agcad_ir::Catalog::global()).unwrap(), agcad_ir::Catalog::global()).unwrap();
+        assert_eq!(out.report.status, "ACCEPTED", "{:?}", out.report.features);
+        let (r, w) = agcad_dops::lower::raise(&sess.doc.workspace("main").unwrap().state).unwrap();
+        assert!(w.is_empty(), "{w:?}");
+        assert!((exact(&r) - v).abs() / v < 1e-9);
     }
+    assert!(tuned > 0, "CMA-ES tuned the added structure");
 }

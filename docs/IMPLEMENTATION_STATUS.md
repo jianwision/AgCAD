@@ -85,6 +85,10 @@ This is the loop **LLM observes → sets a goal → GPU model plans and executes
   - **Objectives:** `satisfy`, `min_volume` and `max_volume`, subject to every constraint.
   - **Measured** at 4096 configurations with every LLM sign prior wrong: mock meets the goal in 181 / 4096, CMA-ES in 4095 / 4096 (24 rounds, 16–17k config-rounds/s).
   - **min_volume** with an 8 mm wall picks the lightest feasible disc. The mock policy remains for structural moves (new holes / pockets).
+- **Structural search:**
+  - **Mock policy:** when a parameter saturates it adds exact-path features: a hole, a rounded pocket, a slot, or a 4-hole bolt circle to remove material, or a boss on the base pad to add it.
+  - **CMA-ES islands:** an island that stays infeasible for 3 generations makes the same structural move on every member (≤ 6 per island). The move's radius and x / y are bound to spare parameter slots `s{k}_r / _x / _y` (`studio::structural_slots`), so CMA-ES tunes the added structure and the lowered documents stay parametric.
+  - **Measured:** on a goal unreachable by parameters alone, plain CMA-ES meets it in 0 / 64 configurations and structural CMA-ES in 64 / 64. Survivors are exact-sound and round-trip through std documents.
 - **Stiffness proxy** (`fea`): voxel hex8 elasticity solved by matrix-free Jacobi-PCG on the device. Fixed-shape reductions make it bit-identical CUDA ≡ CPU, and it matches `agcad_std::physics` to 1e-6. It runs on survivors.
 - **Measured** on an RTX 2000 Ada laptop GPU (`agcad bench-device`; eval is ≥ 99.9 % of each round):
 

@@ -560,6 +560,12 @@ __device__ __forceinline__ double unit01(u32 h) { return (double)(h >> 8) * (1.0
 
 // ---- CMA-ES islands (twin of reference.rs cma_sample / ag_opt_*) ----
 __device__ __forceinline__ bool param_free(const Goal& g, u32 j) { return g.param_hi[j] > g.param_lo[j]; }
+__device__ __forceinline__ bool param_active(const Goal& g, const OptState& st, u32 j, u32 kn) {
+    u32 n = g.n_params;
+    u32 lim = (kn < MAX_PARAMS) ? kn : MAX_PARAMS;
+    if (j >= lim || !param_free(g, j)) return false;
+    return j < n || (j - n) / 3u < st.structs;
+}
 __device__ double normal12(u32 seed, u32 gcfg, u32 idx) {
     double s = 0.0;
     for (u32 k = 0; k < 12u; ++k) s += unit01(hash3(seed ^ 0x51ED270Bu, gcfg, idx * 12u + k));
@@ -567,6 +573,7 @@ __device__ double normal12(u32 seed, u32 gcfg, u32 idx) {
 }
 
 __device__ __forceinline__ void fa_blank(FeatureArgs& f) { for (int jj = 0; jj < NVALS; ++jj) { f.pref[jj] = NO_PARAM; f.val[jj] = 0.0; } }
+__device__ __forceinline__ void fa_bind(FeatureArgs& f, int i, u32 j, double off, double lit) { if (j != NO_PARAM) { f.pref[i] = j; f.val[i] = off; } else { f.val[i] = lit; } }
 
 __device__ u32 struct_move(const DopsArgs* a, const Goal& g, u32 cfg, u32 gi, u32 k, bool remove, CommandRecord* cmds, FeatureArgs* arena) {
     u32 kn = a->params, nn = a->nodes, rn = a->records;
@@ -579,6 +586,11 @@ __device__ u32 struct_move(const DopsArgs* a, const Goal& g, u32 cfg, u32 gi, u3
     double h = g.hole_r;
     bool two = rn >= 2u && count + 1u < nn;
     fa_blank(arena[0]);
+    u32 n0 = g.n_params + 3u * k;
+    u32 lim = (kn < MAX_PARAMS) ? kn : MAX_PARAMS;
+    u32 jr = (n0 < lim && param_free(g, n0)) ? n0 : NO_PARAM;
+    u32 jx = (n0 + 1u < lim && param_free(g, n0 + 1u)) ? n0 + 1u : NO_PARAM;
+    u32 jy = (n0 + 2u < lim && param_free(g, n0 + 2u)) ? n0 + 2u : NO_PARAM;
     if (remove) {
         u32 kind = two ? (gi + k) % 4u : 0u;
         cmds[0].opcode = (unsigned short)a->ops.pocket;
@@ -586,14 +598,16 @@ __device__ u32 struct_move(const DopsArgs* a, const Goal& g, u32 cfg, u32 gi, u3
         if (kind == 1u || kind == 2u) {
             cmds[0].args[0] = PROFILE_RECT;
             double hx = (kind == 1u) ? h : 2.0 * h, hy = (kind == 1u) ? h : 0.5 * h;
-            f.val[0] = px - hx; f.val[1] = py - hy; f.val[2] = px + hx; f.val[3] = py + hy; f.val[4] = g.hole_z0; f.val[5] = g.hole_z1;
+            fa_bind(f, 0, jx, -hx, px - hx); fa_bind(f, 1, jy, -hy, py - hy); fa_bind(f, 2, jx, hx, px + hx); fa_bind(f, 3, jy, hy, py + hy);
+            f.val[4] = g.hole_z0; f.val[5] = g.hole_z1;
             cmds[1].opcode = (unsigned short)a->ops.fillet; cmds[1].args[0] = LAST;
             fa_blank(arena[1]);
             arena[1].val[10] = (kind == 1u) ? 0.4 * h : 0.5 * h;
             return 2u;
         }
         cmds[0].args[0] = PROFILE_CIRCLE;
-        f.val[0] = px; f.val[1] = py; f.val[4] = g.hole_z0; f.val[5] = g.hole_z1;
+        fa_bind(f, 0, jx, 0.0, px); fa_bind(f, 1, jy, 0.0, py);
+        f.val[4] = g.hole_z0; f.val[5] = g.hole_z1;
         if (kind == 3u) {
             f.val[2] = 0.5 * h;
             cmds[1].opcode = (unsigned short)a->ops.circular_pattern; cmds[1].args[0] = LAST;
@@ -602,7 +616,7 @@ __device__ u32 struct_move(const DopsArgs* a, const Goal& g, u32 cfg, u32 gi, u3
             arena[1].val[7] = TAU;
             return 2u;
         }
-        f.val[2] = h;
+        fa_bind(f, 2, jr, 0.0, h);
         return 1u;
     }
     const Node* cn_ = ag_ptr<const Node>(a->cur_nodes) + (u64)cfg * nn;
@@ -610,12 +624,13 @@ __device__ u32 struct_move(const DopsArgs* a, const Goal& g, u32 cfg, u32 gi, u3
     int bp = -1;
     for (u32 q = 0; q < count; ++q) { if (cn_[q].op == FOP_ADD && cn_[q].kind <= PROFILE_SKETCH && (cn_[q].flags & NF_ACTIVE) != 0u) { bp = (int)q; break; } }
     if (bp < 0) return 0u;
-    const Node& n0 = cn_[bp];
-    double top = n0.val[5] + ((n0.pref[5] != NO_PARAM && n0.pref[5] < kn) ? pr[n0.pref[5]] : 0.0);
+    const Node& bn = cn_[bp];
+    double top = bn.val[5] + ((bn.pref[5] != NO_PARAM && bn.pref[5] < kn) ? pr[bn.pref[5]] : 0.0);
     cmds[0].opcode = (unsigned short)a->ops.pad;
     cmds[0].args[0] = PROFILE_CIRCLE;
     FeatureArgs& f = arena[0];
-    f.val[0] = px; f.val[1] = py; f.val[2] = h; f.val[4] = top; f.val[5] = top + h;
+    fa_bind(f, 0, jx, 0.0, px); fa_bind(f, 1, jy, 0.0, py); fa_bind(f, 2, jr, 0.0, h);
+    f.val[4] = top; f.val[5] = top + h;
     return 1u;
 }
 
@@ -627,7 +642,7 @@ __device__ void cma_sample(const DopsArgs* a, const Goal& g, u32 cfg, u32 gcfg, 
     u32 np = g.n_params; if (np > kn) np = kn; if (np > MAX_PARAMS) np = MAX_PARAMS;
     bool idle = ag_ptr<const u32>(a->done)[cfg] != 0u || ag_ptr<const u32>(a->budget)[cfg] == 0u;
     if (idle) {
-        for (u32 j = 0; j < MAX_PARAMS; ++j) samp[j] = (j < np && param_free(g, j)) ? (pr[j] - g.param_lo[j]) / (g.param_hi[j] - g.param_lo[j]) : 0.0;
+        for (u32 j = 0; j < MAX_PARAMS; ++j) samp[j] = param_active(g, st, j, kn) ? (pr[j] - g.param_lo[j]) / (g.param_hi[j] - g.param_lo[j]) : 0.0;
         ag_ptr<double>(a->tscore)[cfg] = ag_ptr<const double>(a->score)[cfg];
         return;
     }
@@ -638,7 +653,7 @@ __device__ void cma_sample(const DopsArgs* a, const Goal& g, u32 cfg, u32 gcfg, 
     }
     for (u32 j = 0; j < MAX_PARAMS; ++j) {
         double u = 0.0;
-        if (j < np && param_free(g, j)) {
+        if (param_active(g, st, j, kn)) {
             double z = normal12(g.seed, gcfg, round * 16u + j);
             u = st.mean[j] + st.sigma * sqrt(st.diag[j]) * z;
             if (u < 0.0) u = 0.0;
@@ -674,7 +689,8 @@ AG_KERNEL void ag_opt_init(const DopsArgs* a) {
     }
 }
 
-__device__ void island_update(OptState& st, const double* samp, const double* fs, const double* errs, u32 m, const Goal& g, u32 np, u32 gi, u32 round) {
+__device__ void island_update(OptState& st, const double* samp, const double* fs, const double* errs, u32 m, const Goal& g, u32 kn, u32 gi, u32 round) {
+    u32 np = (kn < MAX_PARAMS) ? kn : MAX_PARAMS;
     if (m == 0u) return;
     bool was_struct = st.pending != 0u;
     st.pending = 0u;
@@ -694,7 +710,7 @@ __device__ void island_update(OptState& st, const double* samp, const double* fs
     double old[MAX_PARAMS];
     for (u32 j = 0; j < MAX_PARAMS; ++j) old[j] = st.mean[j];
     for (u32 j = 0; j < np; ++j) {
-        if (!param_free(g, j)) continue;
+        if (!param_active(g, st, j, kn)) continue;
         double mj = 0.0, var = 0.0;
         for (u32 r = 0; r < mu; ++r) {
             double w = (double)(mu - r) / wsum;
@@ -720,13 +736,16 @@ __device__ void island_update(OptState& st, const double* samp, const double* fs
         double e = errs[(u64)order[0] * OBS + 11];
         if (e != 0.0) {
             st.pending = (e > 0.0) ? 1u : 2u;
+            u32 n0 = g.n_params + 3u * st.structs;
+            double us[3] = {0.5, unit01(hash3(g.seed ^ 0x57170C7Au, gi, 2u * st.structs)), unit01(hash3(g.seed ^ 0x57170C7Au, gi, 2u * st.structs + 1u))};
+            for (u32 w = 0; w < 3u; ++w) if (n0 + w < MAX_PARAMS) { st.mean[n0 + w] = us[w]; st.diag[n0 + w] = 1.0; }
             st.structs += 1u;
             st.stall = 0u;
             return;
         }
     }
     if (st.sigma < 1e-3 && st.best >= 1000.0) {
-        for (u32 j = 0; j < np; ++j) if (param_free(g, j)) { st.mean[j] = unit01(hash3(g.seed ^ 0x0CA15EEDu, gi, ((round + 1u) << 4) | j)); st.diag[j] = 1.0; }
+        for (u32 j = 0; j < np; ++j) if (param_active(g, st, j, kn)) { st.mean[j] = unit01(hash3(g.seed ^ 0x0CA15EEDu, gi, ((round + 1u) << 4) | j)); st.diag[j] = 1.0; }
         st.sigma = 0.3;
         st.restarts += 1u;
     }
@@ -746,7 +765,7 @@ AG_KERNEL void ag_opt_update(const DopsArgs* a) {
     if (i >= ni) return;
     u32 m0 = i * lam;
     u32 m = (lam < cn - m0) ? lam : cn - m0;
-    island_update(opt[i], samp + (u64)m0 * MAX_PARAMS, ts + m0, ag_ptr<const double>(a->obs) + (u64)m0 * OBS, m, g, np, a->cfg_offset / lam + i, round);
+    island_update(opt[i], samp + (u64)m0 * MAX_PARAMS, ts + m0, ag_ptr<const double>(a->obs) + (u64)m0 * OBS, m, g, a->params, a->cfg_offset / lam + i, round);
 }
 
 // ---- policy (mock GPU model) ----

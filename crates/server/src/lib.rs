@@ -235,7 +235,8 @@ impl Server {
                     None => if free > 0 && g.hole_r <= 0.0 { 1 } else { 0 },
                 };
                 let island = args.get("island").and_then(Value::as_u64).unwrap_or(16).clamp(2, 64) as u32;
-                let records = (g.n_params + 2).max(4); // parameters + up to 2 structural records
+                // parameters (+ structural slots) + up to 2 structural records
+                let records = if pol == 1 && g.hole_r > 0.0 { 2 + agcad_dops::abi::MAX_PARAMS as u32 } else { (g.n_params + 2).max(4) };
                 let cfg = agcad_dops::StudioConfig { configs, records, max_rounds: rounds, coarse: 8, levels, cap: 4096, nodes: (design.nodes.len() as u32 + 8).max(8), budget: records * rounds, tighten: 0, max_cells: 0, policy: pol, island };
                 let prefer_cuda = match args.get("device").and_then(Value::as_str) { Some("cpu") => false, Some(_) => true, None => std::env::var("AGCAD_DEVICE").map(|v| v != "cpu").unwrap_or(true) };
                 let run = device::run(&mut self.device_cache, &design, &g, cfg, top_k, prefer_cuda)?;

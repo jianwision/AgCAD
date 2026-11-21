@@ -181,6 +181,13 @@ impl<D: KernelExt> Studio<D> {
     /// Full constructor: shard offset and stream priority (rollouts high; certification and
     /// escalation low, so they overlap without delaying rollouts).
     pub fn new_with(dev: Arc<D>, base: &Design, goal: &Goal, cfg: StudioConfig, cfg_offset: u32, priority: Priority) -> DriverResult<Self> {
+        let (padded, pgoal) = structural_slots(base, goal, cfg.policy);
+        let (base, goal) = (&padded, &pgoal);
+        if cfg.policy == policy::CMAES {
+            // one record per searched parameter, plus up to 2 for a structural move
+            let need = base.params.len().min(MAX_PARAMS) + if goal.hole_r > 0.0 { 2 } else { 0 };
+            if (cfg.records as usize) < need { return Err(EnqueueError::InvalidConfig(format!("CMA-ES needs ≥ {need} records per configuration (got {})", cfg.records)).into()); }
+        }
         let s = dev.stream(priority)?;
         let lib = dev.load_library(&dops_library())?;
         let hv = dev.load_library(&agcad_harness::wavefront::harness_library())?;
@@ -283,6 +290,8 @@ impl<D: KernelExt> Studio<D> {
     /// ≤ node capacity, same parameter count). Buffers and their addresses are kept, so a
     /// captured graph stays valid.
     pub fn reset(&mut self, base: &Design, goal: &Goal) -> DriverResult<()> {
+        let (padded, pgoal) = structural_slots(base, goal, self.cfg.policy);
+        let (base, goal) = (&padded, &pgoal);
         let (c, n) = (self.cfg.configs as usize, self.cfg.nodes as usize);
         let k = self.base.params.len().max(1);
         if base.nodes.len() > n || base.params.len().max(1) != k {
@@ -513,6 +522,27 @@ impl<D: KernelExt + ConditionalExt> GraphRollout<D> {
         st.dev.sync(&st.s)?;
         Ok(())
     }
+}
+
+/// Structural parameter slots for CMA-ES islands that may change structure: the spare
+/// parameter slots (n_params .. MAX_PARAMS) become (radius, x, y) of structural move k at
+/// slots n_params + 3k …, with ranges r ∈ [0.5 h, 1.5 h] and (x, y) in the placement region.
+/// Their features reference them, so CMA-ES tunes added structure like any parameter, and
+/// lowered documents stay parametric (names s{k}_r / s{k}_x / s{k}_y).
+pub fn structural_slots(base: &Design, goal: &Goal, pol: u32) -> (Design, Goal) {
+    let (mut d, mut g) = (base.clone(), *goal);
+    let n = base.params.len();
+    if pol != policy::CMAES || !(goal.hole_r > 0.0) || n >= MAX_PARAMS || (g.n_params as usize) != n { return (d, g); }
+    for j in n..MAX_PARAMS {
+        let (k, w) = ((j - n) / 3, (j - n) % 3);
+        let (lo, hi) = match w { 0 => (0.5 * g.hole_r, 1.5 * g.hole_r), 1 => (g.place[0], g.place[2]), _ => (g.place[1], g.place[3]) };
+        g.param_lo[j] = lo;
+        g.param_hi[j] = hi;
+        g.param_sign[j] = 0.0;
+        d.params.push(0.5 * (lo + hi));
+        d.names.push(format!("s{k}_{}", ["r", "x", "y"][w]));
+    }
+    (d, g)
 }
 
 /// Escalation step of the evidence chain (spec 14): re-evaluate one design alone with a deep,

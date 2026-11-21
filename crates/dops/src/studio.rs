@@ -53,10 +53,14 @@ pub struct StudioConfig {
     /// Interval evaluations per terminal boundary cell to tighten the rigorous volume
     /// bounds (0 = boundary cells count as [0, 1]).
     pub tighten: u32,
+    /// Global worklist budget in cells (0 = configs × cap). Memory scales with this instead of
+    /// configs × cap; when exhausted, the remaining refinements of a level become boundary
+    /// cells (still rigorous, just wider bounds), in configuration order.
+    pub max_cells: u32,
 }
 
 impl Default for StudioConfig {
-    fn default() -> Self { StudioConfig { configs: 64, nodes: 16, records: 4, max_rounds: 32, coarse: 8, levels: 5, cap: 4096, budget: 64, tighten: 0 } }
+    fn default() -> Self { StudioConfig { configs: 64, nodes: 16, records: 4, max_rounds: 32, coarse: 8, levels: 5, cap: 4096, budget: 64, tighten: 0, max_cells: 0 } }
 }
 
 /// One configuration's result after a rollout.
@@ -84,7 +88,7 @@ struct Bufs<B> {
     // ranking scratch
     rank_keys: B, rank_vals: B,
     stamps: B,
-    wl0: B, wl1: B, cls: B, flag: B, offs: B, crank: B, start: B, lvl: B,
+    wl0: B, wl1: B, cls: B, flag: B, offs: B, crank: B, start: B, lvl: B, term: B, toffs: B, tlist: B, tcount: B,
 }
 
 pub struct Studio<D: KernelExt> {
@@ -102,6 +106,7 @@ pub struct Studio<D: KernelExt> {
     a_level: [Vec<ParamUpload<D>>; 2],
     scan: agcad_kernels::primitives::ScanPlan<D>,
     scan_cls: agcad_kernels::primitives::ScanPlan<D>,
+    scan_term: agcad_kernels::primitives::ScanPlan<D>,
     a_validate: ParamUpload<D>,
     host_args: DopsArgs,
     a_stamp: Vec<ParamUpload<D>>,
@@ -130,7 +135,9 @@ impl<D: KernelExt> Studio<D> {
         let (c, n, r) = (cfg.configs as usize, cfg.nodes as usize, cfg.records as usize);
         assert!(cfg.levels >= 1 && (cfg.coarse << (cfg.levels - 1)) <= 1024, "finest resolution must be ≤ 1024 per axis");
         assert!(cfg.cap >= cfg.coarse.pow(3), "cap must hold the root grid of one configuration");
-        let capacity = c * cfg.cap as usize;
+        let full = c * cfg.cap as usize;
+        let capacity = if cfg.max_cells > 0 { full.min(cfg.max_cells as usize) } else { full };
+        assert!(capacity >= c * cfg.coarse.pow(3) as usize, "max_cells must hold the root grids of all configurations");
         let k = base.params.len().max(1);
         assert!(base.nodes.len() <= n, "base design has more features than node capacity");
         assert!(base.params.len() <= MAX_PARAMS, "at most {MAX_PARAMS} parameters");
@@ -184,6 +191,10 @@ impl<D: KernelExt> Studio<D> {
             crank: zeros(capacity * 4)?,
             start: zeros(c * 4)?,
             lvl: zeros((cfg.levels as usize + 1) * 4)?,
+            term: zeros(capacity * 4)?,
+            toffs: zeros(capacity * 4)?,
+            tlist: zeros(capacity * 4)?,
+            tcount: zeros(4)?,
         };
         let mk = |eval_trial: u32, handle: u64, level: u32| DopsArgs {
             goal: b.goal.device_ptr(), cur_nodes: b.cur_nodes.device_ptr(), cur_count: b.cur_count.device_ptr(), cur_params: b.cur_params.device_ptr(),
@@ -191,7 +202,7 @@ impl<D: KernelExt> Studio<D> {
             rev: b.rev.device_ptr(), budget: b.budget.device_ptr(), done: b.done.device_ptr(), cmds: b.cmds.device_ptr(), arena: b.arena.device_ptr(),
             status: b.status.device_ptr(), counts: b.counts.device_ptr(), domain_hit: b.domain_hit.device_ptr(), bbox: b.bbox.device_ptr(),
             obs: b.obs.device_ptr(), score: b.score.device_ptr(), trace: b.trace.device_ptr(), round: b.round.device_ptr(), active: b.active.device_ptr(), compiled: b.compiled.device_ptr(), tables: b.tables.device_ptr(),
-            wl0: b.wl0.device_ptr(), wl1: b.wl1.device_ptr(), cls: b.cls.device_ptr(), flag: b.flag.device_ptr(), offs: b.offs.device_ptr(), crank: b.crank.device_ptr(), start: b.start.device_ptr(), lvl: b.lvl.device_ptr(),
+            wl0: b.wl0.device_ptr(), wl1: b.wl1.device_ptr(), cls: b.cls.device_ptr(), flag: b.flag.device_ptr(), offs: b.offs.device_ptr(), crank: b.crank.device_ptr(), start: b.start.device_ptr(), lvl: b.lvl.device_ptr(), term: b.term.device_ptr(), toffs: b.toffs.device_ptr(), tlist: b.tlist.device_ptr(), tcount: b.tcount.device_ptr(),
             cond_handle: handle, configs: cfg.configs, nodes: cfg.nodes, params: k as u32, records: cfg.records, coarse: cfg.coarse, levels: cfg.levels,
             eval_trial, max_rounds: cfg.max_rounds, level, capacity: capacity as u32, cap: cfg.cap, cfg_offset, tighten: cfg.tighten, _pad: 0, ops: crate::registry::op_table(agcad_ir::Catalog::global()),
         };
@@ -200,12 +211,13 @@ impl<D: KernelExt> Studio<D> {
         let a_level = [(0..cfg.levels).map(|l| upload_params(d, &s, &mk(0, 0, l))).collect::<DriverResult<Vec<_>>>()?, (0..cfg.levels).map(|l| upload_params(d, &s, &mk(1, 0, l))).collect::<DriverResult<Vec<_>>>()?];
         let scan = agcad_kernels::primitives::ScanPlan::new(d, &s, &b.flag, &b.offs, capacity as u32)?;
         let scan_cls = agcad_kernels::primitives::ScanPlan::new(d, &s, &b.cls, &b.crank, capacity as u32)?;
+        let scan_term = agcad_kernels::primitives::ScanPlan::new(d, &s, &b.term, &b.toffs, capacity as u32)?;
         let a_round = upload_params(d, &s, &host_args)?;
         let a_validate = upload_params(d, &s, &agcad_harness::wavefront::ValidateParams {
             cmds: b.cmds.device_ptr(), status: b.status.device_ptr(), allow: b.allow.device_ptr(), budget: b.budget.device_ptr(), revisions: b.rev.device_ptr(), keys: b.keys.device_ptr(), n: cfg.configs * cfg.records, configs: cfg.configs,
         })?;
         let a_stamp = (0..STAGES as u32).map(|stage| upload_params(d, &s, &StampParams { stamps: b.stamps.device_ptr(), round: b.round.device_ptr(), stage, max_rounds: cfg.max_rounds })).collect::<DriverResult<Vec<_>>>()?;
-        Ok(Studio { dev, s, lib, hv, prim, cfg, base: base.clone(), b, a_observe, a_round, a_level, scan, scan_cls, a_validate, host_args, a_stamp, readback: Cell::new(0) })
+        Ok(Studio { dev, s, lib, hv, prim, cfg, base: base.clone(), b, a_observe, a_round, a_level, scan, scan_cls, scan_term, a_validate, host_args, a_stamp, readback: Cell::new(0) })
     }
 
     /// Re-initialize the rollout state in place for a new base design and goal (same shape:
@@ -253,10 +265,13 @@ impl<D: KernelExt> Studio<D> {
             d.launch(&self.s, self.lib, "ag_ad_start", &self.per_entry(), a)?;
             self.scan_cls.launch(d, &self.s, self.prim)?;
             d.launch(&self.s, self.lib, "ag_ad_resolve", &self.per_entry(), a)?;
+            self.scan.launch(d, &self.s, self.prim)?;
+            d.launch(&self.s, self.lib, "ag_ad_clip", &self.per_entry(), a)?;
+            self.scan_term.launch(d, &self.s, self.prim)?;
+            d.launch(&self.s, self.lib, "ag_ad_compact", &self.per_entry(), a)?;
+            d.launch(&self.s, self.lib, "ag_ad_fill", &self.per_entry(), a)?;
             if l + 1 < self.cfg.levels as usize {
-                self.scan.launch(d, &self.s, self.prim)?;
                 d.launch(&self.s, self.lib, "ag_ad_emit", &self.per_entry(), a)?;
-                d.launch(&self.s, self.lib, "ag_ad_total", &LaunchConfig::linear(1, 32), a)?;
             }
         }
         Ok(())
@@ -439,7 +454,7 @@ pub fn certify<D: KernelExt>(dev: Arc<D>, design: &Design, goal: &Goal, levels: 
 pub const CERTIFY_TIGHTEN: u32 = 96;
 
 pub fn certify_with<D: KernelExt>(dev: Arc<D>, design: &Design, goal: &Goal, levels: u32, cap: u32, tighten: u32) -> DriverResult<[f64; OBS]> {
-    let cfg = StudioConfig { configs: 1, nodes: design.nodes.len().max(1) as u32, records: 1, max_rounds: 1, coarse: 8, levels, cap, budget: 1, tighten };
+    let cfg = StudioConfig { configs: 1, nodes: design.nodes.len().max(1) as u32, records: 1, max_rounds: 1, coarse: 8, levels, cap, budget: 1, tighten, max_cells: 0 };
     let st = Studio::new_with(dev, design, goal, cfg, 0, Priority::Low)?;
     st.observe()?;
     let o: Vec<f64> = st.read(&st.b.obs, 0, OBS)?;

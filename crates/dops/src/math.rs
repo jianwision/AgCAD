@@ -447,3 +447,137 @@ pub fn tape_iv(nodes: &[CNode], tables: &[f32], x: Iv, y: Iv, z: Iv) -> Iv {
     }
     f
 }
+
+
+// ------------------------------------------------------------------------------------
+// Per-cell tape pruning: terms that cannot affect the field anywhere in a cell
+// ------------------------------------------------------------------------------------
+
+/// Nodes eligible for pruning (higher node indices are always evaluated).
+pub const PRUNE_NODES: usize = 32;
+
+/// Pruned tape for one cell: skipped nodes and, per node, the pattern instances still needed.
+#[derive(Clone, Copy, Debug)]
+pub struct Prune { pub skip: u32, pub inst: [u64; PRUNE_NODES] }
+
+impl Prune {
+    pub const NONE: Prune = Prune { skip: 0, inst: [u64::MAX; PRUNE_NODES] };
+    #[inline] fn skipped(&self, i: usize) -> bool { i < PRUNE_NODES && (self.skip >> i) & 1 != 0 }
+    #[inline] fn keeps(&self, i: usize, k: usize) -> bool { i >= PRUNE_NODES || k >= 64 || (self.inst[i] >> k) & 1 != 0 }
+}
+
+/// `tape_iv` over a cell that also records which terms are dominated by more than `m` (a
+/// margin above f32 rounding) everywhere in the cell: such terms cannot change any min/max
+/// at any point of the cell, so point evaluations with the pruned tape are bit-identical.
+pub fn tape_iv_prune(nodes: &[CNode], tables: &[f32], x: Iv, y: Iv, z: Iv, m: f32, pr: &mut Prune) -> Iv {
+    *pr = Prune::NONE;
+    let mut f = iv(FAR32, FAR32);
+    let mut stack = [iv(FAR32, FAR32); MAX_BODIES];
+    let mut depth = 0usize;
+    let mut ivs = [iv(FAR32, FAR32); 64];
+    for (i, c) in nodes.iter().enumerate() {
+        if c.active == 0 { continue; }
+        if c.kind == profile::SHELL { f = imax(f, sub_ic(neg(f), c.v[0])); continue; }
+        if c.kind == profile::BODY { if depth < MAX_BODIES { stack[depth] = f; depth += 1; f = iv(FAR32, FAR32); } continue; }
+        if c.kind == profile::COMBINE {
+            if depth > 0 {
+                depth -= 1;
+                let t = stack[depth];
+                f = if c.op == fop::ADD { imin(t, f) } else if c.op == fop::REMOVE { imax(t, neg(f)) } else { imax(t, f) };
+            }
+            continue;
+        }
+        let t = &tables[i * TABLE..(i + 1) * TABLE];
+        let mut tf = iv(FAR32, FAR32);
+        let cn = c.count as usize;
+        for k in 0..cn {
+            let (co, s, tx, ty) = (t[4 * k], t[4 * k + 1], t[4 * k + 2], t[4 * k + 3]);
+            let qx = sub_ic(x, tx);
+            let qy = sub_ic(y, ty);
+            let px = add(scale(qx, co), scale(qy, s));
+            let py = sub(scale(qy, co), scale(qx, s));
+            let r = prism_iv(c, t, px, py, z);
+            if k < 64 { ivs[k] = r; }
+            tf = imin(tf, r);
+        }
+        if i < PRUNE_NODES {
+            if cn > 1 && cn <= 64 {
+                let mut mask = 0u64;
+                for (k, r) in ivs.iter().enumerate().take(cn) { if !(r.lo > tf.hi + m) { mask |= 1 << k; } }
+                pr.inst[i] = mask;
+            }
+            let dominated = if c.op == fop::ADD { tf.lo > f.hi + m } else { -tf.lo < f.lo - m };
+            if dominated { pr.skip |= 1 << i; }
+        }
+        f = if c.op == fop::ADD { imin(f, tf) } else { imax(f, neg(tf)) };
+    }
+    f
+}
+
+/// `tape_sdf_c` with a cell's pruned tape (bit-identical inside that cell).
+pub fn tape_sdf_p(nodes: &[CNode], tables: &[f32], pr: &Prune, x: f32, y: f32, z: f32) -> f32 {
+    let mut f = FAR32;
+    let mut stack = [FAR32; MAX_BODIES];
+    let mut depth = 0usize;
+    for (i, c) in nodes.iter().enumerate() {
+        if c.active == 0 { continue; }
+        if c.kind == profile::SHELL { f = f.max(-f - c.v[0]); continue; }
+        if c.kind == profile::BODY { if depth < MAX_BODIES { stack[depth] = f; depth += 1; f = FAR32; } continue; }
+        if c.kind == profile::COMBINE {
+            if depth > 0 {
+                depth -= 1;
+                let t = stack[depth];
+                f = if c.op == fop::ADD { t.min(f) } else if c.op == fop::REMOVE { t.max(-f) } else { t.max(f) };
+            }
+            continue;
+        }
+        if pr.skipped(i) { continue; }
+        let t = &tables[i * TABLE..(i + 1) * TABLE];
+        let mut tf = FAR32;
+        for k in 0..c.count as usize {
+            if !pr.keeps(i, k) { continue; }
+            let (co, s, tx, ty) = (t[4 * k], t[4 * k + 1], t[4 * k + 2], t[4 * k + 3]);
+            let qx = x - tx;
+            let qy = y - ty;
+            let px = qx * co + qy * s;
+            let py = qy * co - qx * s;
+            tf = tf.min(prism_sdf_c(c, t, px, py, z));
+        }
+        f = if c.op == fop::ADD { f.min(tf) } else { f.max(-tf) };
+    }
+    f
+}
+
+/// `tape_iv` with a cell's pruned tape, for sub-boxes of that cell.
+pub fn tape_iv_p(nodes: &[CNode], tables: &[f32], pr: &Prune, x: Iv, y: Iv, z: Iv) -> Iv {
+    let mut f = iv(FAR32, FAR32);
+    let mut stack = [iv(FAR32, FAR32); MAX_BODIES];
+    let mut depth = 0usize;
+    for (i, c) in nodes.iter().enumerate() {
+        if c.active == 0 { continue; }
+        if c.kind == profile::SHELL { f = imax(f, sub_ic(neg(f), c.v[0])); continue; }
+        if c.kind == profile::BODY { if depth < MAX_BODIES { stack[depth] = f; depth += 1; f = iv(FAR32, FAR32); } continue; }
+        if c.kind == profile::COMBINE {
+            if depth > 0 {
+                depth -= 1;
+                let t = stack[depth];
+                f = if c.op == fop::ADD { imin(t, f) } else if c.op == fop::REMOVE { imax(t, neg(f)) } else { imax(t, f) };
+            }
+            continue;
+        }
+        if pr.skipped(i) { continue; }
+        let t = &tables[i * TABLE..(i + 1) * TABLE];
+        let mut tf = iv(FAR32, FAR32);
+        for k in 0..c.count as usize {
+            if !pr.keeps(i, k) { continue; }
+            let (co, s, tx, ty) = (t[4 * k], t[4 * k + 1], t[4 * k + 2], t[4 * k + 3]);
+            let qx = sub_ic(x, tx);
+            let qy = sub_ic(y, ty);
+            let px = add(scale(qx, co), scale(qy, s));
+            let py = sub(scale(qy, co), scale(qx, s));
+            tf = imin(tf, prism_iv(c, t, px, py, z));
+        }
+        f = if c.op == fop::ADD { imin(f, tf) } else { imax(f, neg(tf)) };
+    }
+    f
+}

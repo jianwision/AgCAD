@@ -225,7 +225,7 @@ impl Server {
                 let res = args.get("resolution").and_then(Value::as_u64).unwrap_or(128).clamp(8, 1024) as u32;
                 let levels = 1 + (res / 8).max(1).ilog2();
                 let top_k = args.get("top_k").and_then(Value::as_u64).unwrap_or(4).clamp(1, 64) as usize;
-                let cfg = agcad_dops::StudioConfig { configs, records: 4, max_rounds: rounds, coarse: 8, levels, cap: 4096, nodes: (design.nodes.len() as u32 + 8).max(8), budget: 4 * rounds, tighten: 0 };
+                let cfg = agcad_dops::StudioConfig { configs, records: 4, max_rounds: rounds, coarse: 8, levels, cap: 4096, nodes: (design.nodes.len() as u32 + 8).max(8), budget: 4 * rounds, tighten: 0, max_cells: 0 };
                 let prefer_cuda = match args.get("device").and_then(Value::as_str) { Some("cpu") => false, Some(_) => true, None => std::env::var("AGCAD_DEVICE").map(|v| v != "cpu").unwrap_or(true) };
                 let run = device::run(&mut self.device_cache, &design, &g, cfg, top_k, prefer_cuda)?;
                 let mut out = device::summarize(&run, &names);

@@ -68,7 +68,7 @@ struct OpTable { u32 update, parameter, pad, pocket, hole, circular_pattern, dea
 struct DopsArgs {
     u64 goal, cur_nodes, cur_count, cur_params, tr_nodes, tr_count, tr_params, rev, budget, done,
         cmds, arena, status, counts, domain_hit, bbox, obs, score, trace, round, active, compiled, tables,
-        wl0, wl1, cls, flag, offs, crank, start, lvl, cond_handle;
+        wl0, wl1, cls, flag, offs, crank, start, lvl, term, toffs, tlist, tcount, cond_handle;
     u32 configs, nodes, params, records, coarse, levels, eval_trial, max_rounds, level, capacity, cap, cfg_offset, tighten, _pad;
     OpTable ops;
 };
@@ -679,6 +679,117 @@ __device__ Iv tape_iv(const CNode* nodes, u32 count, const float* tables, Iv x, 
     return f;
 }
 
+// ---- per-cell tape pruning (twin of math.rs Prune) ----
+#define PRUNE_NODES 32u
+struct Prune { u32 skip; u64 inst[PRUNE_NODES]; };
+__device__ __forceinline__ void prune_none(Prune& p) { p.skip = 0u; for (u32 i = 0; i < PRUNE_NODES; ++i) p.inst[i] = 0xFFFFFFFFFFFFFFFFull; }
+__device__ __forceinline__ bool pr_skipped(const Prune& p, u32 i) { return i < PRUNE_NODES && ((p.skip >> i) & 1u) != 0u; }
+__device__ __forceinline__ bool pr_keeps(const Prune& p, u32 i, u32 k) { return i >= PRUNE_NODES || k >= 64u || ((p.inst[i] >> k) & 1ull) != 0ull; }
+
+__device__ __forceinline__ Iv inst_iv(const CNode& c, const float* t, u32 k, Iv x, Iv y, Iv z) {
+    float co = t[4 * k], s = t[4 * k + 1], tx = t[4 * k + 2], ty = t[4 * k + 3];
+    Iv qx = iv_sub_ic(x, tx);
+    Iv qy = iv_sub_ic(y, ty);
+    Iv px = iv_add(iv_scale(qx, co), iv_scale(qy, s));
+    Iv py = iv_sub(iv_scale(qy, co), iv_scale(qx, s));
+    return prism_iv(c, t, px, py, z);
+}
+
+__device__ Iv tape_iv_prune(const CNode* nodes, u32 count, const float* tables, Iv x, Iv y, Iv z, float m, Prune& pr) {
+    prune_none(pr);
+    Iv f = mkiv(FAR32, FAR32);
+    Iv stack[MAX_BODIES];
+    int depth = 0;
+    for (u32 i = 0; i < count; ++i) {
+        const CNode& c = nodes[i];
+        if (c.active == 0u) continue;
+        if (c.kind == PROFILE_SHELL) { f = iv_max(f, iv_sub_ic(iv_neg(f), c.v[0])); continue; }
+        if (c.kind == PROFILE_BODY) { if (depth < MAX_BODIES) { stack[depth] = f; depth += 1; f = mkiv(FAR32, FAR32); } continue; }
+        if (c.kind == PROFILE_COMBINE) {
+            if (depth > 0) {
+                depth -= 1;
+                Iv t = stack[depth];
+                f = (c.op == FOP_ADD) ? iv_min(t, f) : ((c.op == FOP_REMOVE) ? iv_max(t, iv_neg(f)) : iv_max(t, f));
+            }
+            continue;
+        }
+        const float* t = tables + (u64)i * TABLE;
+        Iv tf = mkiv(FAR32, FAR32);
+        for (u32 k = 0; k < c.count; ++k) tf = iv_min(tf, inst_iv(c, t, k, x, y, z));
+        if (i < PRUNE_NODES) {
+            if (c.count > 1u && c.count <= 64u) {
+                u64 mask = 0ull;
+                for (u32 k = 0; k < c.count; ++k) { Iv r = inst_iv(c, t, k, x, y, z); if (!(r.lo > tf.hi + m)) mask |= 1ull << k; }
+                pr.inst[i] = mask;
+            }
+            bool dominated = (c.op == FOP_ADD) ? (tf.lo > f.hi + m) : (-tf.lo < f.lo - m);
+            if (dominated) pr.skip |= 1u << i;
+        }
+        f = (c.op == FOP_ADD) ? iv_min(f, tf) : iv_max(f, iv_neg(tf));
+    }
+    return f;
+}
+
+__device__ float tape_sdf_p(const CNode* nodes, u32 count, const float* tables, const Prune& pr, float x, float y, float z) {
+    float f = FAR32;
+    float stack[MAX_BODIES];
+    int depth = 0;
+    for (u32 i = 0; i < count; ++i) {
+        const CNode& c = nodes[i];
+        if (c.active == 0u) continue;
+        if (c.kind == PROFILE_SHELL) { f = fmaxx(f, -f - c.v[0]); continue; }
+        if (c.kind == PROFILE_BODY) { if (depth < MAX_BODIES) { stack[depth] = f; depth += 1; f = FAR32; } continue; }
+        if (c.kind == PROFILE_COMBINE) {
+            if (depth > 0) {
+                depth -= 1;
+                float t = stack[depth];
+                f = (c.op == FOP_ADD) ? fminn(t, f) : ((c.op == FOP_REMOVE) ? fmaxx(t, -f) : fmaxx(t, f));
+            }
+            continue;
+        }
+        if (pr_skipped(pr, i)) continue;
+        const float* t = tables + (u64)i * TABLE;
+        float tf = FAR32;
+        for (u32 k = 0; k < c.count; ++k) {
+            if (!pr_keeps(pr, i, k)) continue;
+            float co = t[4 * k], s = t[4 * k + 1], tx = t[4 * k + 2], ty = t[4 * k + 3];
+            float qx = x - tx;
+            float qy = y - ty;
+            float px = qx * co + qy * s;
+            float py = qy * co - qx * s;
+            tf = fminn(tf, prism_sdf_c(c, t, px, py, z));
+        }
+        f = (c.op == FOP_ADD) ? fminn(f, tf) : fmaxx(f, -tf);
+    }
+    return f;
+}
+
+__device__ Iv tape_iv_p(const CNode* nodes, u32 count, const float* tables, const Prune& pr, Iv x, Iv y, Iv z) {
+    Iv f = mkiv(FAR32, FAR32);
+    Iv stack[MAX_BODIES];
+    int depth = 0;
+    for (u32 i = 0; i < count; ++i) {
+        const CNode& c = nodes[i];
+        if (c.active == 0u) continue;
+        if (c.kind == PROFILE_SHELL) { f = iv_max(f, iv_sub_ic(iv_neg(f), c.v[0])); continue; }
+        if (c.kind == PROFILE_BODY) { if (depth < MAX_BODIES) { stack[depth] = f; depth += 1; f = mkiv(FAR32, FAR32); } continue; }
+        if (c.kind == PROFILE_COMBINE) {
+            if (depth > 0) {
+                depth -= 1;
+                Iv t = stack[depth];
+                f = (c.op == FOP_ADD) ? iv_min(t, f) : ((c.op == FOP_REMOVE) ? iv_max(t, iv_neg(f)) : iv_max(t, f));
+            }
+            continue;
+        }
+        if (pr_skipped(pr, i)) continue;
+        const float* t = tables + (u64)i * TABLE;
+        Iv tf = mkiv(FAR32, FAR32);
+        for (u32 k = 0; k < c.count; ++k) { if (pr_keeps(pr, i, k)) tf = iv_min(tf, inst_iv(c, t, k, x, y, z)); }
+        f = (c.op == FOP_ADD) ? iv_min(f, tf) : iv_max(f, iv_neg(tf));
+    }
+    return f;
+}
+
 // ---- adaptive evaluation (twin of reference.rs ag_ad_*) ----
 struct Grid { double lo[3], size[3], fine[3], eps; u32 r[3], levels; };
 
@@ -707,17 +818,22 @@ __device__ void cell_box(const Grid& gr, u32 level, u32 ix, u32 iy, u32 iz, Iv* 
 
 struct Surface { float f, g[3], gl, w; };
 
-__device__ Surface surface(const CNode* nodes, u32 cnt, const float* tabs, float x, float y, float z, const float* d) {
+__device__ Surface surface_p(const CNode* nodes, u32 cnt, const float* tabs, const Prune& pr, float x, float y, float z, const float* d) {
     Surface s;
-    s.f = tape_sdf_c(nodes, cnt, tabs, x, y, z);
+    s.f = tape_sdf_p(nodes, cnt, tabs, pr, x, y, z);
     float h = 0.25f * fminn(fminn(d[0], d[1]), d[2]);
-    float gx = tape_sdf_c(nodes, cnt, tabs, x + h, y, z) - tape_sdf_c(nodes, cnt, tabs, x - h, y, z);
-    float gy = tape_sdf_c(nodes, cnt, tabs, x, y + h, z) - tape_sdf_c(nodes, cnt, tabs, x, y - h, z);
-    float gz = tape_sdf_c(nodes, cnt, tabs, x, y, z + h) - tape_sdf_c(nodes, cnt, tabs, x, y, z - h);
+    float gx = tape_sdf_p(nodes, cnt, tabs, pr, x + h, y, z) - tape_sdf_p(nodes, cnt, tabs, pr, x - h, y, z);
+    float gy = tape_sdf_p(nodes, cnt, tabs, pr, x, y + h, z) - tape_sdf_p(nodes, cnt, tabs, pr, x, y - h, z);
+    float gz = tape_sdf_p(nodes, cnt, tabs, pr, x, y, z + h) - tape_sdf_p(nodes, cnt, tabs, pr, x, y, z - h);
     s.g[0] = gx; s.g[1] = gy; s.g[2] = gz;
     s.gl = sqrtf(gx * gx + gy * gy + gz * gz);
     s.w = (s.gl > 1e-30f) ? (fabsf(gx) * d[0] + fabsf(gy) * d[1] + fabsf(gz) * d[2]) / s.gl : 0.0f;
     return s;
+}
+
+__device__ Surface surface(const CNode* nodes, u32 cnt, const float* tabs, float x, float y, float z, const float* d) {
+    Prune pr; prune_none(pr);
+    return surface_p(nodes, cnt, tabs, pr, x, y, z, d);
 }
 
 __device__ u64 fill_of(const Surface& s) {
@@ -753,6 +869,7 @@ __device__ Probe probe(const CNode* nodes, u32 cnt, const float* tabs, const Goa
     if (!(s.gl > 1e-30f) || !(fabsf(s.f) < 0.5f * s.w)) return pr;
     pr.area = d[0] * d[1] * d[2] / s.w;
     float n[3] = {s.g[0] / s.gl, s.g[1] / s.gl, s.g[2] / s.gl};
+    if (!(goal.min_wall > 0.0) && !(goal.min_gap > 0.0) && goal.machining_3ax == 0u) return pr;
     float p[3] = {c[0] - n[0] * s.f, c[1] - n[1] * s.f, c[2] - n[2] * s.f};
     float dm = fminn(fminn(d[0], d[1]), d[2]);
     float hmin = 0.1f * dm;
@@ -782,7 +899,7 @@ __device__ Probe probe(const CNode* nodes, u32 cnt, const float* tabs, const Goa
     return pr;
 }
 
-__device__ void tighten_cell(const CNode* nodes, u32 cnt, const float* tabs, const Iv* b, const float* g, float e, u32 budget, u64* olo, u64* ohi) {
+__device__ void tighten_cell(const CNode* nodes, u32 cnt, const float* tabs, const Prune& pr, const Iv* b, const float* g, float e, u32 budget, u64* olo, u64* ohi) {
     u64 full = 1ull << TQ;
     *olo = 0ull; *ohi = full;
     if (budget < 2u) return;
@@ -812,7 +929,7 @@ __device__ void tighten_cell(const CNode* nodes, u32 cnt, const float* tabs, con
             Iv c[3] = {pb[0], pb[1], pb[2]};
             if (half == 0) c[ax].hi = mid; else c[ax].lo = mid;
             evals += 1u;
-            Iv r = tape_iv(nodes, cnt, tabs, c[0], c[1], c[2]);
+            Iv r = tape_iv_p(nodes, cnt, tabs, pr, c[0], c[1], c[2]);
             if (r.lo - e > 0.0f) continue;
             double v = (double)(c[0].hi - c[0].lo) * (double)(c[1].hi - c[1].lo) * (double)(c[2].hi - c[2].lo) / cv * (double)full;
             if (r.hi + e < 0.0f) { lo += (u64)floor(v); hi += (u64)ceil(v); continue; }
@@ -825,28 +942,7 @@ __device__ void tighten_cell(const CNode* nodes, u32 cnt, const float* tabs, con
     *olo = lo; *ohi = (hi < full) ? hi : full;
 }
 
-__device__ void acc_moments(u64* cc, u32 ix, u32 iy, u32 iz, u32 sh, u64 q20) {
-    u64 w = 1ull << (3u * sh);
-    u64 q6 = q20 >> 14;
-    u64 ss = 4ull << (2u * sh);
-    u32 idx[3] = {ix, iy, iz};
-    for (int k = 0; k < 3; ++k) {
-        u64 c2 = ((u64)(2u * idx[k] + 1u)) << sh;
-        atomicAdd((unsigned long long*)&cc[C_M1 + k], (unsigned long long)(q20 * w * c2));
-        atomicAdd((unsigned long long*)&cc[C_M2 + k], (unsigned long long)(q6 * w * (12ull * c2 * c2 + ss)));
-    }
-    atomicAdd((unsigned long long*)&cc[C_V6], (unsigned long long)(q6 * w));
-}
 
-__device__ void acc_probe(u64* cc, const Probe& p) {
-    u64 aq = qarea(p.area);
-    if (aq != 0ull) atomicAdd((unsigned long long*)&cc[C_AREA], (unsigned long long)aq);
-    if (p.thin) atomicAdd((unsigned long long*)&cc[C_THIN], (unsigned long long)aq);
-    if (p.narrow) atomicAdd((unsigned long long*)&cc[C_GAP], (unsigned long long)aq);
-    if (p.undercut) atomicAdd((unsigned long long*)&cc[C_UNDERCUT], (unsigned long long)aq);
-    if (p.wall < FAR32) atomicMin((unsigned long long*)&cc[C_MIN_WALL], (unsigned long long)__float_as_uint(p.wall));
-    if (p.gap < FAR32) atomicMin((unsigned long long*)&cc[C_MIN_GAP], (unsigned long long)__float_as_uint(p.gap));
-}
 
 __device__ __forceinline__ u64 enc(u32 cfg, u32 ix, u32 iy, u32 iz) { return ((u64)cfg << 32) | ((u64)ix << 20) | ((u64)iy << 10) | (u64)iz; }
 
@@ -866,11 +962,84 @@ __device__ bool border_hit(const Grid& gr, const CNode* nodes, u32 cnt, const fl
     return false;
 }
 
-__device__ void acc_bbox(u32* bb, const u32* lo, u32 n, bool inside) {
+
+// Per-thread accumulator contributions, flushed with warp aggregation: when the full warp
+// works on one configuration (worklists are sorted by configuration), integer butterfly
+// reductions and one atomic per slot; otherwise per-lane atomics. Integer sums and min/max
+// are associative, so the result is identical either way (and to the CPU reference).
+struct Contrib { u64 v[CS]; u32 bb[12]; u32 dom; bool has; };
+__device__ __forceinline__ void contrib_init(Contrib& c) {
+    for (int j = 0; j < CS; ++j) c.v[j] = 0ull;
+    c.v[C_MIN_WALL] = 0xFFFFFFFFFFFFFFFFull; c.v[C_MIN_GAP] = 0xFFFFFFFFFFFFFFFFull;
+    for (int k = 0; k < 3; ++k) { c.bb[k] = 0xFFFFFFFFu; c.bb[3 + k] = 0u; c.bb[6 + k] = 0xFFFFFFFFu; c.bb[9 + k] = 0u; }
+    c.dom = 0u;
+    c.has = false;
+}
+__device__ __forceinline__ void contrib_bbox(Contrib& c, const u32* lo, u32 n, bool inside) {
     for (int k = 0; k < 3; ++k) {
-        if (inside) { atomicMin(bb + k, lo[k]); atomicMax(bb + 3 + k, lo[k] + n); }
-        atomicMin(bb + 6 + k, lo[k]); atomicMax(bb + 9 + k, lo[k] + n);
+        if (inside) { c.bb[k] = min(c.bb[k], lo[k]); c.bb[3 + k] = max(c.bb[3 + k], lo[k] + n); }
+        c.bb[6 + k] = min(c.bb[6 + k], lo[k]); c.bb[9 + k] = max(c.bb[9 + k], lo[k] + n);
     }
+}
+__device__ __forceinline__ bool is_min_slot(int j) { return j == C_MIN_WALL || j == C_MIN_GAP; }
+__device__ void contrib_flush(const DopsArgs* a, u32 cfg, Contrib& c) {
+    u64* cc = ag_ptr<u64>(a->counts) + (u64)CS * cfg;
+    u32* bb = ag_ptr<u32>(a->bbox) + 12u * cfg;
+    unsigned act = __activemask();
+    if (__ballot_sync(act, c.has) == 0u) return; // nothing to add in this warp
+    unsigned grp = __match_any_sync(act, cfg);
+    if (act == 0xFFFFFFFFu && grp == act) {
+        // (lanes without contributions hold identities)
+        for (int j = 0; j < CS; ++j) {
+            u64 x = c.v[j];
+            for (int o = 16; o > 0; o >>= 1) { u64 y = __shfl_xor_sync(0xFFFFFFFFu, x, o); x = is_min_slot(j) ? (y < x ? y : x) : x + y; }
+            c.v[j] = x;
+        }
+        for (int k = 0; k < 12; ++k) {
+            u32 x = c.bb[k];
+            bool mx = (k % 6) >= 3;
+            for (int o = 16; o > 0; o >>= 1) { u32 y = __shfl_xor_sync(0xFFFFFFFFu, x, o); x = mx ? max(x, y) : min(x, y); }
+            c.bb[k] = x;
+        }
+        u32 d = __reduce_or_sync(0xFFFFFFFFu, c.dom);
+        if ((threadIdx.x & 31u) != 0u) return;
+        c.dom = d;
+        c.has = true; // lane 0 carries the warp's totals
+    }
+    if (!c.has) return;
+    for (int j = 0; j < CS; ++j) {
+        if (is_min_slot(j)) { if (c.v[j] != 0xFFFFFFFFFFFFFFFFull) atomicMin((unsigned long long*)&cc[j], (unsigned long long)c.v[j]); }
+        else if (c.v[j] != 0ull) atomicAdd((unsigned long long*)&cc[j], (unsigned long long)c.v[j]);
+    }
+    for (int k = 0; k < 12; ++k) {
+        bool mx = (k % 6) >= 3;
+        if (mx) { if (c.bb[k] != 0u) atomicMax(bb + k, c.bb[k]); }
+        else if (c.bb[k] != 0xFFFFFFFFu) atomicMin(bb + k, c.bb[k]);
+    }
+    if (c.dom != 0u) atomicExch(ag_ptr<u32>(a->domain_hit) + cfg, 1u);
+}
+
+__device__ void contrib_moments(Contrib& ct, u32 ix, u32 iy, u32 iz, u32 sh, u64 q20) {
+    u64 w = 1ull << (3u * sh);
+    u64 q6 = q20 >> 14;
+    u64 ss = 4ull << (2u * sh);
+    u32 idx[3] = {ix, iy, iz};
+    for (int k = 0; k < 3; ++k) {
+        u64 c2 = ((u64)(2u * idx[k] + 1u)) << sh;
+        ct.v[C_M1 + k] += q20 * w * c2;
+        ct.v[C_M2 + k] += q6 * w * (12ull * c2 * c2 + ss);
+    }
+    ct.v[C_V6] += q6 * w;
+}
+
+__device__ void contrib_probe(Contrib& ct, const Probe& p) {
+    u64 aq = qarea(p.area);
+    ct.v[C_AREA] += aq;
+    if (p.thin) ct.v[C_THIN] += aq;
+    if (p.narrow) ct.v[C_GAP] += aq;
+    if (p.undercut) ct.v[C_UNDERCUT] += aq;
+    if (p.wall < FAR32) { u64 b = (u64)__float_as_uint(p.wall); if (b < ct.v[C_MIN_WALL]) ct.v[C_MIN_WALL] = b; }
+    if (p.gap < FAR32) { u64 b = (u64)__float_as_uint(p.gap); if (b < ct.v[C_MIN_GAP]) ct.v[C_MIN_GAP] = b; }
 }
 
 #define GRID_STRIDE(i, n) for (u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x; i < (u64)(n); i += (u64)gridDim.x * blockDim.x)
@@ -888,7 +1057,7 @@ AG_KERNEL void ag_ad_seed(const DopsArgs* a) {
     if (blockIdx.x == 0 && threadIdx.x == 0) ag_ptr<u32>(a->lvl)[0] = (u32)n;
 }
 
-AG_KERNEL void ag_ad_classify(const DopsArgs* a) {
+AG_KERNEL __launch_bounds__(256, 3) void ag_ad_classify(const DopsArgs* a) {
     u32 nn = a->nodes;
     const u32* cnt = ag_ptr<const u32>(a->eval_trial ? a->tr_count : a->cur_count);
     const CNode* cnodes = ag_ptr<const CNode>(a->compiled);
@@ -900,7 +1069,6 @@ AG_KERNEL void ag_ad_classify(const DopsArgs* a) {
     u32 n = ag_ptr<const u32>(a->lvl)[l];
     const u64* wl = ag_ptr<const u64>((l % 2u == 0u) ? a->wl0 : a->wl1);
     u32* cls = ag_ptr<u32>(a->cls);
-    u64* counts = ag_ptr<u64>(a->counts);
     u32 sh = a->levels - 1u - l;
     float e = (float)gr.eps;
     GRID_STRIDE(j, a->capacity) { if (j >= (u64)n) cls[j] = 0u; }
@@ -908,28 +1076,79 @@ AG_KERNEL void ag_ad_classify(const DopsArgs* a) {
         u64 en = wl[i];
         u32 cfg = (u32)(en >> 32), ix = (u32)((en >> 20) & 1023u), iy = (u32)((en >> 10) & 1023u), iz = (u32)(en & 1023u);
         cls[i] = 0u;
-        if (a->eval_trial != 0u && done[cfg] != 0u) continue;
-        const CNode* tape = cnodes + (u64)cfg * nn;
-        const float* tb = tabs + (u64)cfg * nn * TABLE;
-        u32 c = cnt[cfg];
-        Iv b[3];
-        cell_box(gr, l, ix, iy, iz, b);
-        Iv r = tape_iv(tape, c, tb, b[0], b[1], b[2]);
-        if (r.lo - e > 0.0f) continue;
-        if (r.hi + e < 0.0f) {
-            atomicAdd((unsigned long long*)&counts[CS * cfg], (unsigned long long)(1ull << (3u * sh)));
-            acc_moments(counts + (u64)CS * cfg, ix, iy, iz, sh, 1ull << 20);
-            u32 lo[3] = {ix << sh, iy << sh, iz << sh};
-            acc_bbox(ag_ptr<u32>(a->bbox) + 12u * cfg, lo, 1u << sh, true);
-            u32 idx[3] = {ix, iy, iz};
-            if (border_hit(gr, tape, c, tb, l, idx, b, true)) atomicExch(ag_ptr<u32>(a->domain_hit) + cfg, 1u);
-            continue;
+        Contrib ct;
+        contrib_init(ct);
+        if (!(a->eval_trial != 0u && done[cfg] != 0u)) {
+            const CNode* tape = cnodes + (u64)cfg * nn;
+            const float* tb = tabs + (u64)cfg * nn * TABLE;
+            u32 c = cnt[cfg];
+            Iv b[3];
+            cell_box(gr, l, ix, iy, iz, b);
+            Iv r = tape_iv(tape, c, tb, b[0], b[1], b[2]);
+            if (!(r.lo - e > 0.0f)) {
+                if (r.hi + e < 0.0f) {
+                    ct.has = true;
+                    ct.v[C_INSIDE] = 1ull << (3u * sh);
+                    contrib_moments(ct, ix, iy, iz, sh, 1ull << 20);
+                    u32 lo[3] = {ix << sh, iy << sh, iz << sh};
+                    contrib_bbox(ct, lo, 1u << sh, true);
+                    u32 idx[3] = {ix, iy, iz};
+                    if (border_hit(gr, tape, c, tb, l, idx, b, true)) ct.dom = 1u;
+                } else {
+                    cls[i] = 1u;
+                }
+            }
         }
-        cls[i] = 1u;
+        contrib_flush(a, cfg, ct);
     }
 }
 
 AG_KERNEL void ag_ad_resolve(const DopsArgs* a) {
+    u32 l = a->level;
+    u32 n = ag_ptr<const u32>(a->lvl)[l];
+    const u64* wl = ag_ptr<const u64>((l % 2u == 0u) ? a->wl0 : a->wl1);
+    const u32* cls = ag_ptr<const u32>(a->cls);
+    u32* flag = ag_ptr<u32>(a->flag);
+    u32* term = ag_ptr<u32>(a->term);
+    const u32* crank = ag_ptr<const u32>(a->crank);
+    const u32* start = ag_ptr<const u32>(a->start);
+    GRID_STRIDE(i, a->capacity) {
+        u32 f = 0u, t = 0u;
+        if (i < (u64)n && cls[i] == 1u) {
+            u32 cfg = (u32)(wl[i] >> 32);
+            u32 rank = crank[i] - crank[start[cfg]];
+            if (l + 1u < a->levels && ((u64)rank + 1ull) * 8ull <= (u64)a->cap) f = 1u; else t = 1u;
+        }
+        flag[i] = f;
+        term[i] = t;
+    }
+}
+
+AG_KERNEL void ag_ad_clip(const DopsArgs* a) {
+    u32 cap = a->capacity;
+    u32* flag = ag_ptr<u32>(a->flag);
+    u32* term = ag_ptr<u32>(a->term);
+    const u32* offs = ag_ptr<const u32>(a->offs);
+    u32 keep = cap / 8u;
+    GRID_STRIDE(i, cap) {
+        u32 f = flag[i];
+        if (i == (u64)cap - 1ull) { u32 total = offs[i] + f; ag_ptr<u32>(a->lvl)[a->level + 1u] = ((total < keep) ? total : keep) * 8u; }
+        if (f != 0u && offs[i] >= keep) { flag[i] = 0u; term[i] = 1u; }
+    }
+}
+
+AG_KERNEL void ag_ad_compact(const DopsArgs* a) {
+    u32 cap = a->capacity;
+    const u32* term = ag_ptr<const u32>(a->term);
+    const u32* toffs = ag_ptr<const u32>(a->toffs);
+    u32* tlist = ag_ptr<u32>(a->tlist);
+    GRID_STRIDE(i, cap) {
+        if (term[i] != 0u) tlist[toffs[i]] = (u32)i;
+        if (i == (u64)cap - 1ull) ag_ptr<u32>(a->tcount)[0] = toffs[i] + term[i];
+    }
+}
+
+AG_KERNEL __launch_bounds__(256, 3) void ag_ad_fill(const DopsArgs* a) {
     u32 nn = a->nodes;
     const u32* cnt = ag_ptr<const u32>(a->eval_trial ? a->tr_count : a->cur_count);
     const CNode* cnodes = ag_ptr<const CNode>(a->compiled);
@@ -939,45 +1158,48 @@ AG_KERNEL void ag_ad_resolve(const DopsArgs* a) {
     u32 l = a->level;
     u32 n = ag_ptr<const u32>(a->lvl)[l];
     const u64* wl = ag_ptr<const u64>((l % 2u == 0u) ? a->wl0 : a->wl1);
-    const u32* cls = ag_ptr<const u32>(a->cls);
-    u32* flag = ag_ptr<u32>(a->flag);
-    const u32* crank = ag_ptr<const u32>(a->crank);
-    const u32* start = ag_ptr<const u32>(a->start);
-    u64* counts = ag_ptr<u64>(a->counts);
+    const u32* tlist = ag_ptr<const u32>(a->tlist);
+    u32 tn = ag_ptr<const u32>(a->tcount)[0];
     u32 sh = a->levels - 1u - l;
-    GRID_STRIDE(i, a->capacity) {
-        flag[i] = 0u;
-        if (i >= (u64)n || cls[i] != 1u) continue;
-        u64 en = wl[i];
+    (void)n;
+    GRID_STRIDE(j, tn) {
+        u64 en = wl[tlist[j]];
         u32 cfg = (u32)(en >> 32), ix = (u32)((en >> 20) & 1023u), iy = (u32)((en >> 10) & 1023u), iz = (u32)(en & 1023u);
-        u32 rank = crank[i] - crank[start[cfg]];
-        if (l + 1u < a->levels && ((u64)rank + 1ull) * 8ull <= (u64)a->cap) { flag[i] = 1u; continue; }
-        const CNode* tape = cnodes + (u64)cfg * nn;
-        const float* tb = tabs + (u64)cfg * nn * TABLE;
-        u32 c = cnt[cfg];
-        Iv b[3];
-        cell_box(gr, l, ix, iy, iz, b);
-        u64 w = 1ull << (3u * sh);
-        u64* cc = counts + (u64)CS * cfg;
-        atomicAdd((unsigned long long*)&cc[C_BOUNDARY], (unsigned long long)w);
-        float d[3] = {b[0].hi - b[0].lo, b[1].hi - b[1].lo, b[2].hi - b[2].lo};
-        float cxyz[3] = {0.5f * (b[0].lo + b[0].hi), 0.5f * (b[1].lo + b[1].hi), 0.5f * (b[2].lo + b[2].hi)};
-        Surface sf = surface(tape, c, tb, cxyz[0], cxyz[1], cxyz[2], d);
-        u64 tlo, thi;
-        tighten_cell(tape, c, tb, b, sf.g, (float)gr.eps, a->tighten, &tlo, &thi);
-        atomicAdd((unsigned long long*)&cc[C_BLO], (unsigned long long)(tlo * w));
-        atomicAdd((unsigned long long*)&cc[C_BHI], (unsigned long long)(thi * w));
-        u64 fq = fill_of(sf);
-        if (fq < (tlo >> 4)) fq = tlo >> 4;
-        if (fq > ((thi + 15ull) >> 4)) fq = (thi + 15ull) >> 4;
-        atomicAdd((unsigned long long*)&cc[C_FILL], (unsigned long long)(fq * w));
-        acc_moments(cc, ix, iy, iz, sh, fq);
-        Probe pr = probe(tape, c, tb, goal, sf, cxyz, d);
-        acc_probe(cc, pr);
-        u32 lo[3] = {ix << sh, iy << sh, iz << sh};
-        acc_bbox(ag_ptr<u32>(a->bbox) + 12u * cfg, lo, 1u << sh, false);
-        u32 idx[3] = {ix, iy, iz};
-        if (border_hit(gr, tape, c, tb, l, idx, b, false)) atomicExch(ag_ptr<u32>(a->domain_hit) + cfg, 1u);
+        Contrib ct;
+        contrib_init(ct);
+        {
+            {
+                const CNode* tape = cnodes + (u64)cfg * nn;
+                const float* tb = tabs + (u64)cfg * nn * TABLE;
+                u32 c = cnt[cfg];
+                Iv b[3];
+                cell_box(gr, l, ix, iy, iz, b);
+                u64 w = 1ull << (3u * sh);
+                ct.has = true;
+                ct.v[C_BOUNDARY] = w;
+                float d[3] = {b[0].hi - b[0].lo, b[1].hi - b[1].lo, b[2].hi - b[2].lo};
+                float cxyz[3] = {0.5f * (b[0].lo + b[0].hi), 0.5f * (b[1].lo + b[1].hi), 0.5f * (b[2].lo + b[2].hi)};
+                Prune pru;
+                (void)tape_iv_prune(tape, c, tb, b[0], b[1], b[2], (float)gr.eps, pru);
+                Surface sf = surface_p(tape, c, tb, pru, cxyz[0], cxyz[1], cxyz[2], d);
+                u64 tlo, thi;
+                tighten_cell(tape, c, tb, pru, b, sf.g, (float)gr.eps, a->tighten, &tlo, &thi);
+                ct.v[C_BLO] = tlo * w;
+                ct.v[C_BHI] = thi * w;
+                u64 fq = fill_of(sf);
+                if (fq < (tlo >> 4)) fq = tlo >> 4;
+                if (fq > ((thi + 15ull) >> 4)) fq = (thi + 15ull) >> 4;
+                ct.v[C_FILL] = fq * w;
+                contrib_moments(ct, ix, iy, iz, sh, fq);
+                Probe pr = probe(tape, c, tb, goal, sf, cxyz, d);
+                contrib_probe(ct, pr);
+                u32 lo[3] = {ix << sh, iy << sh, iz << sh};
+                contrib_bbox(ct, lo, 1u << sh, false);
+                u32 idx[3] = {ix, iy, iz};
+                if (border_hit(gr, tape, c, tb, l, idx, b, false)) ct.dom = 1u;
+            }
+        }
+        contrib_flush(a, cfg, ct);
     }
 }
 

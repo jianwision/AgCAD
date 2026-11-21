@@ -278,13 +278,17 @@ pub fn cell_box(gr: &Grid, level: u32, ix: u32, iy: u32, iz: u32) -> [Iv; 3] {
 /// SDF value, central-difference gradient and gradient width at a boundary cell centre.
 pub struct Surface { pub f: f32, pub g: [f32; 3], pub gl: f32, pub w: f32 }
 
-pub fn surface(nodes: &[CNode], tabs: &[f32], c: [f32; 3], d: [f32; 3]) -> Surface {
+pub fn surface(nodes: &[CNode], tabs: &[f32], c: [f32; 3], d: [f32; 3]) -> Surface { surface_p(nodes, tabs, &Prune::NONE, c, d) }
+
+/// `surface` with the cell's pruned tape (all samples lie inside the cell).
+pub fn surface_p(nodes: &[CNode], tabs: &[f32], pr: &Prune, c: [f32; 3], d: [f32; 3]) -> Surface {
     let (x, y, z) = (c[0], c[1], c[2]);
-    let f = tape_sdf_c(nodes, tabs, x, y, z);
+    let e = |x: f32, y: f32, z: f32| tape_sdf_p(nodes, tabs, pr, x, y, z);
+    let f = e(x, y, z);
     let h = 0.25f32 * d[0].min(d[1]).min(d[2]);
-    let gx = tape_sdf_c(nodes, tabs, x + h, y, z) - tape_sdf_c(nodes, tabs, x - h, y, z);
-    let gy = tape_sdf_c(nodes, tabs, x, y + h, z) - tape_sdf_c(nodes, tabs, x, y - h, z);
-    let gz = tape_sdf_c(nodes, tabs, x, y, z + h) - tape_sdf_c(nodes, tabs, x, y, z - h);
+    let gx = e(x + h, y, z) - e(x - h, y, z);
+    let gy = e(x, y + h, z) - e(x, y - h, z);
+    let gz = e(x, y, z + h) - e(x, y, z - h);
     let gl = (gx * gx + gy * gy + gz * gz).sqrt();
     // width of the cell along the gradient direction
     let w = if gl > 1e-30 { (gx.abs() * d[0] + gy.abs() * d[1] + gz.abs() * d[2]) / gl } else { 0.0 };
@@ -311,7 +315,7 @@ pub fn fill_q(nodes: &[CNode], tabs: &[f32], x: f32, y: f32, z: f32, d: [f32; 3]
 /// by interval evaluation, within `budget` evaluations. Volumes use the actual f32 box
 /// widths (lower bound floored, upper bound ceiled). Returns (certified inside, inside or
 /// ambiguous).
-pub fn tighten(nodes: &[CNode], tabs: &[f32], b: &[Iv; 3], g: [f32; 3], e: f32, budget: u32) -> (u64, u64) {
+pub fn tighten(nodes: &[CNode], tabs: &[f32], pr: &Prune, b: &[Iv; 3], g: [f32; 3], e: f32, budget: u32) -> (u64, u64) {
     let full = 1u64 << TQ;
     if budget < 2 { return (0, full); }
     let cd = [(b[0].hi - b[0].lo) as f64, (b[1].hi - b[1].lo) as f64, (b[2].hi - b[2].lo) as f64];
@@ -346,7 +350,7 @@ pub fn tighten(nodes: &[CNode], tabs: &[f32], b: &[Iv; 3], g: [f32; 3], e: f32, 
             let mut c = pb;
             if half == 0 { c[ax].hi = mid; } else { c[ax].lo = mid; }
             evals += 1;
-            let r = tape_iv(nodes, tabs, c[0], c[1], c[2]);
+            let r = tape_iv_p(nodes, tabs, pr, c[0], c[1], c[2]);
             if r.lo - e > 0.0 { continue; }
             let v = q(&c);
             if r.hi + e < 0.0 { lo += v.floor() as u64; hi += v.ceil() as u64; continue; }
@@ -397,6 +401,7 @@ pub fn probe(nodes: &[CNode], tabs: &[f32], goal: &Goal, s: &Surface, c: [f32; 3
     let n = [s.g[0] / s.gl, s.g[1] / s.gl, s.g[2] / s.gl];
     // surface point: the centre projected along the gradient; rejected where the bound is not
     // a distance (near edges the projection can miss the surface)
+    if !(goal.min_wall > 0.0) && !(goal.min_gap > 0.0) && goal.machining_3ax == 0 { return pr; }
     let p = [c[0] - n[0] * s.f, c[1] - n[1] * s.f, c[2] - n[2] * s.f];
     let dm = d[0].min(d[1]).min(d[2]);
     let hmin = 0.1f32 * dm;
@@ -537,6 +542,56 @@ pub unsafe fn ag_ad_classify(params: *const u8, _: &LaunchConfig) {
 /// levels remain; otherwise count them as boundary (with fill estimate and border test).
 pub unsafe fn ag_ad_resolve(params: *const u8, _: &LaunchConfig) {
     let a = unsafe { args(params) };
+    let cn = a.configs as usize;
+    let l = a.level;
+    let n = unsafe { sl::<u32>(a.lvl, a.levels as usize + 1)[l as usize] } as usize;
+    let cap = a.capacity as usize;
+    let wl = unsafe { sl::<u64>(if l % 2 == 0 { a.wl0 } else { a.wl1 }, n) };
+    let cls = unsafe { sl::<u32>(a.cls, n) };
+    let flag = unsafe { slm::<u32>(a.flag, cap) };
+    let term = unsafe { slm::<u32>(a.term, cap) };
+    let crank = unsafe { sl::<u32>(a.crank, cap) };
+    let start = unsafe { sl::<u32>(a.start, cn) };
+    for i in 0..cap {
+        flag[i] = 0;
+        term[i] = 0;
+        if i >= n || cls[i] != 1 { continue; }
+        let (cfg, _, _, _) = decode(wl[i]);
+        let rank = crank[i] - crank[start[cfg] as usize];
+        if l + 1 < a.levels && (rank as u64 + 1) * 8 <= a.cap as u64 { flag[i] = 1; } else { term[i] = 1; }
+    }
+}
+
+/// CLIP: refinements whose children would not fit in the global cell budget become terminal
+/// (a suffix in entry order, i.e. in configuration order: deterministic, and sound — such
+/// cells are counted as boundary). Also sets the next level's entry count.
+pub unsafe fn ag_ad_clip(params: *const u8, _: &LaunchConfig) {
+    let a = unsafe { args(params) };
+    let cap = a.capacity as usize;
+    let flag = unsafe { slm::<u32>(a.flag, cap) };
+    let term = unsafe { slm::<u32>(a.term, cap) };
+    let offs = unsafe { sl::<u32>(a.offs, cap) };
+    let keep = (a.capacity / 8) as u32;
+    let total = offs[cap - 1] + flag[cap - 1];
+    for i in 0..cap { if flag[i] != 0 && offs[i] >= keep { flag[i] = 0; term[i] = 1; } }
+    unsafe { slm::<u32>(a.lvl, a.levels as usize + 1)[a.level as usize + 1] = total.min(keep) * 8; }
+}
+
+/// COMPACT: terminal entries → dense list (ascending entry index, so sorted by configuration).
+pub unsafe fn ag_ad_compact(params: *const u8, _: &LaunchConfig) {
+    let a = unsafe { args(params) };
+    let cap = a.capacity as usize;
+    let term = unsafe { sl::<u32>(a.term, cap) };
+    let toffs = unsafe { sl::<u32>(a.toffs, cap) };
+    let tlist = unsafe { slm::<u32>(a.tlist, cap) };
+    for i in 0..cap { if term[i] != 0 { tlist[toffs[i] as usize] = i as u32; } }
+    unsafe { slm::<u32>(a.tcount, 1)[0] = toffs[cap - 1] + term[cap - 1]; }
+}
+
+/// FILL (level l): terminal boundary cells — rigorous tightened fractions, sampled fill,
+/// moments, engineering probes, extents and the border test.
+pub unsafe fn ag_ad_fill(params: *const u8, _: &LaunchConfig) {
+    let a = unsafe { args(params) };
     let (cn, nn) = (a.configs as usize, a.nodes as usize);
     let cnt = unsafe { sl::<u32>(if a.eval_trial != 0 { a.tr_count } else { a.cur_count }, cn) };
     let cnodes = unsafe { sl::<CNode>(a.compiled, cn * nn) };
@@ -545,21 +600,14 @@ pub unsafe fn ag_ad_resolve(params: *const u8, _: &LaunchConfig) {
     let gr = grid(&goal, a.coarse, a.levels);
     let l = a.level;
     let n = unsafe { sl::<u32>(a.lvl, a.levels as usize + 1)[l as usize] } as usize;
-    let cap = a.capacity as usize;
     let wl = unsafe { sl::<u64>(if l % 2 == 0 { a.wl0 } else { a.wl1 }, n) };
-    let cls = unsafe { sl::<u32>(a.cls, n) };
-    let flag = unsafe { slm::<u32>(a.flag, cap) };
-    let crank = unsafe { sl::<u32>(a.crank, cap) };
-    let start = unsafe { sl::<u32>(a.start, cn) };
+    let tn = unsafe { sl::<u32>(a.tcount, 1)[0] } as usize;
+    let tlist = unsafe { sl::<u32>(a.tlist, tn) };
     let mut acc = Acc { counts: unsafe { slm::<u64>(a.counts, CS * cn) }, dom: unsafe { slm::<u32>(a.domain_hit, cn) }, bb: unsafe { slm::<u32>(a.bbox, 12 * cn) } };
     let sh = a.levels - 1 - l;
     let e = gr.eps as f32;
-    for i in 0..cap {
-        flag[i] = 0;
-        if i >= n || cls[i] != 1 { continue; }
-        let (cfg, ix, iy, iz) = decode(wl[i]);
-        let rank = crank[i] - crank[start[cfg] as usize];
-        if l + 1 < a.levels && (rank as u64 + 1) * 8 <= a.cap as u64 { flag[i] = 1; continue; }
+    for &ti in tlist {
+        let (cfg, ix, iy, iz) = decode(wl[ti as usize]);
         let tape = &cnodes[cfg * nn..cfg * nn + cnt[cfg] as usize];
         let tb = &tabs[cfg * nn * TABLE..(cfg * nn + cnt[cfg] as usize) * TABLE];
         let b = cell_box(&gr, l, ix, iy, iz);
@@ -567,8 +615,11 @@ pub unsafe fn ag_ad_resolve(params: *const u8, _: &LaunchConfig) {
         acc.counts[CS * cfg + cnt::BOUNDARY] += w;
         let d = [b[0].hi - b[0].lo, b[1].hi - b[1].lo, b[2].hi - b[2].lo];
         let c = [0.5f32 * (b[0].lo + b[0].hi), 0.5f32 * (b[1].lo + b[1].hi), 0.5f32 * (b[2].lo + b[2].hi)];
-        let sf = surface(tape, tb, c, d);
-        let (tlo, thi) = tighten(tape, tb, &b, sf.g, e, a.tighten);
+        // pruned tape for this cell (bit-identical point values inside it)
+        let mut pru = Prune::NONE;
+        let _ = tape_iv_prune(tape, tb, b[0], b[1], b[2], e, &mut pru);
+        let sf = surface_p(tape, tb, &pru, c, d);
+        let (tlo, thi) = tighten(tape, tb, &pru, &b, sf.g, e, a.tighten);
         acc.counts[CS * cfg + cnt::BLO] += tlo * w;
         acc.counts[CS * cfg + cnt::BHI] += thi * w;
         // sampled fill, kept inside the certified fraction interval
@@ -810,6 +861,9 @@ pub const DOPS_CPU: &[(&str, CpuKernelFn)] = &[
     ("ag_ad_seed", ag_ad_seed),
     ("ag_ad_classify", ag_ad_classify),
     ("ag_ad_resolve", ag_ad_resolve),
+    ("ag_ad_clip", ag_ad_clip),
+    ("ag_ad_compact", ag_ad_compact),
+    ("ag_ad_fill", ag_ad_fill),
     ("ag_ad_start", ag_ad_start),
     ("ag_ad_emit", ag_ad_emit),
     ("ag_ad_total", ag_ad_total),

@@ -41,7 +41,7 @@ This is the loop **LLM observes → sets a goal → GPU model plans and executes
   - **Profile ops:** pad, pocket and hole over rectangle, circle and regular-polygon sketches.
   - **Patterns:** circular, and rectangular (x / y, ≤ 64 instances).
   - **Corners:** vertical-edge fillet and chamfer of rectangle profiles.
-  - **Shell:** device-only. There is no exact layered offset yet, so it is reported and never approximated silently.
+  - **Shell (closed):** exact through a 2D inward offset (`region2d::offset_inward`, `LayeredSolid::shell_closed`; std `part.shell` with `remove: []`) when the body is one convex pad minus cuts. In that case the device field is an exact interior distance. Any other body is delivered as a **certified implicit** body: a watertight mesh within h·√3 of the surface with certified volume bounds, exportable as 3MF/STL, with STEP refused.
   - **Multi-body:** `document.body` plus `boolean.add/remove/intersect`. Lowered with `$body` containers.
   - **Also:** activation and parameters.
   
@@ -64,7 +64,16 @@ This is the loop **LLM observes → sets a goal → GPU model plans and executes
   - **Counters:** all counts are integer atomics, so CUDA and the CPU reference stay bit-identical.
 - **Evidence chain (spec 14):**
   - **Proxy rounds:** these use small caps. The policy steers with the sampled estimate, and the bounds reject definite violations.
-  - **Survivors:** `studio::certify` re-evaluates them alone with a deep pass. On the flange this moved the rigorous interval from ±23.9 % to **±3.5 %**, with the estimate within 0.03 % of exact. `device_rollout` reports `certified_volume_bounds`.
+  - **Survivors:** `studio::certify` re-evaluates them alone with a deep pass plus **per-cell bound tightening**: interval refinement of each terminal boundary cell (largest ambiguous sub-box split along the axis of largest |g|·width) with fixed-point certified fractions. Flange: ±23.9 % (quick) → ±3.5 % (deep) → **±0.3 %** (tightened). Plate ±0.19 %, union ±0.12 %, shell ±0.24 %. Soundness is checked against exact volumes.
+- **Engineering evaluators** (sampled, CUDA ≡ CPU):
+  - integer mass moments → centroid and inertia;
+  - surface area;
+  - wall thickness and clearance (sphere-traced probes along ∓normal);
+  - 3-axis tool access;
+  - centroid limits.
+
+  `set_goal` takes `min_wall`, `min_clearance`, `machining: "3ax"` (defaulting from the requirements' process), `centroid`, and `load` / `max_compliance`. Edits may not worsen violations.
+- **Stiffness proxy** (`fea`): voxel hex8 elasticity solved by matrix-free Jacobi-PCG on the device. Fixed-shape reductions make it bit-identical CUDA ≡ CPU, and it matches `agcad_std::physics` to 1e-6. It runs on survivors.
 - **Measured** on an RTX 2000 Ada laptop GPU (`agcad bench-device`; eval is ≥ 99.9 % of each round):
 
   | Design | Eval per round (4096 configurations) | Rigorous volume interval | 4096 × 7-round rollout |
@@ -73,16 +82,22 @@ This is the loop **LLM observes → sets a goal → GPU model plans and executes
   | f32 point / Lipschitz, 96³ (G0 baseline) | 1361 ms | ±40 % | 11.9 s |
   | f32 adaptive interval, 128³ (all-or-nothing cap) | 166 ms | — | — |
   | f32 adaptive interval, 256³ (cap 4096, partial refinement) | 360 ms | ±30 % | 2.8 s |
+  | + new ops and engineering accumulators (post-N3) | 585 ms | | 5.9k config-rounds/s |
+  | + warp-aggregated integer accumulation | 399 ms | | |
+  | + per-cell tape pruning (exact: bit-identical point values) | 385 ms | | |
+  | + `__launch_bounds__(256, 3)` (143 regs → 16.7 % occupancy before) | 274 ms | | 10.7k |
+  | + compacted terminal-cell fill kernel (resolve → clip → compact → fill) | 227 ms | | **12.5–13.9k config-rounds/s** |
+
+  **Global cell budget** (`max_cells`): memory follows the budget instead of configs × cap. 4096 configurations at cap 65 536 / 512³ finest run in 2.7 s under a 32 M-cell budget; before, this exceeded VRAM at 12 s per round.
 
   Ruled out by measurement: near-cubic root cells. They made plate bounds 3× wider, because the thin-z cells bound the dominant faces best. The fix will be orientation-aware anisotropic splitting.
 - **Next:**
-  - per-cell tape pruning (patterns: 12 instances per point → about 1);
-  - warp-aggregated atomics and shared-memory tapes;
-  - anisotropic refinement;
-  - a graph cache;
-  - replace the mock policy with a learned one: the trace ring already records (round, committed, accepted, rejected, volume bounds), and the Candle trainer consumes it;
-  - add more device ops: shell, fillet, rectangular pattern, booleans between bodies;
-  - feed `describe` / renders back as observations to the LLM automatically.
+  - on-device optimizers (CMA-ES / batched gradients) as policies, and later a learned structural policy (the trace ring and the Candle trainer are in place);
+  - anisotropic refinement in the global worklist (today it is only within the per-cell tightening);
+  - shared-memory tapes;
+  - open shells and multi-slab offsets (the general offset path);
+  - an OCCT parity fuzz for `offset_inward`;
+  - a Pareto front of survivors with renders back to the LLM.
 
 ## Op coverage (293 catalog ops)
 

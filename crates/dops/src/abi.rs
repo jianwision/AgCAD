@@ -290,6 +290,12 @@ pub struct DopsArgs {
     pub crank: u64,
     pub start: u64,
     pub lvl: u64,
+    /// Terminal boundary cells of the current level: flag, exclusive scan, compacted entry
+    /// indices and their count (the fill kernel runs over the compacted list).
+    pub term: u64,
+    pub toffs: u64,
+    pub tlist: u64,
+    pub tcount: u64,
     /// CUgraphConditionalHandle of the enclosing WHILE node (0 = host-driven loop).
     pub cond_handle: u64,
     pub configs: u32,

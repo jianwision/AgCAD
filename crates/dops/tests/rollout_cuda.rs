@@ -170,6 +170,7 @@ fn fea_pcg_bitwise() {
     let d = cpu::flange(60.0, 12.0, 6.0);
     let mut lc = LoadCase::over([-61.0, -61.0, 0.0], [61.0, 61.0, 12.0], 3.0);
     lc.force = [500.0, 0.0, 0.0];
+    lc.precond = agcad_dops::fea::Precond::Multigrid;
     let a = stiffness(agcad_driver_cuda::CudaDevice::open(0).unwrap(), &d, &lc).unwrap();
     let b = stiffness(agcad_driver_cpu::CpuDevice::new(), &d, &lc).unwrap();
     eprintln!("flange FEA: {} voxels, {} dofs, {} iterations, compliance {}", a.voxels, a.dofs, a.iterations, a.compliance);
@@ -177,6 +178,12 @@ fn fea_pcg_bitwise() {
     assert_eq!(a.compliance.to_bits(), b.compliance.to_bits());
     assert_eq!(a.max_disp.to_bits(), b.max_disp.to_bits());
     assert_eq!((a.iterations, a.voxels, a.dofs), (b.iterations, b.voxels, b.dofs));
+    // Jacobi-PCG too
+    let lj = LoadCase { precond: agcad_dops::fea::Precond::Jacobi, ..lc };
+    let (a2, b2) = (stiffness(agcad_driver_cuda::CudaDevice::open(0).unwrap(), &d, &lj).unwrap(), stiffness(agcad_driver_cpu::CpuDevice::new(), &d, &lj).unwrap());
+    assert_eq!(a2.compliance.to_bits(), b2.compliance.to_bits());
+    assert_eq!(a2.iterations, b2.iterations);
+    assert!(a.levels >= 3 && a.iterations * 3 < a2.iterations, "multigrid {} vs Jacobi {}", a.iterations, a2.iterations);
 }
 
 /// Certified implicit mesh: device sampling is bit-identical, so the meshes are identical.

@@ -361,7 +361,7 @@ impl Server {
                             Ok((r, h)) => {
                                 stiff_ok[i] = r.converged && spec.max_compliance.is_none_or(|m| r.compliance <= m);
                                 compliance[i] = r.converged.then_some(r.compliance);
-                                json!({ "compliance": r.compliance, "max_displacement": r.max_disp, "converged": r.converged, "iterations": r.iterations, "voxel": h, "voxels": r.voxels, "ok": stiff_ok[i], "evidence": "sampled" })
+                                json!({ "compliance": r.compliance, "max_displacement": r.max_disp, "converged": r.converged, "iterations": r.iterations, "solver": if r.levels > 1 { format!("multigrid-PCG ({} levels)", r.levels) } else { "Jacobi-PCG".to_string() }, "voxel": h, "voxels": r.voxels, "ok": stiff_ok[i], "evidence": "sampled" })
                             }
                             Err(e) => { stiff_ok[i] = false; json!({ "error": e }) }
                         };

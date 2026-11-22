@@ -41,3 +41,45 @@ fn thicker_is_stiffer_and_empty_is_reported() {
     assert_eq!(none.voxels, 0);
     assert_eq!(none.compliance, 0.0);
 }
+
+#[test]
+fn multigrid_matches_jacobi_in_far_fewer_iterations() {
+    use agcad_dops::fea::Precond;
+    // slender cantilever (bending: Jacobi-PCG's hard case) and a holed flange
+    let cases: Vec<(Design, LoadCase)> = vec![
+        ({ bar(60.0, 6.0) }, { let mut l = LoadCase::over([0.0, 0.0, 0.0], [6.0, 6.0, 60.0], 1.0); l.force = [200.0, 0.0, 0.0]; l }),
+        (agcad_dops::examples::flange(40.0, 10.0, 5.0), { let mut l = LoadCase::over([-41.0, -41.0, 0.0], [41.0, 41.0, 10.0], 2.0); l.force = [0.0, 0.0, -500.0]; l }),
+    ];
+    for (d, lc) in cases {
+        let mg = stiffness(CpuDevice::new(), &d, &LoadCase { precond: Precond::Multigrid, ..lc }).unwrap();
+        let jc = stiffness(CpuDevice::new(), &d, &LoadCase { precond: Precond::Jacobi, ..lc }).unwrap();
+        eprintln!("{} dofs: multigrid {} it ({} levels), Jacobi {} it; compliance {} vs {}", mg.dofs, mg.iterations, mg.levels, jc.iterations, mg.compliance, jc.compliance);
+        assert!(mg.converged && jc.converged);
+        assert!(mg.levels >= 3);
+        assert!((mg.compliance - jc.compliance).abs() / jc.compliance < 1e-6);
+        assert!((mg.max_disp - jc.max_disp).abs() / jc.max_disp < 1e-6);
+        assert!(mg.iterations * 4 < jc.iterations, "{} vs {}", mg.iterations, jc.iterations);
+    }
+}
+
+/// Wall-clock: multigrid vs Jacobi at growing resolution (`--ignored --nocapture`).
+#[test]
+#[ignore = "benchmark"]
+fn bench_multigrid_vs_jacobi() {
+    use agcad_dops::fea::Precond;
+    let dev = || -> std::sync::Arc<agcad_driver_cuda::CudaDevice> { agcad_driver_cuda::CudaDevice::open(0).unwrap() };
+    let cuda = std::env::var("AGCAD_BENCH_CUDA").is_ok();
+    for h in [1.0, 0.5, 0.3] {
+        let d = bar(60.0, 6.0);
+        let mut lc = LoadCase::over([0.0, 0.0, 0.0], [6.0, 6.0, 60.0], h);
+        lc.force = [200.0, 0.0, 0.0];
+        for (name, d, lc) in [("cantilever", d, lc), ("flange", agcad_dops::examples::flange(40.0, 10.0, 5.0), { let mut l = LoadCase::over([-41.0, -41.0, 0.0], [41.0, 41.0, 10.0], 2.0 * h); l.force = [0.0, 0.0, -500.0]; l })] {
+            for pc in [Precond::Multigrid, Precond::Jacobi] {
+                let lc = LoadCase { precond: pc, ..lc };
+                let w = std::time::Instant::now();
+                let r = if cuda { stiffness(dev(), &d, &lc).unwrap() } else { stiffness(CpuDevice::new(), &d, &lc).unwrap() };
+                eprintln!("{name:10} h {h:4} {:8} dofs {pc:?}: {:5} it, {:8.1} ms, converged {}", r.dofs, r.iterations, w.elapsed().as_secs_f64() * 1e3, r.converged);
+            }
+        }
+    }
+}

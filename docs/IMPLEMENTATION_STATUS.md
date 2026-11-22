@@ -102,6 +102,14 @@ This is the loop **LLM observes → sets a goal → GPU model plans and executes
     - `ray_undercut` is available as a Pareto objective; `ray_check: false` turns the check off.
     - Catches what the device's +z probe cannot: sealed cavities, and 3+2 / 5-axis reach.
   - **Renders:** ray-traced, shadowed renders (`render {mode: "raytraced"}`, Pareto candidates).
+- **Multigrid stiffness solver** (`fea`, `Precond`):
+  - **Method:** geometric multigrid V-cycle as the PCG preconditioner, up to 6 levels. Coarse levels re-discretize on doubled voxels, weighted by solid fraction; trilinear prolongation with transpose restriction; ℓ1-Jacobi smoothing, which is convergent for any geometry, 2 pre / 2 post sweeps at ω 1.3; 32 coarse sweeps.
+  - **Determinism:** gather-only kernels in a fixed order, so CUDA ≡ CPU bitwise.
+  - **Iterations are resolution-independent:**
+    - cantilever: 60 → 64 iterations from 8.8k to 265k DOFs (Jacobi: 292 → 890);
+    - flange: 20 → 20 (Jacobi: 135 → 371).
+  - **RTX 2000 Ada wall-clock:** 2.3× faster at 265k DOFs and 2.6× at 688k. Below about 100k DOFs a GPU V-cycle is launch-bound, so `Auto` (the default) uses Jacobi there.
+  - **Reporting:** the server's stiffness report names the solver.
 - **Stiffness proxy** (`fea`): voxel hex8 elasticity solved by matrix-free Jacobi-PCG on the device. Fixed-shape reductions make it bit-identical CUDA ≡ CPU, and it matches `agcad_std::physics` to 1e-6. It runs on survivors.
 - **Measured** on an RTX 2000 Ada laptop GPU (`agcad bench-device`; eval is ≥ 99.9 % of each round):
 

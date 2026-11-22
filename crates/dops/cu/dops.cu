@@ -2027,7 +2027,7 @@ AG_KERNEL void ag_dop_stamp(const StampParams* p) {
 struct FeaArgs {
     u64 tape, tables, solid, nflag, ke, x, r, z, p, ap, b, diag, scal, stat;
     double lo[3], h, force[3], tol;
-    u32 count, dims[3], axis, _pad[3];
+    u32 count, dims[3], axis, precond, _pad[2];
 };
 struct DotArgs { u64 a0, b0, a1, b1, part, scal, n; u32 slot0, slot1, ndots, always; };
 
@@ -2103,9 +2103,16 @@ AG_KERNEL void ag_fea_init(const FeaArgs* a) {
         dg[i] = act ? ke[c * 25u] * 4.0 : 1.0;
         x[i] = 0.0;
         r[i] = b[i];
-        z[i] = r[i] / dg[i];
+        z[i] = (a->precond == 0u) ? r[i] / dg[i] : 0.0;
         p[i] = z[i];
     }
+}
+
+AG_KERNEL void ag_fea_setp(const FeaArgs* a) {
+    u64 nd = 3ull * (u64)(a->dims[0] + 1u) * (u64)(a->dims[1] + 1u) * (u64)(a->dims[2] + 1u);
+    const double* z = ag_ptr<const double>(a->z);
+    double* p = ag_ptr<double>(a->p);
+    GRID_STRIDE(i, nd) { p[i] = z[i]; }
 }
 
 AG_KERNEL void ag_fea_dot_part(const DotArgs* a) {
@@ -2217,7 +2224,7 @@ AG_KERNEL void ag_fea_update1(const FeaArgs* a) {
     GRID_STRIDE(i, nd) {
         x[i] = x[i] + alpha * p[i];
         r[i] = r[i] - alpha * ap[i];
-        z[i] = r[i] / dg[i];
+        if (a->precond == 0u) z[i] = r[i] / dg[i];
     }
 }
 
@@ -2252,6 +2259,210 @@ AG_KERNEL void ag_fea_maxdisp(const FeaArgs* a) {
     GRID_STRIDE(n, nn) {
         double m = sqrt(x[3 * n] * x[3 * n] + x[3 * n + 1] * x[3 * n + 1] + x[3 * n + 2] * x[3 * n + 2]);
         atomicMax((unsigned long long*)&stat[1], (unsigned long long)__double_as_longlong(m));
+    }
+}
+
+// ---- multigrid V-cycle (twins of the ag_mg_* kernels in src/fea.rs) ----
+struct MgArgs {
+    u64 w, nflag, diag, x, r, t, cw, cnflag, cx, cr, solid, ke, scal, _pad0;
+    double scale, omega;
+    u32 dims[3], cdims[3], mode, _pad1;
+};
+__device__ __forceinline__ bool mg_done(const MgArgs* m) { return ag_ptr<const double>(m->scal)[S_DONE] != 0.0; }
+__device__ __forceinline__ u32 mg_local(u32 di, u32 dj, u32 dk) {
+    u32 l0 = 1u - di, l1 = 1u - dj, l2 = 1u - dk, la = 0;
+    for (u32 q = 0; q < 8u; ++q) if (FEA_CORNER[q][0] == l0 && FEA_CORNER[q][1] == l1 && FEA_CORNER[q][2] == l2) la = q;
+    return la;
+}
+__device__ __forceinline__ double mg_tw(u32 o) { return o == 1u ? 1.0 : 0.5; }
+
+AG_KERNEL void ag_mg_weights0(const MgArgs* m) {
+    u64 ne = (u64)m->dims[0] * m->dims[1] * m->dims[2];
+    const u32* solid = ag_ptr<const u32>(m->solid);
+    double* w = ag_ptr<double>(m->w);
+    GRID_STRIDE(e, ne) { w[e] = solid[e] != 0u ? 1.0 : 0.0; }
+}
+
+AG_KERNEL void ag_mg_coarsen(const MgArgs* m) {
+    u64 d0 = m->dims[0], d1 = m->dims[1], d2 = m->dims[2], c0 = m->cdims[0], c1 = m->cdims[1], c2 = m->cdims[2];
+    const double* w = ag_ptr<const double>(m->w);
+    double* cw = ag_ptr<double>(m->cw);
+    GRID_STRIDE(e, c0 * c1 * c2) {
+        u64 i = e % c0, j = (e / c0) % c1, k = e / (c0 * c1);
+        double s = 0.0;
+        for (u64 dk = 0; dk < 2; ++dk) for (u64 dj = 0; dj < 2; ++dj) for (u64 di = 0; di < 2; ++di) {
+            u64 fi = 2 * i + di, fj = 2 * j + dj, fk = 2 * k + dk;
+            if (fi < d0 && fj < d1 && fk < d2) s = s + w[(fk * d1 + fj) * d0 + fi];
+        }
+        cw[e] = s * 0.125;
+    }
+}
+
+AG_KERNEL void ag_mg_nodes(const MgArgs* m) {
+    u64 d[3] = {m->dims[0], m->dims[1], m->dims[2]}, c[3] = {m->cdims[0], m->cdims[1], m->cdims[2]};
+    const u32* nf = ag_ptr<const u32>(m->nflag);
+    const double* cw = ag_ptr<const double>(m->cw);
+    u32* cnf = ag_ptr<u32>(m->cnflag);
+    GRID_STRIDE(n, (c[0] + 1) * (c[1] + 1) * (c[2] + 1)) {
+        u64 q[3] = {n % (c[0] + 1), (n / (c[0] + 1)) % (c[1] + 1), n / ((c[0] + 1) * (c[1] + 1))};
+        bool used = false;
+        for (u64 dk = 0; dk < 2; ++dk) for (u64 dj = 0; dj < 2; ++dj) for (u64 di = 0; di < 2; ++di) {
+            if (q[0] + di < 1 || q[1] + dj < 1 || q[2] + dk < 1) continue;
+            u64 i = q[0] + di - 1, j = q[1] + dj - 1, k = q[2] + dk - 1;
+            if (i < c[0] && j < c[1] && k < c[2] && cw[(k * c[1] + j) * c[0] + i] > 0.0) used = true;
+        }
+        bool fixed = false;
+        if (used) {
+            for (u64 ok = 0; ok < 3; ++ok) for (u64 oj = 0; oj < 3; ++oj) for (u64 oi = 0; oi < 3; ++oi) {
+                u64 f0 = 2 * q[0] + oi, f1 = 2 * q[1] + oj, f2 = 2 * q[2] + ok;
+                if (f0 < 1 || f1 < 1 || f2 < 1) continue;
+                f0 -= 1; f1 -= 1; f2 -= 1;
+                if (f0 > d[0] || f1 > d[1] || f2 > d[2]) continue;
+                u32 fl = nf[(f2 * (d[1] + 1) + f1) * (d[0] + 1) + f0];
+                if ((fl & N_USED) != 0u && (fl & N_FIXED) != 0u) fixed = true;
+            }
+        }
+        cnf[n] = used ? (N_USED | (fixed ? N_FIXED : 0u)) : 0u;
+    }
+}
+
+AG_KERNEL void ag_mg_diag(const MgArgs* m) {
+    u64 d[3] = {m->dims[0], m->dims[1], m->dims[2]};
+    u64 nx = d[0] + 1, ny = d[1] + 1, nd = 3ull * nx * ny * (d[2] + 1);
+    const double* w = ag_ptr<const double>(m->w);
+    const u32* nf = ag_ptr<const u32>(m->nflag);
+    const double* ke = ag_ptr<const double>(m->ke);
+    double* dg = ag_ptr<double>(m->diag);
+    GRID_STRIDE(dof, nd) {
+        double v = 0.0;
+        if (fea_active(nf, dof)) {
+            u64 n = dof / 3ull;
+            u64 c[3] = {n % nx, (n / nx) % ny, n / (nx * ny)};
+            for (u32 dk = 0; dk < 2u; ++dk) for (u32 dj = 0; dj < 2u; ++dj) for (u32 di = 0; di < 2u; ++di) {
+                if (c[0] + di < 1ull || c[1] + dj < 1ull || c[2] + dk < 1ull) continue;
+                u64 i = c[0] + di - 1ull, j = c[1] + dj - 1ull, k = c[2] + dk - 1ull;
+                if (i >= d[0] || j >= d[1] || k >= d[2]) continue;
+                double we = w[(k * d[1] + j) * d[0] + i];
+                if (!(we > 0.0)) continue;
+                u32 row = 3u * mg_local(di, dj, dk) + (u32)(dof % 3ull);
+                double rs = 0.0;
+                for (u32 q = 0; q < 8u; ++q) {
+                    u64 mm = ((k + FEA_CORNER[q][2]) * ny + (j + FEA_CORNER[q][1])) * nx + (i + FEA_CORNER[q][0]);
+                    for (u32 e = 0; e < 3u; ++e) if (fea_active(nf, 3ull * mm + e)) rs = rs + fabs(ke[row * 24u + 3u * q + e]);
+                }
+                v = v + (we * m->scale) * rs;
+            }
+        }
+        dg[dof] = v > 0.0 ? v : 1.0;
+    }
+}
+
+AG_KERNEL void ag_mg_matvec(const MgArgs* m) {
+    if (mg_done(m)) return;
+    u64 d[3] = {m->dims[0], m->dims[1], m->dims[2]};
+    u64 nx = d[0] + 1, ny = d[1] + 1, nd = 3ull * nx * ny * (d[2] + 1);
+    const double* w = ag_ptr<const double>(m->w);
+    const u32* nf = ag_ptr<const u32>(m->nflag);
+    const double* ke = ag_ptr<const double>(m->ke);
+    const double* x = ag_ptr<const double>(m->x);
+    double* t = ag_ptr<double>(m->t);
+    GRID_STRIDE(dof, nd) {
+        if (!fea_active(nf, dof)) { t[dof] = 0.0; continue; }
+        u64 n = dof / 3ull;
+        u64 c[3] = {n % nx, (n / nx) % ny, n / (nx * ny)};
+        double y = 0.0;
+        for (u32 dk = 0; dk < 2u; ++dk) for (u32 dj = 0; dj < 2u; ++dj) for (u32 di = 0; di < 2u; ++di) {
+            if (c[0] + di < 1ull || c[1] + dj < 1ull || c[2] + dk < 1ull) continue;
+            u64 i = c[0] + di - 1ull, j = c[1] + dj - 1ull, k = c[2] + dk - 1ull;
+            if (i >= d[0] || j >= d[1] || k >= d[2]) continue;
+            double we = w[(k * d[1] + j) * d[0] + i];
+            if (!(we > 0.0)) continue;
+            u32 row = 3u * mg_local(di, dj, dk) + (u32)(dof % 3ull);
+            double s = 0.0;
+            for (u32 q = 0; q < 8u; ++q) {
+                u64 mm = ((k + FEA_CORNER[q][2]) * ny + (j + FEA_CORNER[q][1])) * nx + (i + FEA_CORNER[q][0]);
+                for (u32 e = 0; e < 3u; ++e) {
+                    u64 dd = 3ull * mm + e;
+                    double u = fea_active(nf, dd) ? x[dd] : 0.0;
+                    s = s + ke[row * 24u + 3u * q + e] * u;
+                }
+            }
+            y = y + (we * m->scale) * s;
+        }
+        t[dof] = y;
+    }
+}
+
+AG_KERNEL void ag_mg_smooth(const MgArgs* m) {
+    if (mg_done(m)) return;
+    u64 nd = 3ull * (u64)(m->dims[0] + 1u) * (u64)(m->dims[1] + 1u) * (u64)(m->dims[2] + 1u);
+    const u32* nf = ag_ptr<const u32>(m->nflag);
+    const double *dg = ag_ptr<const double>(m->diag), *r = ag_ptr<const double>(m->r), *t = ag_ptr<const double>(m->t);
+    double* x = ag_ptr<double>(m->x);
+    GRID_STRIDE(i, nd) {
+        x[i] = !fea_active(nf, i) ? 0.0 : (m->mode == 0u ? m->omega * (r[i] / dg[i]) : x[i] + m->omega * ((r[i] - t[i]) / dg[i]));
+    }
+}
+
+AG_KERNEL void ag_mg_resid(const MgArgs* m) {
+    if (mg_done(m)) return;
+    u64 nd = 3ull * (u64)(m->dims[0] + 1u) * (u64)(m->dims[1] + 1u) * (u64)(m->dims[2] + 1u);
+    const u32* nf = ag_ptr<const u32>(m->nflag);
+    const double* r = ag_ptr<const double>(m->r);
+    double* t = ag_ptr<double>(m->t);
+    GRID_STRIDE(i, nd) { t[i] = fea_active(nf, i) ? r[i] - t[i] : 0.0; }
+}
+
+AG_KERNEL void ag_mg_restrict(const MgArgs* m) {
+    if (mg_done(m)) return;
+    u64 d[3] = {m->dims[0], m->dims[1], m->dims[2]}, c[3] = {m->cdims[0], m->cdims[1], m->cdims[2]};
+    const u32* nf = ag_ptr<const u32>(m->nflag);
+    const double* t = ag_ptr<const double>(m->t);
+    const u32* cnf = ag_ptr<const u32>(m->cnflag);
+    double* cr = ag_ptr<double>(m->cr);
+    GRID_STRIDE(cd, 3ull * (c[0] + 1) * (c[1] + 1) * (c[2] + 1)) {
+        if (!fea_active(cnf, cd)) { cr[cd] = 0.0; continue; }
+        u64 n = cd / 3ull;
+        u64 q[3] = {n % (c[0] + 1), (n / (c[0] + 1)) % (c[1] + 1), n / ((c[0] + 1) * (c[1] + 1))};
+        double v = 0.0;
+        for (u32 ok = 0; ok < 3u; ++ok) for (u32 oj = 0; oj < 3u; ++oj) for (u32 oi = 0; oi < 3u; ++oi) {
+            u64 f0 = 2 * q[0] + oi, f1 = 2 * q[1] + oj, f2 = 2 * q[2] + ok;
+            if (f0 < 1 || f1 < 1 || f2 < 1) continue;
+            f0 -= 1; f1 -= 1; f2 -= 1;
+            if (f0 > d[0] || f1 > d[1] || f2 > d[2]) continue;
+            u64 fd = 3ull * ((f2 * (d[1] + 1) + f1) * (d[0] + 1) + f0) + cd % 3ull;
+            if (fea_active(nf, fd)) v = v + ((mg_tw(oi) * mg_tw(oj)) * mg_tw(ok)) * t[fd];
+        }
+        cr[cd] = v;
+    }
+}
+
+AG_KERNEL void ag_mg_prolong(const MgArgs* m) {
+    if (mg_done(m)) return;
+    u64 d[3] = {m->dims[0], m->dims[1], m->dims[2]}, c[3] = {m->cdims[0], m->cdims[1], m->cdims[2]};
+    const u32* nf = ag_ptr<const u32>(m->nflag);
+    double* x = ag_ptr<double>(m->x);
+    const u32* cnf = ag_ptr<const u32>(m->cnflag);
+    const double* cx = ag_ptr<const double>(m->cx);
+    GRID_STRIDE(fd, 3ull * (d[0] + 1) * (d[1] + 1) * (d[2] + 1)) {
+        if (!fea_active(nf, fd)) { x[fd] = 0.0; continue; }
+        u64 n = fd / 3ull;
+        u64 f[3] = {n % (d[0] + 1), (n / (d[0] + 1)) % (d[1] + 1), n / ((d[0] + 1) * (d[1] + 1))};
+        double v = 0.0;
+        for (u32 bk = 0; bk < 2u; ++bk) for (u32 bj = 0; bj < 2u; ++bj) for (u32 bi = 0; bi < 2u; ++bi) {
+            u32 b[3] = {bi, bj, bk};
+            bool ok = true;
+            u64 q[3];
+            double wt[3];
+            for (int a = 0; a < 3; ++a) {
+                if (f[a] % 2ull == 0ull) { if (b[a] == 1u) ok = false; q[a] = f[a] / 2ull; wt[a] = 1.0; }
+                else { q[a] = (f[a] - 1ull) / 2ull + b[a]; wt[a] = 0.5; }
+            }
+            if (!ok || q[0] > c[0] || q[1] > c[1] || q[2] > c[2]) continue;
+            u64 cd = 3ull * ((q[2] * (c[1] + 1) + q[1]) * (c[0] + 1) + q[0]) + fd % 3ull;
+            if (fea_active(cnf, cd)) v = v + ((wt[0] * wt[1]) * wt[2]) * cx[cd];
+        }
+        x[fd] = x[fd] + v;
     }
 }
 

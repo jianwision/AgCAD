@@ -21,6 +21,8 @@ mod surface_spline;
 mod surface_blend;
 pub mod mesh;
 pub mod part;
+pub mod push_pull;
+mod selected_edge;
 pub mod physics;
 pub mod sketch;
 pub mod transform;
@@ -60,6 +62,7 @@ pub fn standard_registry() -> Registry {
     for op in ["query.parallel_to", "query.element_type", "query.geometry", "query.created_by", "query.named"] { r.register(Arc::new(evaluate::QueryOp(op))); }
     for op in ["knowledge.parameter", "datum.plane", "datum.axis_system", "datum.point"] { r.register(Arc::new(knowledge::KnowledgeOp(op))); }
     for op in ["file.export_step", "file.export_mesh", "file.export_3mf", "file.export_usd", "file.export_feature_script"] { r.register(Arc::new(file::FileOp(op))); }
+    r.register(Arc::new(push_pull::PushPull));
     r.register(Arc::new(file::ImportStep));
     r
 }

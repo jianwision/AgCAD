@@ -36,3 +36,7 @@ pub use brep::Brep;
 pub use kernel::{ExactKernel, NativeKernel, Solid};
 pub use math::{v3, Frame, V3};
 pub mod accelerator;
+
+pub mod block_corner;
+
+pub mod block_edit;

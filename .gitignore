@@ -2,6 +2,8 @@
 **/target
 *.ptx.cache
 /.agcad-cache
+/.env
+/agcad-models/
 
 # Demo build output and bundled binaries (not source)
 /docs/Demo/output/

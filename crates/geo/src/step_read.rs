@@ -8,6 +8,8 @@ use crate::math::{Frame, V3};
 use crate::nurbs::{NurbsCurve, NurbsSurface};
 use crate::surface::Surface;
 use std::collections::HashMap;
+mod appearance;
+pub use appearance::{StepBodyStyle, StepMaterial};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
@@ -221,6 +223,7 @@ pub fn index(t: &[Tok], lim: &ImportLimits) -> Result<(HashMap<u64, Entity>, Str
                 }
                 other => return Err(format!("#{id}: unexpected {other:?}")),
             }
+            if parts.is_empty() { return Err(format!("#{id}: empty STEP entity")); }
             map.insert(id, Entity { parts });
             if map.len() > lim.max_entities { return Err("too many entities".into()); }
             while i < t.len() && t[i] != Tok::Semi { i += 1; }
@@ -233,6 +236,7 @@ pub fn index(t: &[Tok], lim: &ImportLimits) -> Result<(HashMap<u64, Entity>, Str
 struct Ctx<'a> {
     m: &'a HashMap<u64, Entity>,
     scale: f64,
+    max_depth: usize,
 }
 
 impl<'a> Ctx<'a> {
@@ -258,7 +262,9 @@ impl<'a> Ctx<'a> {
     }
     fn len(&self, a: &Arg) -> f64 { a.num().unwrap_or(0.0) * self.scale }
 
-    fn curve(&self, r: u64) -> Result<Curve, String> {
+    fn curve(&self, r: u64) -> Result<Curve, String> { self.curve_at(r, 0) }
+    fn curve_at(&self, r: u64, depth: usize) -> Result<Curve, String> {
+        if depth > self.max_depth { return Err("curve reference depth exceeded".into()); }
         let e = self.get(r)?;
         match e.ty() {
             "LINE" => {
@@ -280,22 +286,23 @@ impl<'a> Ctx<'a> {
                 let w = e.part("RATIONAL_B_SPLINE_CURVE").map(|p| p[0].list().iter().filter_map(Arg::num).collect::<Vec<_>>());
                 Ok(Curve::Nurbs(self.bcurve(bc[0].num().unwrap_or(1.0) as usize, bc[1].list(), bk[0].list(), bk[1].list(), w)?))
             }
-            "SURFACE_CURVE" | "SEAM_CURVE" => self.curve(e.args()[1].r().ok_or("surface_curve 3d")?),
-            "TRIMMED_CURVE" => self.curve(e.args()[1].r().ok_or("trimmed basis")?),
+            "SURFACE_CURVE" | "SEAM_CURVE" => self.curve_at(e.args()[1].r().ok_or("surface_curve 3d")?, depth + 1),
+            "TRIMMED_CURVE" => self.curve_at(e.args()[1].r().ok_or("trimmed basis")?, depth + 1),
             other => Err(format!("unsupported curve type {other} (#{r})")),
         }
     }
 
     fn bcurve(&self, degree: usize, pts: &[Arg], mults: &[Arg], knots: &[Arg], w: Option<Vec<f64>>) -> Result<NurbsCurve, String> {
         let poles: Vec<V3> = pts.iter().map(|p| self.point(p.r().ok_or("pole ref")?)).collect::<Result<_, _>>()?;
-        let mut kv = Vec::new();
-        for (m, k) in mults.iter().zip(knots) { for _ in 0..m.num().unwrap_or(1.0) as usize { kv.push(k.num().unwrap_or(0.0)); } }
+        let kv = expanded_knots(mults, knots, poles.len(), degree)?;
         let n = NurbsCurve { degree, knots: kv, weights: w.unwrap_or_else(|| vec![1.0; poles.len()]), poles };
         n.validate().map_err(|e| format!("invalid B-spline curve: {e}"))?;
         Ok(n)
     }
 
-    fn surface(&self, r: u64) -> Result<Surface, String> {
+    fn surface(&self, r: u64) -> Result<Surface, String> { self.surface_at(r, 0) }
+    fn surface_at(&self, r: u64, depth: usize) -> Result<Surface, String> {
+        if depth > self.max_depth { return Err("surface reference depth exceeded".into()); }
         let e = self.get(r)?;
         match e.ty() {
             "PLANE" => Ok(Surface::Plane { frame: self.ax2(e.args()[1].r().ok_or("plane pos")?)? }),
@@ -327,7 +334,7 @@ impl<'a> Ctx<'a> {
                 let z = self.dir(ax[2].r().ok_or("axis dir")?)?;
                 Ok(Surface::Revolution { curve: Box::new(c), axis: Frame::new(o, z, z.any_perp()) })
             }
-            "OFFSET_SURFACE" => Ok(Surface::Offset { base: Box::new(self.surface(e.args()[1].r().ok_or("base")?)?), d: self.len(&e.args()[2]) }),
+            "OFFSET_SURFACE" => Ok(Surface::Offset { base: Box::new(self.surface_at(e.args()[1].r().ok_or("base")?, depth + 1)?), d: self.len(&e.args()[2]) }),
             other => Err(format!("unsupported surface type {other} (#{r})")),
         }
     }
@@ -335,17 +342,33 @@ impl<'a> Ctx<'a> {
     fn bsurf(&self, du: usize, dv: usize, rows: &[Arg], kn: &[Arg], w: Option<Vec<f64>>) -> Result<Surface, String> {
         let nu = rows.len();
         let nv = rows.first().map(|r| r.list().len()).unwrap_or(0);
-        let mut poles = Vec::with_capacity(nu * nv);
+        if nu == 0 || nv == 0 || rows.iter().any(|r| r.list().len() != nv) { return Err("invalid surface control grid".into()); }
+        let mut poles = Vec::new();
         for row in rows { for p in row.list() { poles.push(self.point(p.r().ok_or("pole")?)?); } }
-        let expand = |m: &Arg, k: &Arg| -> Vec<f64> { let mut v = Vec::new(); for (mm, kk) in m.list().iter().zip(k.list()) { for _ in 0..mm.num().unwrap_or(1.0) as usize { v.push(kk.num().unwrap_or(0.0)); } } v };
-        let s = NurbsSurface { du, dv, ku: expand(&kn[0], &kn[2]), kv: expand(&kn[1], &kn[3]), nu, nv, weights: w.unwrap_or_else(|| vec![1.0; nu * nv]), poles };
+        let s = NurbsSurface { du, dv, ku: expanded_knots(kn[0].list(), kn[2].list(), nu, du)?, kv: expanded_knots(kn[1].list(), kn[3].list(), nv, dv)?, nu, nv, weights: w.unwrap_or_else(|| vec![1.0; nu * nv]), poles };
         s.validate().map_err(|e| format!("invalid B-spline surface: {e}"))?;
         Ok(Surface::Nurbs(s))
     }
 }
 
+fn expanded_knots(mults: &[Arg], knots: &[Arg], poles: usize, degree: usize) -> Result<Vec<f64>, String> {
+    if degree >= poles || mults.len() != knots.len() { return Err("invalid spline degree or knots".into()); }
+    let expected = poles.checked_add(degree + 1).ok_or("knot count overflow")?;
+    let mut values = Vec::new();
+    for (m, k) in mults.iter().zip(knots) {
+        let n = m.num().ok_or("invalid knot multiplicity")?;
+        if n < 1.0 || n.fract() != 0.0 || n > (expected - values.len()) as f64 { return Err("invalid knot multiplicity".into()); }
+        values.resize(values.len() + n as usize, k.num().ok_or("invalid knot")?);
+    }
+    Ok(values)
+}
+
 fn length_scale(m: &HashMap<u64, Entity>) -> f64 {
-    for e in m.values() {
+    let mut contexts: Vec<_> = m.iter().filter(|(_, e)| e.part("GLOBAL_UNIT_ASSIGNED_CONTEXT").is_some()).collect();
+    contexts.sort_by_key(|(id, _)| **id);
+    let units = contexts.iter().flat_map(|(_, e)| &e.part("GLOBAL_UNIT_ASSIGNED_CONTEXT").unwrap()[..])
+        .flat_map(Arg::list).filter_map(Arg::r).filter_map(|r| m.get(&r));
+    for e in units.chain(m.values()) {
         if e.part("LENGTH_UNIT").is_some() {
             if let Some(si) = e.part("SI_UNIT") {
                 let prefix = si.first().map(|a| a.s().to_string()).unwrap_or_default();
@@ -362,14 +385,25 @@ fn length_scale(m: &HashMap<u64, Entity>) -> f64 {
 
 /// Import all MANIFOLD_SOLID_BREP / shell-based bodies.
 pub fn read_step(src: &str, lim: &ImportLimits) -> Result<(Vec<Brep>, ImportReport), String> {
+    decode_step(src, lim, false).map(|(b, r, _)| (b, r))
+}
+
+/// Appearance entries follow the same order as the returned bodies and their B-rep faces.
+pub fn read_styled_step(src: &str, lim: &ImportLimits) -> Result<(Vec<Brep>, ImportReport, Vec<StepBodyStyle>), String> {
+    decode_step(src, lim, true)
+}
+
+fn decode_step(src: &str, lim: &ImportLimits, styled: bool) -> Result<(Vec<Brep>, ImportReport, Vec<StepBodyStyle>), String> {
     let toks = lex(src, lim)?;
     let (m, schema) = index(&toks, lim)?;
     let scale = length_scale(&m);
-    let cx = Ctx { m: &m, scale };
+    let cx = Ctx { m: &m, scale, max_depth: lim.max_depth };
     let mut report = ImportReport { entities: m.len(), length_scale: scale, schema, ..Default::default() };
     let mut ids: Vec<&u64> = m.keys().collect();
     ids.sort();
     let mut bodies = Vec::new();
+    let appearance = styled.then(|| appearance::Styles::read(&m));
+    let mut styles = Vec::new();
     for &id in &ids {
         let e = &m[id];
         let (shells, kind): (Vec<u64>, BodyKind) = match e.ty() {
@@ -379,6 +413,7 @@ pub fn read_step(src: &str, lim: &ImportLimits) -> Result<(Vec<Brep>, ImportRepo
             _ => continue,
         };
         let mut b = Brep::new(kind);
+        let mut style = appearance.as_ref().map(|a| a.body(*id, e.args()[0].s()));
         let mut vmap: HashMap<u64, u32> = HashMap::new();
         let mut emap: HashMap<u64, u32> = HashMap::new();
         let mut smap: HashMap<u64, u32> = HashMap::new();
@@ -431,6 +466,11 @@ pub fn read_step(src: &str, lim: &ImportLimits) -> Result<(Vec<Brep>, ImportRepo
                                 let range = match &c { Curve::Nurbs(n) => n.domain(), _ => (-1e12, 1e12) };
                                 let mut t0 = c.closest(p0, range.0, range);
                                 let mut t1 = c.closest(p1, range.1, range);
+                                if let Curve::Ellipse{frame,a,b}=&c {
+                                    // STEP vertices lie on the ellipse. Recover the parameter directly before unwrapping its sweep.
+                                    let parameter=|p|{let v=frame.to_local(p);(v.y/b).atan2(v.x/a)};
+                                    (t0,t1)=(parameter(p0),parameter(p1));
+                                }
                                 if let Curve::Circle { .. } | Curve::Ellipse { .. } = c {
                                     // closed curves: choose the sweep matching the sense
                                     let tau = core::f64::consts::TAU;
@@ -454,9 +494,13 @@ pub fn read_step(src: &str, lim: &ImportLimits) -> Result<(Vec<Brep>, ImportRepo
                 let outer = loops.remove(oi).1;
                 let inner: Vec<Vec<(u32, bool)>> = loops.into_iter().map(|l| l.1).collect();
                 b.add_face(surf_i, same, si, &outer, &inner, name, [0.0, core::f64::consts::TAU, -1e9, 1e9]);
+                if let (Some(s), Some(a)) = (&mut style, &appearance) {
+                    s.faces.push((fref, a.color(fref).or_else(|| a.color(sh))));
+                }
             }
         }
         bodies.push(b);
+        if let Some(s) = style { styles.push(s); }
     }
     report.bodies = bodies.len();
     // validation properties present in the file
@@ -468,7 +512,7 @@ pub fn read_step(src: &str, lim: &ImportLimits) -> Result<(Vec<Brep>, ImportRepo
             }
         }
     }
-    Ok((bodies, report))
+    Ok((bodies, report, styles))
 }
 
 #[cfg(test)]

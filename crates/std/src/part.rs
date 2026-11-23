@@ -54,6 +54,7 @@ pub struct PartOp(pub &'static str);
 impl FeatureImpl for PartOp {
     fn op(&self) -> &'static str { self.0 }
     fn execute(&self, ctx: &mut BuildContext<'_>, n: &FeatureNode) -> Result<Product, FeatureError> {
+        n.check_part_options(|v|ctx.number(v).ok()).map_err(|m| FeatureError::new(AgStatus::UnsupportedOp,m))?;
         match self.0 {
             "part.pad" | "part.pocket" => {
                 let r = regions_of(ctx, req(n, "profile")?)?;
@@ -68,6 +69,9 @@ impl FeatureImpl for PartOp {
             }
             "part.shaft" | "part.groove" => {
                 let r = regions_of(ctx, req(n, "profile")?)?;
+                let axis = req(n,"axis")?;
+                let direction = vec3(ctx,axis).or_else(|_|frame(ctx,axis).map(|f|f.z))?;
+                if direction.normalized().cross(r.frame.y).norm()>1e-9 {return Err(bad("Revolve axis must follow the sketch Y axis"));}
                 let reg = r.regions.first().ok_or_else(|| bad("profile has no regions"))?;
                 // vertical axis and an axis-aligned meridian: an exact layered stack of annuli
                 // (composes with pads / pockets through the exact layered booleans)
@@ -102,6 +106,11 @@ impl FeatureImpl for PartOp {
                 combine(ctx, n, solid, BoolOp2::Union)
             }
             "part.hole" => {
+                if let support @ Value::Ref { .. } = req(n,"support")? {
+                    if !matches!(ctx.product(support)?, Product::Solid(Solid::Layered(_))) {
+                        return Err(bad("Hole support must resolve to the top end of a prismatic solid"));
+                    }
+                }
                 let body = ctx.bodies.get(&n.container).cloned().ok_or_else(|| FeatureError::new(AgStatus::InvalidBaseline, "hole needs an existing body"))?;
                 let Solid::Layered(l) = &body else { return Err(FeatureError::new(AgStatus::TopologyFailed, "hole on non-prismatic body requires the general boolean (P11)")) };
                 let spec = match req(n, "spec")? { Value::Map(m) => m.clone(), _ => BTreeMap::new() };
@@ -128,12 +137,33 @@ impl FeatureImpl for PartOp {
             }
             "part.edge_fillet" | "part.chamfer" => {
                 let body = ctx.bodies.get(&n.container).cloned().ok_or_else(|| FeatureError::new(AgStatus::InvalidBaseline, format!("{} needs an existing body", n.op)))?;
-                let Solid::Layered(l) = &body else { return Err(FeatureError::new(AgStatus::TopologyFailed, "fillets on non-prismatic bodies require the general rolling-ball path (P11 general kernel)")) };
-                let size = if self.0 == "part.edge_fillet" { num(ctx, n, "r")? } else { num(ctx, n, "a")? };
+                let round = self.0 == "part.edge_fillet";
+                let size = num(ctx,n,if round {"r"} else {"a"})?;
+                let edges = list(req(n,"edges")?);
+                if edges.iter().any(|e| matches!(e,Value::Map(m) if m.contains_key("endpoints_mm") || m.contains_key("vertex_mm"))) {
+                    if !round && (text(n,"mode")!=Some("equal_distance") || arg(n,"b").is_some()) {return Err(bad("Selected chamfers require one equal setback"));}
+                    if let [Value::Map(pick)]=edges {
+                        if pick.contains_key("endpoints_mm") {return crate::selected_edge::edit(ctx,&body.brep(),pick,size,round);}
+                    }
+                    let block=agcad_geo::block_edit::Block::recognize(&body.brep()).map_err(bad)?;
+                    let (mut mask,mut vertices)=(0u16,0u8);
+                    for e in edges {
+                        let Value::Map(m)=e else{return Err(bad("Invalid selected entity"))};
+                        if let Some(v)=m.get("vertex_mm") {
+                            if round{return Err(bad("Vertex treatment requires a chamfer"))}
+                            vertices|=1<<block.vertex(vec3(ctx,v)?).map_err(bad)?;
+                        }else{
+                            let [a,b]=m.get("endpoints_mm").map(list).unwrap_or_default() else{return Err(bad("Edge requires both endpoints"))};
+                            mask|=1<<block.edge(vec3(ctx,a)?,vec3(ctx,b)?).map_err(bad)?;
+                        }
+                    }
+                    return Ok(Product::Solid(Solid::Brep(block.treat(mask,vertices,size,round).map_err(bad)?)));
+                }
+                let Solid::Layered(l) = &body else { return Err(FeatureError::new(AgStatus::TopologyFailed, "This group fillet needs a layered prism. Select one edge on a rectangular block.")) };
                 let brep = l.to_brep();
                 // Resolve edge names (or "all") to 2D corner points of vertical edges.
                 let mut at: Vec<[f64; 2]> = Vec::new();
-                let edges = list(req(n, "edges")?);
+
                 // vertical edges given by a 2D point they pass through (sketch-plane coordinates)
                 for e in edges.iter() {
                     if let Value::List(c) = e { if c.len() == 2 { at.push([ctx.number(&c[0])?, ctx.number(&c[1])?]); } }

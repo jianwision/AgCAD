@@ -25,6 +25,7 @@ members = [
     "crates/improve",
     "crates/server",
     "crates/cli",
+    "crates/viewer",
     "crates/trace",
     "crates/conformance",
     "crates/capi",

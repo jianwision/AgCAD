@@ -168,7 +168,14 @@ pub fn tessellate(b: &Brep, o: &TessOptions) -> Mesh {
 }
 
 pub fn try_tessellate(b: &Brep, o: &TessOptions) -> agcad_driver::DriverResult<Mesh> {
-    Ok(tessellate_impl(b, o, false)?.mesh)
+    Ok(tessellate_impl(b, o, false, None)?.mesh)
+}
+
+/// Display mesh and ordered mesh position indices along each B-rep edge, including both ends.
+pub fn try_tessellate_with_edges(b: &Brep, o: &TessOptions) -> agcad_driver::DriverResult<(Mesh, Vec<Vec<u32>>)> {
+    let mut paths = Vec::new();
+    let mesh = tessellate_impl(b, o, false, Some(&mut paths))?.mesh;
+    Ok((mesh, paths))
 }
 
 /// Immutable position ranges produced by this tessellation on the calling thread.
@@ -198,13 +205,20 @@ impl From<Mesh> for PreparedMesh {
 }
 
 pub fn tessellate_for_measurement(b: &Brep, o: &TessOptions) -> agcad_driver::DriverResult<PreparedMesh> {
-    tessellate_impl(b, o, crate::accelerator::cuda_mass_enabled())
+    tessellate_impl(b, o, crate::accelerator::cuda_mass_enabled(), None)
 }
 
-fn tessellate_impl(b: &Brep, o: &TessOptions, retain:bool) -> agcad_driver::DriverResult<PreparedMesh> {
+fn tessellate_impl(b: &Brep, o: &TessOptions, retain:bool, paths: Option<&mut Vec<Vec<u32>>>) -> agcad_driver::DriverResult<PreparedMesh> {
     let grid = patch::Grid::new(b,o)?;
     let mut ranges: Vec<PointRange> = Vec::new();
     let mut bl = Builder::new(b, &grid);
+    if let Some(paths) = paths {
+        paths.extend(b.edges.iter().zip(&bl.esamples).map(|(edge, samples)| {
+            std::iter::once(bl.vmap[edge.v0 as usize])
+                .chain(samples.iter().map(|&(_, i)| i))
+                .chain(std::iter::once(bl.vmap[edge.v1 as usize])).collect()
+        }));
+    }
     for (fi, f) in b.faces.iter().enumerate() {
         let start = bl.mesh.positions.len();
         if grid.tessellate(fi,&mut bl) {
@@ -220,6 +234,14 @@ fn tessellate_impl(b: &Brep, o: &TessOptions, retain:bool) -> agcad_driver::Driv
             continue;
         }
         let surf = &b.surfaces[f.surface as usize];
+        if let Some(tris)=sphere_corner(&mut bl,f,surf){
+            bl.mesh.face_of.extend(std::iter::repeat_n(fi as u32,tris.len()));bl.mesh.triangles.extend(tris);continue;
+        }
+        if let Some(tris) = cylinder_strip(&bl, f, surf) {
+            bl.mesh.face_of.extend(std::iter::repeat_n(fi as u32, tris.len()));
+            bl.mesh.triangles.extend(tris);
+            continue;
+        }
         if let Some(tris) = closed_periodic_grid(&mut bl, f, o) {
             for t in tris {
                 let tri = if f.same_sense { t } else { [t[0], t[2], t[1]] };
@@ -270,6 +292,74 @@ fn tessellate_impl(b: &Brep, o: &TessOptions, retain:bool) -> agcad_driver::Driv
     Ok(PreparedMesh { mesh: bl.mesh, indices_valid: true, resident })
 }
 
+// Subdivide an octant radially. Reuse every sampled boundary vertex from its adjacent fillet.
+fn sphere_corner(bl:&mut Builder<'_>,f:&crate::brep::Face,surf:&crate::surface::Surface)->Option<Vec<[u32;3]>>{
+    let crate::surface::Surface::Sphere{frame,r}=surf else{return None};
+    let [lp]=f.loops.as_slice() else{return None};let cs=&bl.b.loops[*lp as usize].coedges;
+    if cs.len()!=3 || cs.iter().any(|&ce|{
+        let e=&bl.b.edges[bl.b.coedges[ce as usize].edge as usize];
+        !matches!(&bl.b.curves[e.curve as usize],Curve::Circle{frame:cf,..} if cf.origin.dist(frame.origin)<crate::brep::DEFAULT_LINEAR_TOL) ||
+        ((e.t1-e.t0).abs()-std::f64::consts::FRAC_PI_2).abs()>1e-6
+    }){return None}
+    let outer=bl.loop_points(*lp);let n=outer.len();let normals:Vec<_>=outer.iter().map(|&i|(bl.mesh.positions[i as usize]-frame.origin).normalized()).collect();
+    let middle=normals.iter().copied().fold(V3::ZERO,|s,p|s+p).normalized();
+    let rings=n.div_ceil(3);let mut prev=outer;let mut tris=Vec::new();
+    for k in 1..=rings{
+        let mut row=Vec::with_capacity(n);let count=if k==rings{1}else{n};
+        for v in normals.iter().take(count){row.push(bl.mesh.positions.len() as u32);bl.mesh.positions.push(frame.origin+v.lerp(middle,k as f64/rings as f64).normalized()*(*r));}
+        for i in 0..n{let j=(i+1)%n;
+            tris.push([prev[i],prev[j],row[i%count]]);
+            if count>1{tris.push([row[i],prev[j],row[j]]);}
+        }
+        prev=row;
+    }
+    for tri in &mut tris{let [a,b,c]=tri.map(|i|bl.mesh.positions[i as usize]);if ((b-a).cross(c-a).dot(a-frame.origin)>0.)!=f.same_sense{tri.swap(1,2)}}
+    Some(tris)
+}
+
+// Pair the two sampled arc boundaries of a cylindrical fillet. Ear clipping in UV
+// can connect distant stations when a rigid transform perturbs a nominally level row.
+fn cylinder_strip(bl: &Builder<'_>, f: &crate::brep::Face, surf: &crate::surface::Surface) -> Option<Vec<[u32;3]>> {
+    let crate::surface::Surface::Cylinder { frame, .. } = surf else {return None};
+    let [lp] = f.loops.as_slice() else {return None};
+    let coedges=&bl.b.loops[*lp as usize].coedges;
+    if coedges.len()!=4 {return None;}
+    let mut arcs=Vec::with_capacity(2);
+    for &ce in coedges {
+        let edge_id=bl.b.coedges[ce as usize].edge as usize;
+        let e=&bl.b.edges[edge_id];
+        match &bl.b.curves[e.curve as usize] {
+            Curve::Line {dir,..} if dir.normalized().cross(frame.z).norm()<1e-9 => (),
+            Curve::Circle {frame:circle,..} if e.v0!=e.v1 && circle.z.cross(frame.z).norm()<1e-9 => {
+                let row:Vec<_>=std::iter::once(bl.vmap[e.v0 as usize]).chain(bl.esamples[edge_id].iter().map(|p|p.1)).chain(std::iter::once(bl.vmap[e.v1 as usize])).collect();
+                arcs.push(row);
+            }
+            Curve::Ellipse {..} if e.v0!=e.v1 => {
+                let row=std::iter::once(bl.vmap[e.v0 as usize]).chain(bl.esamples[edge_id].iter().map(|p|p.1)).chain(std::iter::once(bl.vmap[e.v1 as usize])).collect();
+                arcs.push(row);
+            }
+            _ => return None,
+        }
+    }
+    let [first,second]=arcs.as_mut_slice() else {return None};
+    let p=|i:u32| bl.mesh.positions[i as usize];
+    let radial=|v:V3| v-frame.z*v.dot(frame.z);
+    if radial(p(first[0])-p(second[0])).norm()>crate::brep::DEFAULT_LINEAR_TOL {second.reverse();}
+    if radial(p(first[0])-p(second[0])).norm()>crate::brep::DEFAULT_LINEAR_TOL ||
+        radial(p(*first.last()?)-p(*second.last()?)).norm()>crate::brep::DEFAULT_LINEAR_TOL {return None;}
+    let mut tris=Vec::with_capacity(first.len()+second.len()-2);
+    let(mut i,mut j)=(0,0);
+    while i+1<first.len() || j+1<second.len(){
+        let lower=i+1<first.len() && (j+1==second.len() ||
+            radial(p(first[i+1])-p(second[j])).norm()<=radial(p(first[i])-p(second[j+1])).norm());
+        let mut tri=if lower{let t=[first[i],first[i+1],second[j]];i+=1;t}else{let t=[first[i],second[j+1],second[j]];j+=1;t};
+        let [a,b,c]=tri.map(p);
+        if ((b-a).cross(c-a).dot(radial((a+b+c)*(1./3.)-frame.origin))>0.)!=f.same_sense{tri.swap(1,2);}
+        tris.push(tri);
+    }
+    Some(tris)
+}
+
 /// Structured grid for faces covering a whole sphere or torus (seam/pole loops). Seam
 /// columns/rows reuse the seam edges' sample vertices, so the result stays watertight.
 fn closed_periodic_grid(bl: &mut Builder<'_>, f: &crate::brep::Face, o: &TessOptions) -> Option<Vec<[u32; 3]>> {
@@ -279,6 +369,7 @@ fn closed_periodic_grid(bl: &mut Builder<'_>, f: &crate::brep::Face, o: &TessOpt
     let edge_of = |k: usize| bl.b.coedges[lp.coedges[k] as usize].edge as usize;
     match surf {
         Surface::Sphere { r, .. } => {
+            if lp.coedges.len()!=2 || edge_of(0)!=edge_of(1) {return None}
             let seam = edge_of(0);
             let e = bl.b.edges[seam].clone();
             let rows: Vec<(f64, u32)> = std::iter::once((e.t0, bl.vmap[e.v0 as usize]))

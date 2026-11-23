@@ -104,9 +104,14 @@ impl HarnessSession {
         }
     }
 
+    pub fn has_feature_ref(&self, branch: &str, name: &str) -> bool {
+        self.ids.get(branch).and_then(|ids| ids.get(name)).is_some_and(|id|
+            self.doc.workspaces.get(branch).is_some_and(|ws| ws.state.features.contains_key(id)))
+    }
+
     fn run_program_inner(&mut self, branch: &str, p: &Program, catalog: &Catalog) -> Result<ProgramOutcome, (AgStatus, String)> {
         self.requirements.check_rev(p.requirements_rev).map_err(|s| (s, format!("program targets requirements rev {}, current is {}", p.requirements_rev, self.requirements.rev)))?;
-        let diags = agcad_ir::verify::verify(p, catalog);
+        let diags = agcad_ir::verify::verify_in_workspace(p, catalog, |id| self.has_feature_ref(branch, id));
         if let Some(d) = diags.first() { return Err((d.status, format!("{}: {}", d.stmt, d.message))); }
         let ws_rev = self.doc.workspace(branch).ok_or((AgStatus::StaleReference, format!("unknown branch '{branch}'")))?.revision;
         if p.expected_revision != ws_rev { return Err((AgStatus::StaleRevision, format!("expected revision {}, workspace is at {ws_rev}", p.expected_revision))); }

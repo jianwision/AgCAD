@@ -111,6 +111,7 @@ impl Gpu {
                 "rail_overlap",
                 "rebase_triangles",
                 "local_positions",
+                "block_edge_corners",
             ]
             .into_iter(),
             &[],

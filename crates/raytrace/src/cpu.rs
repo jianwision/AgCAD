@@ -56,7 +56,11 @@ impl CpuTracer {
         true
     }
 
-    fn one(&self, r: &Ray) -> Hit {
+    /// Intersect one ray without scheduling a batch of worker threads.
+    pub fn trace_one(&self, r: &Ray) -> Hit {
+        if self.tri.is_empty() {
+            return Hit { t: -1.0, prim: u32::MAX, u: 0.0, v: 0.0, front: 0 };
+        }
         let o = v3(r.origin[0] as f64, r.origin[1] as f64, r.origin[2] as f64);
         let d = v3(r.dir[0] as f64, r.dir[1] as f64, r.dir[2] as f64);
         let inv = v3(1.0 / d.x, 1.0 / d.y, 1.0 / d.z);
@@ -100,7 +104,7 @@ impl Tracer for CpuTracer {
         let per = rays.len().div_ceil(threads).max(1);
         std::thread::scope(|sc| {
             for (rs, os) in rays.chunks(per).zip(out.chunks_mut(per)) {
-                sc.spawn(move || for (r, o) in rs.iter().zip(os.iter_mut()) { *o = self.one(r); });
+                sc.spawn(move || for (r, o) in rs.iter().zip(os.iter_mut()) { *o = self.trace_one(r); });
             }
         });
         Ok(out)

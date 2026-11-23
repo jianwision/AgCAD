@@ -85,6 +85,10 @@ fn configurations_of(table: &J) -> Option<u64> {
 
 /// Lint a program given as JSON text.
 pub fn check_program(text: &str, catalog: &Catalog) -> LintReport {
+    check_program_in_workspace(text, catalog, |_| false)
+}
+
+pub fn check_program_in_workspace(text: &str, catalog: &Catalog, exists: impl Fn(&str) -> bool) -> LintReport {
     let mut out: Vec<Lint> = Vec::new();
     let mut push = |severity, path: String, status: &str, message: String, fix: Option<String>, signature: Option<String>| out.push(Lint { severity, path, status: status.into(), message, fix, signature });
     let mut preview = serde_json::json!({});
@@ -185,7 +189,7 @@ pub fn check_program(text: &str, catalog: &Catalog) -> LintReport {
     // SSA order, finiteness and unit dimensions on what decoded (missing-input rules are
     // already reported above with fixes, so skip those duplicates).
     let prog = Program { agir: crate::program::AGIR_VERSION.into(), requirements_rev: 0, expected_revision: 0, statements: decoded.clone() };
-    for d in crate::verify::verify(&prog, catalog) {
+    for d in crate::verify::verify_in_workspace(&prog, catalog, exists) {
         if d.message.contains("missing required input") { continue; }
         if failed.iter().any(|f| d.message.contains(&format!("'%{f}'"))) { continue; }
         let i = json_index.get(&d.stmt).copied().unwrap_or(0);

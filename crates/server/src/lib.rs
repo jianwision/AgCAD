@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
 pub mod device;
+mod mcp;
 pub mod pareto;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -38,7 +39,11 @@ pub struct Server {
 }
 
 fn tool(name: &str, description: &str, schema: Value) -> Value {
-    json!({ "name": name, "description": description, "inputSchema": schema })
+    let mut definition = json!({ "name": name, "description": description, "inputSchema": schema });
+    if let Some(output) = mcp::output_schema(name) {
+        definition["outputSchema"] = output;
+    }
+    definition
 }
 
 pub fn tools() -> Vec<Value> {
@@ -49,7 +54,7 @@ pub fn tools() -> Vec<Value> {
         tool("check_program", "Lint an AgIR JSON program without running it: every problem at once with JSON path, signature and a concrete fix, plus a size preview. Formulas: \"=od/2 - 5 mm\"; parameter references: \"$od\"; statement references: \"%id\".", json!({ "type": "object", "properties": { "program": { "type": "object" } }, "required": ["program"] })),
         tool("run_program", "Run an AgIR JSON program on the active workspace. Lints first (same diagnostics as check_program); returns an UpdateReport (and DeliveryReport on document.finish).", json!({ "type": "object", "properties": { "program": { "type": "object" } }, "required": ["program"] })),
         tool("specification_tree", "Specification tree of the active workspace: features, parameters, revision.", json!({ "type": "object" })),
-        tool("query", "Resolve element names / face queries on the current body.", json!({ "type": "object", "properties": { "role": { "type": "string" } } })),
+        tool("query", "Resolve face names and zero-based face indices on the current body. Use a returned index for direct.push_pull with the current workspace revision.", json!({ "type": "object", "properties": { "role": { "type": "string" } } })),
         tool("describe", "Structured text view of the current body: bounding box, volume, holes and cylindrical walls by diameter/axis/position, planar faces by normal/offset, parameters. With against_version: semantic diff (holes added/removed, volume delta, parameter changes).", json!({ "type": "object", "properties": { "against_version": { "type": "integer" } } })),
         tool("render", "Offscreen render (PNG, base64) of the current body: views iso/top/front/right, mode shaded/face_ids.", json!({ "type": "object", "properties": { "view": { "type": "string" }, "mode": { "type": "string" } } })),
         tool("export", "Export the current body (step_ap242 | stl | 3mf); returns path written by the control plane.", json!({ "type": "object", "properties": { "format": { "type": "string" } } })),
@@ -65,8 +70,17 @@ pub fn tools() -> Vec<Value> {
 
 
 /// Minimal statement for an op: required inputs filled with typed example values.
-fn example_statement(o: &agcad_ir::OpManifest) -> Value {
+pub fn example_statement(o: &agcad_ir::OpManifest) -> Value {
     let mut args = serde_json::Map::new();
+    if o.name == "direct.push_pull" {
+        return json!({"id":"extend","op":o.name,"args":{"faces":[0],"d":"30 mm"}});
+    }
+    if o.name == "part.hole" {
+        return json!({"id":"hole","op":o.name,"args":{"support":"cap_end","positions":[[0,0]],"spec":{"d":4,"depth":"through"}}});
+    }
+    if o.name == "part.primitive" {
+        return json!({"id":"sphere","op":o.name,"args":{"kind":"sphere","p":[5],"axis":"xy"}});
+    }
     for inp in &o.inputs {
         let Some((name, ty)) = inp.split_once(':') else { continue };
         if ty.ends_with('?') { continue; }
@@ -207,11 +221,11 @@ impl Server {
             }
             "check_program" => {
                 let prog = args.get("program").ok_or("missing program")?;
-                serde_json::to_value(agcad_ir::lint::check_program(&prog.to_string(), catalog)).map_err(|e| e.to_string())?
+                serde_json::to_value(agcad_ir::lint::check_program_in_workspace(&prog.to_string(), catalog, |id| self.session.has_feature_ref(&self.branch, id))).map_err(|e| e.to_string())?
             }
             "run_program" => {
                 let prog = args.get("program").ok_or("missing program")?;
-                let lint = agcad_ir::lint::check_program(&prog.to_string(), catalog);
+                let lint = agcad_ir::lint::check_program_in_workspace(&prog.to_string(), catalog, |id| self.session.has_feature_ref(&self.branch, id));
                 if !lint.ok {
                     let first = lint.diagnostics.first().map(|d| d.status.clone()).unwrap_or_default();
                     return Err(format!("{first}: program has {} error(s); nothing was run\n{}", lint.errors, serde_json::to_string_pretty(&lint).unwrap_or_default()));
@@ -237,9 +251,17 @@ impl Server {
             "query" => {
                 let role = args.get("role").and_then(Value::as_str).unwrap_or("");
                 let body = self.session.accepted_bodies.get(&self.branch).and_then(|a| a.exact.as_ref()).and_then(Product::exact_body);
-                let names: Vec<_> = body.iter().flat_map(|b| &b.faces).filter(|f| role.is_empty() || f.name.contains(role))
-                    .map(|f| agcad_harness::report::untrusted(&f.name, "element_name")).collect();
-                json!({ "elements": names })
+                let mut elements = Vec::new();
+                let mut faces = Vec::new();
+                if let Some(body) = body.as_deref() {
+                    for (index, face) in body.faces.iter().enumerate().filter(|(_, f)| role.is_empty() || f.name.contains(role)) {
+                        let name = agcad_harness::report::untrusted(&face.name, "element_name");
+                        faces.push(json!({"index":index,"name":name}));
+                        elements.push(name);
+                    }
+                }
+                let revision = self.session.doc.workspace(&self.branch).ok_or("no workspace")?.revision;
+                json!({ "elements": elements, "faces": faces, "revision": revision })
             }
             "describe" => {
                 let accepted = self.session.accepted_bodies.get(&self.branch).ok_or("no accepted geometry")?;
@@ -458,24 +480,22 @@ impl Server {
     /// Handle one JSON-RPC message; returns the response (None for notifications).
     pub fn handle(&mut self, msg: &Value) -> Option<Value> {
         let id = msg.get("id").cloned();
+        if msg.get("jsonrpc").and_then(Value::as_str) != Some("2.0") || !msg["method"].is_string() ||
+            id.as_ref().is_some_and(|v| !(v.is_string() || v.is_i64() || v.is_u64())) {
+            return Some(json!({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid JSON-RPC request"}}));
+        }
+        // MCP tool execution is a request. Notifications have no tool side effects.
+        let id = id?;
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         let result: Result<Value, (i64, String)> = match method {
             "initialize" => Ok(json!({ "protocolVersion": PROTOCOL_VERSION, "capabilities": { "tools": {} }, "serverInfo": { "name": "agcad", "version": env!("CARGO_PKG_VERSION") } })),
             "notifications/initialized" => return None,
             "tools/list" => Ok(json!({ "tools": tools() })),
-            "tools/call" => {
-                let p = msg.get("params").cloned().unwrap_or(Value::Null);
-                let name = p.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                let args = p.get("arguments").cloned().unwrap_or(json!({}));
-                Ok(match self.call_tool(&name, &args) {
-                    Ok(v) => json!({ "content": [{ "type": "text", "text": v.to_string() }], "isError": false }),
-                    Err(e) => json!({ "content": [{ "type": "text", "text": e }], "isError": true }),
-                })
-            }
+            "tools/call" => mcp::call(self, &msg["params"]),
             "ping" => Ok(json!({})),
             _ => Err((-32601, format!("method not found: {method}"))),
         };
-        id.map(|id| match result {
+        Some(match result {
             Ok(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
             Err((code, m)) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": m } }),
         })
@@ -511,6 +531,47 @@ mod tests {
         let t = s.handle(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
         assert!(t["result"]["tools"].as_array().unwrap().len() >= 9);
         assert_eq!(b64(b"Man"), "TWFu");
+    }
+
+    #[test]
+    fn notifications_and_malformed_arguments_do_not_run_tools() {
+        let requirements = Requirements::parse(r#"{"id":"r","rev":1,"deliver":{"body_type":"SolidBody"}}"#).unwrap();
+        let mut server = Server::new(requirements, "part");
+        let mut msg = json!({"jsonrpc":"2.0","method":"tools/call","params":{"name":"run_program","arguments":{"program":{
+            "requirements_rev":1,"expected_revision":0,"program":[{"id":"s","op":"part.primitive","args":{"kind":"sphere","axis":"xy","p":[10]}}]
+        }}}});
+        assert!(server.handle(&msg).is_none());
+        assert_eq!(server.call_tool("specification_tree",&json!({})).unwrap()["revision"],0);
+        msg["id"] = json!(1);
+        msg["params"]["arguments"] = json!([]);
+        assert_eq!(server.handle(&msg).unwrap()["error"]["code"],-32602);
+        let failed=server.handle(&json!({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"run_program","arguments":{"program":{
+            "requirements_rev":1,"expected_revision":0,"program":[{"id":"s","op":"part.primitive","args":{"kind":"invalid","axis":"xy","p":[10]}}]
+        }}}})).unwrap();
+        assert_eq!(failed["result"]["isError"],true);
+        assert_eq!(failed["result"]["structuredContent"]["report"]["status"],"FEATURE_FAILED");
+    }
+
+    #[test]
+    fn follow_up_edit_can_reference_existing_sketch() {
+        let req = Requirements::parse(r#"{"id":"r","rev":1,"deliver":{"body_type":"SolidBody"}}"#).unwrap();
+        let mut server = Server::new(req, "part");
+        let base = json!({"requirements_rev":1,"expected_revision":0,"program":[
+            {"id":"sk","op":"sketch.create","args":{"support":"xy"}},
+            {"id":"circle","op":"sketch.circle","args":{"sketch":"%sk","mode":"center_radius","pts":[[0,0]],"r":4}},
+            {"id":"profile","op":"sketch.regions","args":{"sketch":"%circle"}},
+            {"id":"pad","op":"part.pad","args":{"profile":"%profile","limits":2}}]});
+        let r = server.call_tool("run_program", &json!({"program":base})).unwrap();
+        assert_eq!(r["report"]["status"], "ACCEPTED");
+        let revision = server.call_tool("specification_tree", &json!({})).unwrap()["revision"].clone();
+        let mut follow = json!({"requirements_rev":1,"expected_revision":revision,"program":[
+            {"id":"second_pad","op":"part.pad","args":{"profile":"%profile","limits":4}}]});
+        assert!(!agcad_ir::lint::check_program(&follow.to_string(), Catalog::global()).ok);
+        assert_eq!(server.call_tool("check_program", &json!({"program":follow})).unwrap()["ok"], true);
+        let r = server.call_tool("run_program", &json!({"program":follow})).unwrap();
+        assert_eq!(r["report"]["status"], "ACCEPTED");
+        follow["program"][0]["args"]["profile"] = json!("%missing");
+        assert_eq!(server.call_tool("check_program", &json!({"program":follow})).unwrap()["ok"], false);
     }
 
     #[test]

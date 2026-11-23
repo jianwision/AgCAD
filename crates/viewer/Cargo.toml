@@ -1,0 +1,27 @@
+[package]
+name = "agcad-viewer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Persistent GPU-rendered WebRTC CAD server"
+
+[target.'cfg(all(windows, target_env = "msvc"))'.dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
+serde.workspace = true
+serde_json.workspace = true
+agcad-geo.workspace = true
+agcad-raytrace.workspace = true
+agcad-ir.workspace = true
+agcad-harness.workspace = true
+agcad-server.workspace = true
+agcad-model.workspace = true
+agcad-std.workspace = true
+agcad-runtime.workspace = true
+getrandom = "0.3"
+dotenvy = "0.15"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+
+[build-dependencies]
+cc = "1"

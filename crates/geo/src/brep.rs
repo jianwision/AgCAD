@@ -179,6 +179,25 @@ impl Brep {
             let c = &self.curves[e.curve as usize];
             for i in 0..=8 { b.add(c.point(e.t0 + (e.t1 - e.t0) * i as f64 / 8.0)); }
         }
+        for face in &self.faces {
+            let Surface::Sphere { frame, r } = &self.surfaces[face.surface as usize] else { continue };
+            // A complete sphere has a doubled meridian between its two poles. Trimmed
+            // patches can share its parametric domain but have additional boundaries.
+            let [lp] = face.loops.as_slice() else { continue };
+            let [up, down] = self.loops[*lp as usize].coedges.as_slice() else { continue };
+            let (a, d) = (&self.coedges[*up as usize], &self.coedges[*down as usize]);
+            if a.edge != d.edge || a.forward == d.forward { continue; }
+            let e = &self.edges[a.edge as usize];
+            let p = self.vertices[e.v0 as usize].p - frame.origin;
+            let q = self.vertices[e.v1 as usize].p - frame.origin;
+            let tol = DEFAULT_LINEAR_TOL;
+            if (p + q).norm() <= tol && (p.dot(frame.z).abs() - r).abs() <= tol
+                && (face.uv[1] - face.uv[0]).abs() >= std::f64::consts::TAU - 1e-9 {
+                let extent = crate::math::v3(*r, *r, *r);
+                b.add(frame.origin - extent);
+                b.add(frame.origin + extent);
+            }
+        }
         b
     }
 

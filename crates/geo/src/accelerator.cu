@@ -251,3 +251,31 @@ extern "C" __global__ void local_positions(const LocalPositions *p) {
   }
   p->positions[i] = minus(p->positions[i], p->origins[lo]);
 }
+
+struct CornerArgs {
+  const P3 *points;
+  double *results;
+  const P3 *frame;
+  double size;
+  U64 count;
+};
+extern "C" __global__ void block_edge_corners(const CornerArgs *p) {
+  U64 i = (U64)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= p->count) return;
+  double x[3], y[3];
+  for (int j = 0; j < 3; ++j) {
+    P3 v = minus(p->points[3*i+j],p->frame[0]);
+    P3 a = p->frame[1], b = p->frame[2];
+    x[j] = v.x*a.x + v.y*a.y + v.z*a.z;
+    y[j] = v.x*b.x + v.y*b.y + v.z*b.z;
+  }
+  double ux=x[0]-x[1], uy=y[0]-y[1], vx=x[2]-x[1], vy=y[2]-y[1];
+  double lu=hypot(ux,uy), lv=hypot(vx,vy);
+  ux/=lu; uy/=lu; vx/=lv; vy/=lv;
+  double *o = p->results + 11*i;
+  o[0]=x[1]; o[1]=y[1];
+  o[2]=x[1]+p->size*ux; o[3]=y[1]+p->size*uy;
+  o[4]=x[1]+p->size*vx; o[5]=y[1]+p->size*vy;
+  o[6]=x[1]+p->size*(ux+vx); o[7]=y[1]+p->size*(uy+vy);
+  o[8]=lu; o[9]=lv; o[10]=ux*vx+uy*vy;
+}

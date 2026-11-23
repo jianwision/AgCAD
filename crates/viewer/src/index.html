@@ -1,0 +1,52 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content">
+  <title>AgCAD</title>
+  <link rel="stylesheet" href="/workbench.css">
+</head>
+<body>
+  <main id="screen" aria-label="CAD viewport" title="Click a corner, edge, or face to select it" tabindex="-1">
+    <img id="still" alt="GPU-rendered CAD model" hidden>
+    <video id="video" aria-label="Live CAD model" autoplay muted playsinline hidden></video>
+    <div id="pick-box" hidden></div>
+  </main>
+  <nav id="navigation" aria-label="Viewport navigation" hidden>
+    <canvas id="view-cube" width="216" height="192" title="Click a face or corner to change view. Drag to orbit." aria-label="Orientation cube"></canvas>
+    <details id="view-menu"><summary aria-label="Standard views" title="Standard views">&#9662;</summary><div id="views" role="group" aria-label="Standard views"></div></details>
+  </nav>
+  <div id="viewport-tools" role="group" aria-label="Viewport controls">
+    <select id="skybox" aria-label="Skybox" title="Skybox">
+      <option value="dark">Dark</option><option value="studio">Studio</option>
+      <option value="daylight">Daylight</option><option value="sunset">Sunset</option>
+    </select>
+    <button type="button" id="settings-button" popovertarget="viewport-settings" aria-label="Viewport settings" title="Viewport settings">&#9881;&#xfe0e;</button>
+    <div popover id="viewport-settings" role="group" aria-label="Viewport settings">
+      <label><input type="checkbox" id="show-cube" checked> Show view cube</label>
+      <label><input type="checkbox" id="reverse-zoom"> Reverse scroll zoom</label>
+    </div>
+  </div>
+  <aside aria-label="CAD chat">
+    <section id="popup" aria-label="Conversation" hidden>
+      <div id="thread" role="log" aria-live="polite" aria-relevant="additions"></div>
+      <div id="review" aria-label="Review edit" hidden>
+        <button id="current">Current</button><button id="proposed">Proposed</button>
+        <button id="apply">Apply</button><button id="discard">Discard</button>
+      </div>
+    </section>
+    <form id="composer" aria-label="Message composer">
+      <span id="context" aria-live="polite" hidden></span>
+      <textarea id="prompt" rows="2" maxlength="8192" aria-label="Chat message" placeholder="Describe a part or ask a question…"></textarea>
+      <div class="tools">
+        <button type="button" id="new" title="New part" aria-label="New part">+</button>
+        <select id="chat-model" aria-label="Chat model" title="Chat model" hidden></select>
+        <select id="thinking" aria-label="Thinking level" title="Thinking level" hidden></select>
+        <span id="working" role="status"></span>
+        <button type="submit" id="ask" title="Send message (Enter)" aria-label="Send message" disabled>↑</button>
+      </div>
+    </form>
+  </aside>
+  <script type="module" src="/workbench.js"></script>
+</body>
+</html>

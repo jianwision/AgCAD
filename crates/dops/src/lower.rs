@@ -548,6 +548,7 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
     for id in part.rebuild_order() {
         let f = &part.features[&id];
         if !f.active { continue; }
+        f.check_part_options(Value::as_f64)?;
         let a = &f.args;
         let solid_feature = matches!(f.op.as_str(), "part.pad" | "part.pocket" | "part.shell" | "part.shaft" | "part.groove" | "part.hole");
         if mirrored && solid_feature { mirror_closed = true; }
@@ -677,6 +678,9 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
                     Some((p, o)) => { let v: Vec<f64> = o.split(',').filter_map(|x| x.parse().ok()).collect(); (p.to_string(), [v[0], v[1], v[2]]) }
                     None => (sup.clone(), [0.0; 3]),
                 };
+                if !matches!(a.get("axis"), Some(Value::String(axis)) if matches!(axis.as_str(),"z"|"+z"|"-z")) {
+                    return Err(format!("{}: device revolution requires the vertical axis", f.feature_ref()));
+                }
                 if !matches!(plane.as_str(), "yz" | "yz_plane" | "YZ") { return Err(format!("{}: only revolutions about a vertical axis (sketch on the yz plane or a yz-parallel datum) are device-representable", f.feature_ref())); }
                 let mut loops = close_loops(&segs).map_err(|e| format!("{}: {e}", f.feature_ref()))?;
                 if origin[2] != 0.0 {
@@ -773,6 +777,9 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
                 }
             }
             "part.hole" => {
+                if let Some(source)=refid(a.get("support")) {
+                    if !feat_node.contains_key(&source) {return Err(format!("{}: hole support must refer to a prismatic end face", f.feature_ref()));}
+                }
                 // std semantics: from the body top (zmax) down `depth` (or through), plus an
                 // optional counterbore; one circular pocket per position
                 let zmax = d.nodes.iter().filter(|n| n.op == fop::ADD && n.kind <= profile::SKETCH).map(|n| value(n, &d.params, 5)).fold(f64::NEG_INFINITY, f64::max);
@@ -785,7 +792,6 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
                 let depth = if through { zmax - zmin + 2.0 } else { num("depth", &mut warnings)?.unwrap_or(zmax - zmin + 2.0) };
                 let cb = num("counterbore_d", &mut warnings)?;
                 let cbh = num("counterbore_depth", &mut warnings)?.unwrap_or(dia * 0.5);
-                if spec.contains_key("countersink_d") || spec.contains_key("countersink_angle") { warnings.push(format!("{}: countersink is not modeled by the standard library; ignored on the device too", f.feature_ref())); }
                 for p in list(a.get("positions")) {
                     let l = match &p { Value::List(l) => l.clone(), _ => return Err(format!("{}: hole positions must be [x, y]", f.feature_ref())) };
                     let x = raise_value(l.first().ok_or("hole x")?, &d.names, &pvals, &mut warnings)?;
@@ -856,6 +862,9 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
                 }
             }
             "part.edge_fillet" | "part.chamfer" => {
+                if list(a.get("edges")).iter().any(|e| matches!(e,Value::Map(m) if m.contains_key("endpoints_mm") || m.contains_key("vertex_mm"))) {
+                    return Err(format!("{}: a selected 3D edge requires the exact feature executor", f.feature_ref()));
+                }
                 // device form: corner points of the last rectangle feature's instances
                 let size = raise_value(a.get(if f.op == "part.edge_fillet" { "r" } else { "a" }).ok_or("fillet size")?, &d.names, &pvals, &mut warnings)?;
                 let pts: Vec<[f64; 2]> = list(a.get("edges")).iter().filter_map(|e| match e { Value::List(c) if c.len() == 2 => Some([c[0].as_f64()?, c[1].as_f64()?]), _ => None }).collect();
@@ -876,6 +885,7 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
                     (n.pref[10], n.val[10]) = size;
                 }
             }
+            "direct.push_pull" if list(a.get("faces")).iter().any(|e|matches!(e,Value::Map(_))) => return Err(format!("{}: selected face offsets require the exact executor",f.feature_ref())),
             "part.multi_sections_solid" => return Err(format!("{}: solid loft has no optimization tape representation", f.feature_ref())),
             other if other.starts_with("evaluate.") || other.starts_with("file.") => {}
             other => warnings.push(format!("{}: {other} has no device equivalent yet; skipped in the rollout", f.feature_ref())),

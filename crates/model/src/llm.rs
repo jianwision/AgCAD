@@ -15,6 +15,14 @@ pub struct Llm {
 }
 
 impl Llm {
+    /// Send a structured observation to the configured workstation bridge.
+    pub fn observe(&self, obs: &Observation) -> Result<serde_json::Value, String> {
+        let payload = serde_json::to_string(obs).map_err(|e| e.to_string())?;
+        match serde_json::from_str(&self.post(&payload)?) {
+            Err(e) if e.is_eof() => serde_json::from_str(&self.post(&payload)?).map_err(|e| format!("Incomplete or invalid bridge response: {e}")),
+            result => result.map_err(|e| e.to_string()),
+        }
+    }
     pub fn new(addr: &str, path: &str, name: &str) -> Self {
         Llm { manifest: CapabilityManifest { name: name.into(), precision: "f64".into(), ..Default::default() }, addr: addr.into(), path: path.into() }
     }

@@ -6,6 +6,7 @@ LLM agents (batch programs over MCP) or GPU-resident Candle-trained models (devi
 with a GPU-resident harness and recursive self-improvement. Pure Rust; first MVP is headless.
 
 - Architecture spec: [docs/spec](docs/spec/README.md)
+- [GPU browser server](crates/viewer/README.md) for STEP models, material editing and an API-backed CAD assistant over WebRTC.
 - Implementation status (not yet built or tested): [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md)
 - Validated prototype (reference): [docs/Demo](docs/Demo/README.md)
 

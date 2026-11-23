@@ -14,6 +14,11 @@ pub struct Diagnostic {
 }
 
 pub fn verify(p: &Program, catalog: &Catalog) -> Vec<Diagnostic> {
+    verify_in_workspace(p, catalog, |_| false)
+}
+
+/// Resolve earlier batch references against the caller's active workspace.
+pub fn verify_in_workspace(p: &Program, catalog: &Catalog, exists: impl Fn(&str) -> bool) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     let mut defined: HashSet<&str> = HashSet::new();
     for s in &p.statements {
@@ -37,7 +42,7 @@ pub fn verify(p: &Program, catalog: &Catalog) -> Vec<Diagnostic> {
             let mut refs = Vec::new();
             v.refs(&mut refs);
             for r in refs {
-                if !defined.contains(r.as_str()) {
+                if !defined.contains(r.as_str()) && !exists(&r) {
                     d(AgStatus::StaleReference, format!("{}: '%{r}' used before definition", op.name));
                 }
             }
@@ -51,7 +56,7 @@ pub fn verify(p: &Program, catalog: &Catalog) -> Vec<Diagnostic> {
             }
         }
         if let Some(ov) = &s.over {
-            if !defined.contains(ov.as_str()) {
+            if !defined.contains(ov.as_str()) && !exists(ov) {
                 d(AgStatus::StaleReference, format!("over '%{ov}' used before definition"));
             }
         }

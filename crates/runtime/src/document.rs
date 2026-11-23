@@ -40,6 +40,39 @@ pub struct FeatureNode {
 }
 
 impl FeatureNode {
+    /// Options that the exact feature executor and the GPU tape must both honour.
+    pub fn check_part_options(&self, number: impl Fn(&Value) -> Option<f64>) -> Result<(), String> {
+        let invalid = |message: &str| Err(format!("{}: {message}", self.feature_ref()));
+        match self.op.as_str() {
+            "part.pad" | "part.pocket" if self.args.get("thick").is_some_and(|v| number(v) != Some(0.0)) =>
+                invalid("thin-wall thickness (thick) is unsupported"),
+            "part.shaft" | "part.groove" => {
+                let full = match self.args.get("angles") {
+                    Some(Value::List(a)) if a.len()==2 => number(&a[0]).zip(number(&a[1]))
+                        .is_some_and(|(a,b)| ((b-a).abs()-std::f64::consts::TAU).abs() <= 1e-10),
+                    _ => false,
+                };
+                if !full { return invalid("angles must span one full revolution (360 degrees)"); }
+                Ok(())
+            }
+            "part.hole" => {
+                match self.args.get("support") {
+                    Some(Value::String(s)) if s.rsplit('/').next()==Some("cap_end") => (),
+                    Some(Value::Ref{field:None,..}) => (),
+                    Some(Value::Ref{field:Some(s),..}) if s=="cap_end" => (),
+                    _ => return invalid("hole support must be the top end face (cap_end); drilling from this face is unsupported"),
+                }
+                if let Some(Value::Map(spec)) = self.args.get("spec") {
+                    if spec.iter().any(|(k,v)| k.starts_with("countersink") || k.starts_with("countersunk") ||
+                        matches!(v,Value::String(s) if s.to_ascii_lowercase().contains("countersink") || s.to_ascii_lowercase().contains("countersunk"))) {
+                        return invalid("countersink diameter and angle are unsupported");
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
     /// `family.op#id` (spec 02 § Stable naming).
     pub fn feature_ref(&self) -> String { format!("{}#{}", self.op, self.id) }
 }

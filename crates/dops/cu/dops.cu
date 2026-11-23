@@ -81,8 +81,8 @@ struct OpTable { u32 update, parameter, pad, pocket, hole, circular_pattern, dea
 struct DopsArgs {
     u64 goal, cur_nodes, cur_count, cur_params, tr_nodes, tr_count, tr_params, rev, budget, done,
         cmds, arena, status, counts, domain_hit, bbox, obs, score, trace, round, active, compiled, tables,
-        wl0, wl1, cls, flag, offs, crank, start, lvl, term, toffs, tlist, tcount, opt, samp, tscore, pool, cond_handle;
-    u32 configs, nodes, params, records, coarse, levels, eval_trial, max_rounds, level, capacity, cap, cfg_offset, tighten, policy, island, general_ok;
+        wl0, wl1, shape, flag, offs, crank, start, lvl, term, toffs, tlist, tcount, opt, samp, tscore, pool, cond_handle;
+    u32 configs, nodes, params, records, coarse, levels, eval_trial, max_rounds, level, capacity, cap, cfg_offset, tighten, policy, island, general_ok, aniso, _pad;
     OpTable ops;
 };
 #define POLICY_CMAES 1u
@@ -1370,10 +1370,10 @@ __device__ Grid make_grid(const Goal& goal, u32 r0, u32 levels) {
     return gr;
 }
 
-__device__ void cell_box(const Grid& gr, u32 level, u32 ix, u32 iy, u32 iz, Iv* b) {
-    u32 idx[3] = {ix, iy, iz};
+__device__ void cell_box_s(const Grid& gr, const u32* s, const u32* idx, Iv* b) {
     for (int k = 0; k < 3; ++k) {
-        double w = gr.size[k] / (double)(gr.r[k] << level);
+        u32 lvl = gr.levels - 1u - s[k];
+        double w = gr.size[k] / (double)(gr.r[k] << lvl);
         b[k] = mkiv((float)(gr.lo[k] + (double)idx[k] * w), (float)(gr.lo[k] + (double)(idx[k] + 1u) * w));
     }
 }
@@ -1516,9 +1516,18 @@ template <bool M> __device__ void tighten_cell(const CNode* nodes, u32 cnt, cons
 
 __device__ __forceinline__ u64 enc(u32 cfg, u32 ix, u32 iy, u32 iz) { return ((u64)cfg << 32) | ((u64)ix << 20) | ((u64)iy << 10) | (u64)iz; }
 
-template <bool M> __device__ bool border_hit(const Grid& gr, const CNode* nodes, u32 cnt, const float* tabs, u32 level, const u32* idx, const Iv* b, bool inside) {
+__device__ __forceinline__ u32 pack_shifts(u32 x, u32 y, u32 z) {
+    return x | (y << 4) | (z << 8);
+}
+__device__ __forceinline__ void unpack_shifts(u32 shape, u32* s) {
+    s[0] = shape & 15u;
+    s[1] = (shape >> 4) & 15u;
+    s[2] = (shape >> 8) & 15u;
+}
+
+template <bool M> __device__ bool border_hit(const Grid& gr, const CNode* nodes, u32 cnt, const float* tabs, const u32* s, const u32* idx, const Iv* b, bool inside) {
     for (int ax = 0; ax < 3; ++ax) {
-        u32 res = gr.r[ax] << level;
+        u32 res = gr.r[ax] << (gr.levels - 1u - s[ax]);
         for (u32 side = 0; side < 2u; ++side) {
             if ((side == 0u && idx[ax] != 0u) || (side == 1u && idx[ax] != res - 1u)) continue;
             if (inside) return true;
@@ -1545,10 +1554,10 @@ __device__ __forceinline__ void contrib_init(Contrib& c) {
     c.dom = 0u;
     c.has = false;
 }
-__device__ __forceinline__ void contrib_bbox(Contrib& c, const u32* lo, u32 n, bool inside) {
+__device__ __forceinline__ void contrib_bbox(Contrib& c, const u32* lo, const u32* span, bool inside) {
     for (int k = 0; k < 3; ++k) {
-        if (inside) { c.bb[k] = min(c.bb[k], lo[k]); c.bb[3 + k] = max(c.bb[3 + k], lo[k] + n); }
-        c.bb[6 + k] = min(c.bb[6 + k], lo[k]); c.bb[9 + k] = max(c.bb[9 + k], lo[k] + n);
+        if (inside) { c.bb[k] = min(c.bb[k], lo[k]); c.bb[3 + k] = max(c.bb[3 + k], lo[k] + span[k]); }
+        c.bb[6 + k] = min(c.bb[6 + k], lo[k]); c.bb[9 + k] = max(c.bb[9 + k], lo[k] + span[k]);
     }
 }
 __device__ __forceinline__ bool is_min_slot(int j) { return j == C_MIN_WALL || j == C_MIN_GAP; }
@@ -1589,13 +1598,12 @@ __device__ void contrib_flush(const DopsArgs* a, u32 cfg, Contrib& c) {
     if (c.dom != 0u) atomicExch(ag_ptr<u32>(a->domain_hit) + cfg, 1u);
 }
 
-__device__ void contrib_moments(Contrib& ct, u32 ix, u32 iy, u32 iz, u32 sh, u64 q20) {
-    u64 w = 1ull << (3u * sh);
+__device__ void contrib_moments(Contrib& ct, const u32* idx, const u32* s, u64 q20) {
+    u64 w = 1ull << (s[0] + s[1] + s[2]);
     u64 q6 = q20 >> 14;
-    u64 ss = 4ull << (2u * sh);
-    u32 idx[3] = {ix, iy, iz};
     for (int k = 0; k < 3; ++k) {
-        u64 c2 = ((u64)(2u * idx[k] + 1u)) << sh;
+        u64 c2 = ((u64)(2u * idx[k] + 1u)) << s[k];
+        u64 ss = 4ull << (2u * s[k]);
         ct.v[C_M1 + k] += q20 * w * c2;
         ct.v[C_M2 + k] += q6 * w * (12ull * c2 * c2 + ss);
     }
@@ -1620,11 +1628,34 @@ AG_KERNEL void ag_ad_seed(const DopsArgs* a) {
     u32 per = gr.r[0] * gr.r[1] * gr.r[2];
     u64 n = (u64)a->configs * per;
     u64* wl = ag_ptr<u64>(a->wl0);
+    u32 sh0 = a->levels - 1u;
     GRID_STRIDE(i, n) {
         u32 cfg = (u32)(i / per), cell = (u32)(i % per);
+        ag_ptr<u32>(a->crank)[i] = pack_shifts(sh0, sh0, sh0);
         wl[i] = enc(cfg, cell % gr.r[0], (cell / gr.r[0]) % gr.r[1], cell / (gr.r[0] * gr.r[1]));
     }
     if (blockIdx.x == 0 && threadIdx.x == 0) ag_ptr<u32>(a->lvl)[0] = (u32)n;
+}
+
+// Twin of reference::sensitive_axes. Each face uses the full extent of the other two axes.
+template <bool M> __device__ u32 sensitive_axes(const CNode* tape, u32 count, const float* tabs,
+                                                const Iv* bounds, Iv interval) {
+    float width = interval.hi - interval.lo;
+    float strongest = 0.0f;
+    u32 mask = 0;
+    for (int axis = 0; axis < 3; ++axis) {
+        Iv face[3] = {bounds[0], bounds[1], bounds[2]};
+        face[axis] = mkiv(bounds[axis].lo, bounds[axis].lo);
+        Iv lo = T_iv<M>(tape, count, tabs, face[0], face[1], face[2]);
+        face[axis] = mkiv(bounds[axis].hi, bounds[axis].hi);
+        Iv hi = T_iv<M>(tape, count, tabs, face[0], face[1], face[2]);
+        float shrink = fmaxf(width - (lo.hi - lo.lo), width - (hi.hi - hi.lo));
+        float change = fabsf(lo.lo - hi.lo) + fabsf(lo.hi - hi.hi);
+        float sensitivity = fmaxf(shrink, change);
+        if (sensitivity > 0.0f) mask |= 1u << axis;
+        strongest = fmaxf(strongest, sensitivity);
+    }
+    return strongest <= 1e-6f * fmaxf(width, 1.0f) ? 7u : mask;
 }
 
 AG_KERNEL __launch_bounds__(256, 3) void ag_ad_classify(const DopsArgs* a) {
@@ -1638,14 +1669,18 @@ AG_KERNEL __launch_bounds__(256, 3) void ag_ad_classify(const DopsArgs* a) {
     u32 l = a->level;
     u32 n = ag_ptr<const u32>(a->lvl)[l];
     const u64* wl = ag_ptr<const u64>((l % 2u == 0u) ? a->wl0 : a->wl1);
-    u32* cls = ag_ptr<u32>(a->cls);
-    u32 sh = a->levels - 1u - l;
+    u32* requested = ag_ptr<u32>(a->flag);
     float e = (float)gr.eps;
-    GRID_STRIDE(j, a->capacity) { if (j >= (u64)n) cls[j] = 0u; }
+    GRID_STRIDE(j, a->capacity) { if (j >= (u64)n) requested[j] = 0u; }
     GRID_STRIDE(i, n) {
         u64 en = wl[i];
-        u32 cfg = (u32)(en >> 32), ix = (u32)((en >> 20) & 1023u), iy = (u32)((en >> 10) & 1023u), iz = (u32)(en & 1023u);
-        cls[i] = 0u;
+        u32 cfg = (u32)(en >> 32);
+        u32 shape = ag_ptr<const u32>(a->crank)[i];
+        ag_ptr<u32>(a->shape)[i] = shape;
+        u32 s[3];
+        unpack_shifts(shape, s);
+        u32 idx[3] = {(u32)((en >> 20) & 1023u), (u32)((en >> 10) & 1023u), (u32)(en & 1023u)};
+        requested[i] = 0u;
         Contrib ct;
         contrib_init(ct);
         if (!(a->eval_trial != 0u && done[cfg] != 0u)) {
@@ -1653,20 +1688,26 @@ AG_KERNEL __launch_bounds__(256, 3) void ag_ad_classify(const DopsArgs* a) {
             const float* tb = tabs + (u64)cfg * nn * TABLE;
             u32 c = cnt[cfg];
             Iv b[3];
-            cell_box(gr, l, ix, iy, iz, b);
+            cell_box_s(gr, s, idx, b);
             bool mir = tape_general(tape, c);
             Iv r = mir ? T_iv<true>(tape, c, tb, b[0], b[1], b[2]) : T_iv<false>(tape, c, tb, b[0], b[1], b[2]);
             if (!(r.lo - e > 0.0f)) {
                 if (r.hi + e < 0.0f) {
                     ct.has = true;
-                    ct.v[C_INSIDE] = 1ull << (3u * sh);
-                    contrib_moments(ct, ix, iy, iz, sh, 1ull << 20);
-                    u32 lo[3] = {ix << sh, iy << sh, iz << sh};
-                    contrib_bbox(ct, lo, 1u << sh, true);
-                    u32 idx[3] = {ix, iy, iz};
-                    if (mir ? border_hit<true>(gr, tape, c, tb, l, idx, b, true) : border_hit<false>(gr, tape, c, tb, l, idx, b, true)) ct.dom = 1u;
+                    ct.v[C_INSIDE] = 1ull << (s[0] + s[1] + s[2]);
+                    contrib_moments(ct, idx, s, 1ull << 20);
+                    u32 lo[3] = {idx[0] << s[0], idx[1] << s[1], idx[2] << s[2]};
+                    u32 sp[3] = {1u << s[0], 1u << s[1], 1u << s[2]};
+                    contrib_bbox(ct, lo, sp, true);
+                    if (mir ? border_hit<true>(gr, tape, c, tb, s, idx, b, true) : border_hit<false>(gr, tape, c, tb, s, idx, b, true)) ct.dom = 1u;
                 } else {
-                    cls[i] = 1u;
+                    u32 mask = 0;
+                    if (l + 1u < a->levels) {
+                        mask = !a->aniso ? 7u : mir ? sensitive_axes<true>(tape, c, tb, b, r)
+                                                    : sensitive_axes<false>(tape, c, tb, b, r);
+                    }
+                    ag_ptr<u32>(a->shape)[i] = shape | (mask << 12);
+                    requested[i] = (mask == 0u) ? 1u : (1u << __popc(mask));
                 }
             }
         }
@@ -1678,17 +1719,19 @@ AG_KERNEL void ag_ad_resolve(const DopsArgs* a) {
     u32 l = a->level;
     u32 n = ag_ptr<const u32>(a->lvl)[l];
     const u64* wl = ag_ptr<const u64>((l % 2u == 0u) ? a->wl0 : a->wl1);
-    const u32* cls = ag_ptr<const u32>(a->cls);
     u32* flag = ag_ptr<u32>(a->flag);
     u32* term = ag_ptr<u32>(a->term);
     const u32* crank = ag_ptr<const u32>(a->crank);
     const u32* start = ag_ptr<const u32>(a->start);
     GRID_STRIDE(i, a->capacity) {
         u32 f = 0u, t = 0u;
-        if (i < (u64)n && cls[i] == 1u) {
-            u32 cfg = (u32)(wl[i] >> 32);
+        if (i < (u64)n && flag[i] != 0u) {
+            u64 en = wl[i];
+            u32 cfg = (u32)(en >> 32);
+            u32 mask = ag_ptr<const u32>(a->shape)[i] >> 12;
+            u32 nc = flag[i];
             u32 rank = crank[i] - crank[start[cfg]];
-            if (l + 1u < a->levels && ((u64)rank + 1ull) * 8ull <= (u64)a->cap) f = 1u; else t = 1u;
+            if (l + 1u < a->levels && mask != 0u && (u64)rank + (u64)nc <= (u64)a->cap) f = nc; else t = 1u;
         }
         flag[i] = f;
         term[i] = t;
@@ -1700,11 +1743,18 @@ AG_KERNEL void ag_ad_clip(const DopsArgs* a) {
     u32* flag = ag_ptr<u32>(a->flag);
     u32* term = ag_ptr<u32>(a->term);
     const u32* offs = ag_ptr<const u32>(a->offs);
-    u32 keep = cap / 8u;
     GRID_STRIDE(i, cap) {
         u32 f = flag[i];
-        if (i == (u64)cap - 1ull) { u32 total = offs[i] + f; ag_ptr<u32>(a->lvl)[a->level + 1u] = ((total < keep) ? total : keep) * 8u; }
-        if (f != 0u && offs[i] >= keep) { flag[i] = 0u; term[i] = 1u; }
+        u32 o = offs[i];
+        // Exactly one lane publishes the new length: the first split that does not fit,
+        // or the tail lane when all splits fit (including an empty level).
+        if (f != 0u && o + f > cap) {
+            if (o <= cap) ag_ptr<u32>(a->lvl)[a->level + 1u] = o;
+            flag[i] = 0u;
+            term[i] = 1u;
+        } else if (i == (u64)cap - 1ull && o + f <= cap) {
+            ag_ptr<u32>(a->lvl)[a->level + 1u] = o + f;
+        }
     }
 }
 
@@ -1720,7 +1770,7 @@ AG_KERNEL void ag_ad_compact(const DopsArgs* a) {
 }
 
 // One terminal boundary cell (body of ag_ad_fill), compiled with (M) or without mirror support.
-template <bool M> __device__ __forceinline__ void fill_cell(const DopsArgs* a, const Goal& goal, const Grid& gr, const CNode* tape, u32 c, const float* tb, u32 l, u32 sh, u32 ix, u32 iy, u32 iz, const Iv* b, u64 w, const float* d, const float* cxyz, Contrib& ct) {
+template <bool M> __device__ __forceinline__ void fill_cell(const DopsArgs* a, const Goal& goal, const Grid& gr, const CNode* tape, u32 c, const float* tb, const u32* s, const u32* idx, const Iv* b, u64 w, const float* d, const float* cxyz, Contrib& ct) {
     Prune pru;
     (void)T_iv_prune<M>(tape, c, tb, b[0], b[1], b[2], (float)gr.eps, pru);
     Surface sf = surface_p<M>(tape, c, tb, pru, cxyz[0], cxyz[1], cxyz[2], d);
@@ -1732,13 +1782,13 @@ template <bool M> __device__ __forceinline__ void fill_cell(const DopsArgs* a, c
     if (fq < (tlo >> 4)) fq = tlo >> 4;
     if (fq > ((thi + 15ull) >> 4)) fq = (thi + 15ull) >> 4;
     ct.v[C_FILL] = fq * w;
-    contrib_moments(ct, ix, iy, iz, sh, fq);
+    contrib_moments(ct, idx, s, fq);
     Probe pr = probe<M>(tape, c, tb, goal, sf, cxyz, d);
     contrib_probe(ct, pr);
-    u32 lo[3] = {ix << sh, iy << sh, iz << sh};
-    contrib_bbox(ct, lo, 1u << sh, false);
-    u32 idx[3] = {ix, iy, iz};
-    if (border_hit<M>(gr, tape, c, tb, l, idx, b, false)) ct.dom = 1u;
+    u32 lo[3] = {idx[0] << s[0], idx[1] << s[1], idx[2] << s[2]};
+    u32 sp[3] = {1u << s[0], 1u << s[1], 1u << s[2]};
+    contrib_bbox(ct, lo, sp, false);
+    if (border_hit<M>(gr, tape, c, tb, s, idx, b, false)) ct.dom = 1u;
 }
 
 template <bool MIR> __device__ __forceinline__ void fill_kernel(const DopsArgs* a) {
@@ -1749,34 +1799,33 @@ template <bool MIR> __device__ __forceinline__ void fill_kernel(const DopsArgs* 
     const Goal goal = *ag_ptr<const Goal>(a->goal);
     Grid gr = make_grid(goal, a->coarse, a->levels);
     u32 l = a->level;
-    u32 n = ag_ptr<const u32>(a->lvl)[l];
     const u64* wl = ag_ptr<const u64>((l % 2u == 0u) ? a->wl0 : a->wl1);
     const u32* tlist = ag_ptr<const u32>(a->tlist);
     u32 tn = ag_ptr<const u32>(a->tcount)[0];
-    u32 sh = a->levels - 1u - l;
-    (void)n;
     GRID_STRIDE(j, tn) {
-        u64 en = wl[tlist[j]];
-        u32 cfg = (u32)(en >> 32), ix = (u32)((en >> 20) & 1023u), iy = (u32)((en >> 10) & 1023u), iz = (u32)(en & 1023u);
-        Contrib ct;
-        contrib_init(ct);
-        if (tape_general(cnodes + (u64)cfg * nn, cnt[cfg]) != MIR) continue; // the other launch
-        {
-            {
-                const CNode* tape = cnodes + (u64)cfg * nn;
-                const float* tb = tabs + (u64)cfg * nn * TABLE;
-                u32 c = cnt[cfg];
-                Iv b[3];
-                cell_box(gr, l, ix, iy, iz, b);
-                u64 w = 1ull << (3u * sh);
-                ct.has = true;
-                ct.v[C_BOUNDARY] = w;
-                float d[3] = {b[0].hi - b[0].lo, b[1].hi - b[1].lo, b[2].hi - b[2].lo};
-                float cxyz[3] = {0.5f * (b[0].lo + b[0].hi), 0.5f * (b[1].lo + b[1].hi), 0.5f * (b[2].lo + b[2].hi)};
-                fill_cell<MIR>(a, goal, gr, tape, c, tb, l, sh, ix, iy, iz, b, w, d, cxyz, ct);
-            }
+        u32 i = tlist[j];
+        u64 en = wl[i];
+        u32 cfg = (u32)(en >> 32);
+        u32 shape = ag_ptr<const u32>(a->shape)[i];
+        const CNode* tape = cnodes + (u64)cfg * nn;
+        u32 c = cnt[cfg];
+        if (tape_general(tape, c) == MIR) {
+            u32 s[3];
+            unpack_shifts(shape, s);
+            u32 idx[3] = {(u32)((en >> 20) & 1023u), (u32)((en >> 10) & 1023u), (u32)(en & 1023u)};
+            Contrib ct;
+            contrib_init(ct);
+            const float* tb = tabs + (u64)cfg * nn * TABLE;
+            Iv b[3];
+            cell_box_s(gr, s, idx, b);
+            u64 w = 1ull << (s[0] + s[1] + s[2]);
+            ct.has = true;
+            ct.v[C_BOUNDARY] = w;
+            float d[3] = {b[0].hi - b[0].lo, b[1].hi - b[1].lo, b[2].hi - b[2].lo};
+            float cxyz[3] = {0.5f * (b[0].lo + b[0].hi), 0.5f * (b[1].lo + b[1].hi), 0.5f * (b[2].lo + b[2].hi)};
+            fill_cell<MIR>(a, goal, gr, tape, c, tb, s, idx, b, w, d, cxyz, ct);
+            contrib_flush(a, cfg, ct);
         }
-        contrib_flush(a, cfg, ct);
     }
 }
 
@@ -1807,16 +1856,35 @@ AG_KERNEL void ag_ad_emit(const DopsArgs* a) {
     GRID_STRIDE(i, m) {
         if (flag[i] == 0u) continue;
         u64 en = wl[i];
-        u32 cfg = (u32)(en >> 32), ix = (u32)((en >> 20) & 1023u), iy = (u32)((en >> 10) & 1023u), iz = (u32)(en & 1023u);
-        u64 base = (u64)offs[i] * 8ull;
-        for (u32 k = 0; k < 8u; ++k) out[base + k] = enc(cfg, 2u * ix + (k & 1u), 2u * iy + ((k >> 1) & 1u), 2u * iz + (k >> 2));
+        u32 cfg = (u32)(en >> 32);
+        u32 mask = ag_ptr<const u32>(a->shape)[i] >> 12;
+        u32 s[3];
+        unpack_shifts(ag_ptr<const u32>(a->shape)[i], s);
+        u32 ix = (u32)((en >> 20) & 1023u), iy = (u32)((en >> 10) & 1023u), iz = (u32)(en & 1023u);
+        u32 sxb = mask & 1u, syb = (mask >> 1) & 1u, szb = (mask >> 2) & 1u;
+        u32 child_shifts = pack_shifts(s[0] - sxb, s[1] - syb, s[2] - szb);
+        u32 dx = 1u + sxb, dy = 1u + syb, dz = 1u + szb;
+        u64 base = (u64)offs[i];
+        u32 k = 0u;
+        for (u32 oz = 0u; oz < dz; ++oz) {
+            for (u32 oy = 0u; oy < dy; ++oy) {
+                for (u32 ox = 0u; ox < dx; ++ox) {
+                    u32 nix = sxb ? (2u * ix + ox) : ix;
+                    u32 niy = syb ? (2u * iy + oy) : iy;
+                    u32 niz = szb ? (2u * iz + oz) : iz;
+                    out[base + k] = enc(cfg, nix, niy, niz);
+                    ag_ptr<u32>(a->crank)[base + k] = child_shifts;
+                    k += 1u;
+                }
+            }
+        }
     }
 }
 
 AG_KERNEL void ag_ad_total(const DopsArgs* a) {
     if (AG_TID != 0) return;
     u32 cap = a->capacity;
-    ag_ptr<u32>(a->lvl)[a->level + 1u] = (ag_ptr<const u32>(a->offs)[cap - 1u] + ag_ptr<const u32>(a->flag)[cap - 1u]) * 8u;
+    ag_ptr<u32>(a->lvl)[a->level + 1u] = ag_ptr<const u32>(a->offs)[cap - 1u] + ag_ptr<const u32>(a->flag)[cap - 1u];
 }
 
 // ---- engineering metrics (twin of reference.rs engineering) ----

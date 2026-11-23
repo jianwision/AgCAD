@@ -349,15 +349,15 @@ pub struct DopsArgs {
     /// Compiled tapes ([`CNode`] × nodes per configuration) and their trig tables.
     pub compiled: u64,
     pub tables: u64,
-    /// Adaptive evaluation: ping-pong cell worklists (u64 entries: cfg << 32 | ix << 20 |
-    /// iy << 10 | iz, sorted by configuration), per-entry class (1 = ambiguous) and its
-    /// exclusive scan (`crank`), refine flag and its scan (`offs`), per-configuration first
-    /// worklist index (`start`), per-level entry counts (levels + 1).
+    /// Sorted ping-pong worklists with a 32-bit configuration and three 10-bit coordinates.
     pub wl0: u64,
     pub wl1: u64,
-    pub cls: u64,
+    /// Three 4-bit axis shifts followed by the 3-bit split mask of the current cell.
+    pub shape: u64,
+    /// Requested child counts, overwritten by resolve with counts within the per-design cap.
     pub flag: u64,
     pub offs: u64,
+    /// Per-cell axis shifts from seed/emit until classify, then the prefix of requested children.
     pub crank: u64,
     pub start: u64,
     pub lvl: u64,
@@ -391,8 +391,8 @@ pub struct DopsArgs {
     pub level: u32,
     /// Worklist capacity (= configs × cap).
     pub capacity: u32,
-    /// Max cells per configuration and level: a configuration refines its first cap / 8
-    /// ambiguous cells (worklist order); the rest are counted as boundary.
+    /// Max cells per configuration and level: children are admitted in worklist order.
+    /// Ambiguous cells whose children do not fit are measured as boundary cells.
     pub cap: u32,
     /// Global id of local configuration 0 (multi-device shards): the policy hashes and
     /// alternates on global ids, so trajectories do not depend on the sharding.
@@ -406,6 +406,8 @@ pub struct DopsArgs {
     /// caps): their tapes are evaluated by a separate CUDA launch; edits introducing them are
     /// rejected otherwise.
     pub general_ok: u32,
+    pub aniso: u32,
+    pub _pad: u32,
     pub ops: OpTable,
 }
 

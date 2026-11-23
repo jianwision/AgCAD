@@ -5,7 +5,7 @@ use agcad_dops::abi::fop;
 use agcad_dops::examples::{box_goal, flange, goal, plate_goal, pocketed_plate, shelled_box, two_bodies};
 use agcad_dops::lower::to_layered;
 use agcad_dops::studio::certify_with;
-use agcad_dops::{Design, Goal};
+use agcad_dops::{Design, Goal, Studio, StudioConfig};
 use agcad_driver_cpu::CpuDevice;
 
 fn exact(d: &Design) -> f64 { agcad_geo::tessellate::tessellate(&to_layered(d).unwrap().brep(), &Default::default()).mass_properties().0 }
@@ -36,4 +36,26 @@ fn tightened_bounds_are_sound_and_narrow() {
         assert!(l1 >= l0 && h1 <= h0, "{name}: tightening widened the bounds");
         assert!(w1 < 0.25 * w0, "{name}: ±{} → ±{}", w0 / 2.0, w1 / 2.0);
     }
+}
+
+#[test]
+fn anisotropic_global_worklist_is_sound_and_tighter_on_thin_plate() {
+    let plate = pocketed_plate(100.0, 3.0);
+    let g = plate_goal();
+    let v = exact(&plate);
+    let eval = |aniso: bool| {
+        let cfg = StudioConfig { configs: 1, coarse: 8, levels: 6, cap: 4096, max_rounds: 1, aniso, ..Default::default() };
+        let st = Studio::new(CpuDevice::new(), &plate, &g, cfg).unwrap();
+        st.observe().unwrap();
+        let r = st.results(1).unwrap();
+        (r.top[0].obs[0], r.top[0].obs[1])
+    };
+    let (iso_lo, iso_hi) = eval(false);
+    let (ani_lo, ani_hi) = eval(true);
+    let iso_w = (iso_hi - iso_lo) / v;
+    let ani_w = (ani_hi - ani_lo) / v;
+    eprintln!("thin plate (cap 4096): iso ±{:.2}% vs aniso ±{:.2}%", 50.0 * iso_w, 50.0 * ani_w);
+    assert!(iso_lo <= v && v <= iso_hi, "isotropic unsound");
+    assert!(ani_lo <= v && v <= ani_hi, "anisotropic unsound: exact {v} not in [{ani_lo}, {ani_hi}]");
+    assert!(ani_w < iso_w, "anisotropic splitting should tighten thin-plate bounds ({ani_w} vs {iso_w})");
 }

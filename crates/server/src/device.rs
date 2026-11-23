@@ -150,7 +150,7 @@ pub struct RolloutRun {
 /// a repeat rollout with a new goal or base design only rewrites device buffers.
 #[derive(Default)]
 pub struct DeviceCache {
-    cuda: Option<((u32, u32, u32, u32, u32, u32, usize, u32, u32), agcad_dops::GraphRollout<agcad_driver_cuda::CudaDevice>)>,
+    cuda: Option<((StudioConfig, usize), agcad_dops::GraphRollout<agcad_driver_cuda::CudaDevice>)>,
 }
 
 /// Run on CUDA (cached graph WHILE) when available and requested, else on the CPU reference.
@@ -158,7 +158,7 @@ pub fn run(cache: &mut DeviceCache, design: &agcad_dops::Design, goal: &Goal, cf
     let t0 = std::time::Instant::now();
     if prefer_cuda {
         if let Ok(dev) = agcad_driver_cuda::CudaDevice::open(0) {
-            let key = (cfg.configs, cfg.nodes, cfg.records, cfg.max_rounds, cfg.levels, cfg.cap, design.params.len(), cfg.policy, cfg.island);
+            let key = (cfg, design.params.len());
             let reused = matches!(&cache.cuda, Some((k, _)) if *k == key);
             if reused {
                 cache.cuda.as_mut().unwrap().1.reset(design, goal).map_err(|e| e.to_string())?;

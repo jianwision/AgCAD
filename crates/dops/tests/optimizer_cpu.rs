@@ -9,7 +9,7 @@ use agcad_driver_cpu::CpuDevice;
 use bytemuck::Zeroable;
 
 fn cfg(configs: u32, rounds: u32, pol: u32) -> StudioConfig {
-    StudioConfig { configs, records: 4, max_rounds: rounds, coarse: 8, levels: 5, cap: 4096, nodes: 8, budget: 4 * rounds, tighten: 0, max_cells: 0, policy: pol, island: 16 }
+    StudioConfig { configs, records: 4, max_rounds: rounds, coarse: 8, levels: 5, cap: 4096, nodes: 8, budget: 4 * rounds, tighten: 0, max_cells: 0, policy: pol, island: 16, aniso: true }
 }
 
 fn exact(d: &agcad_dops::Design) -> f64 { agcad_geo::tessellate::tessellate(&to_layered(d).unwrap().brep(), &Default::default()).mass_properties().0 }

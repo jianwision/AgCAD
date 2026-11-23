@@ -10,7 +10,7 @@ use agcad_dops::lower::to_layered;
 use agcad_dops::{Studio, StudioConfig};
 use std::time::Instant;
 
-fn cfg(configs: u32, rounds: u32) -> StudioConfig { StudioConfig { configs, records: 4, max_rounds: rounds, coarse: 8, levels: 5, cap: 4096, nodes: 8, budget: 64, tighten: 0, max_cells: 0, policy: 0, island: 16 } }
+fn cfg(configs: u32, rounds: u32) -> StudioConfig { StudioConfig { configs, records: 4, max_rounds: rounds, coarse: 8, levels: 5, cap: 4096, nodes: 8, budget: 64, tighten: 0, max_cells: 0, policy: 0, island: 16, aniso: true } }
 
 #[test]
 #[ignore = "requires NVIDIA GPU"]
@@ -51,7 +51,7 @@ fn graph_while_rollout_equals_host_loop_without_round_trips() {
 fn rollout_4096_configurations_throughput_and_soundness() {
     let (base, goal) = (cpu::flange(60.0, 12.0, 6.0), cpu::goal(60_000.0, 66_000.0));
     let cuda = agcad_driver_cuda::CudaDevice::open(0).unwrap();
-    let c = StudioConfig { configs: 4096, records: 4, max_rounds: 24, coarse: 8, levels: 6, cap: 8192, nodes: 8, budget: 64, tighten: 0, max_cells: 0, policy: 0, island: 16 };
+    let c = StudioConfig { configs: 4096, records: 4, max_rounds: 24, coarse: 8, levels: 6, cap: 8192, nodes: 8, budget: 64, tighten: 0, max_cells: 0, policy: 0, island: 16, aniso: true };
     let st = Studio::new(cuda, &base, &goal, c).unwrap();
     let t0 = Instant::now();
     st.run_graph().unwrap();
@@ -207,7 +207,7 @@ fn implicit_mesh_bitwise() {
 fn large_cap_under_global_budget() {
     let (base, goal) = (cpu::flange(60.0, 12.0, 6.0), cpu::goal(60_000.0, 66_000.0));
     let cuda = agcad_driver_cuda::CudaDevice::open(0).unwrap();
-    let c = StudioConfig { configs: 4096, records: 4, max_rounds: 8, coarse: 8, levels: 7, cap: 65536, nodes: 8, budget: 64, tighten: 0, max_cells: 1 << 25, policy: 0, island: 16 };
+    let c = StudioConfig { configs: 4096, records: 4, max_rounds: 8, coarse: 8, levels: 7, cap: 65536, nodes: 8, budget: 64, tighten: 0, max_cells: 1 << 25, policy: 0, island: 16, aniso: true };
     let st = Studio::new(cuda, &base, &goal, c).unwrap();
     let t0 = Instant::now();
     st.run_graph().unwrap();
@@ -239,7 +239,7 @@ fn cmaes_bitwise_graph_and_scale() {
     gr.run_graph().unwrap();
     assert!(gr.state_bytes().unwrap() == a.state_bytes().unwrap(), "graph ≠ host loop");
     for pol in [policy::MOCK, policy::CMAES] {
-        let c = StudioConfig { configs: 4096, records: 4, max_rounds: 24, coarse: 8, levels: 6, cap: 8192, nodes: 8, budget: 96, tighten: 0, max_cells: 0, policy: pol, island: 16 };
+        let c = StudioConfig { configs: 4096, records: 4, max_rounds: 24, coarse: 8, levels: 6, cap: 8192, nodes: 8, budget: 96, tighten: 0, max_cells: 0, policy: pol, island: 16, aniso: true };
         let st = Studio::new(cuda.clone(), &base, &g, c).unwrap();
         let t0 = Instant::now();
         st.run_graph().unwrap();
@@ -321,4 +321,36 @@ fn structural_cmaes_bitwise() {
     gr.run_graph().unwrap();
     assert!(gr.state_bytes().unwrap() == x.state_bytes().unwrap(), "graph ≠ host loop");
     assert!(x.results(1).unwrap().done > 16);
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU"]
+fn thin_plate_bounds_match_with_variable_child_budgets() {
+    let base = agcad_dops::examples::pocketed_plate(100.0, 3.0);
+    let goal = agcad_dops::examples::plate_goal();
+    let exact = agcad_geo::tessellate::tessellate(&to_layered(&base).unwrap().brep(), &Default::default()).mass_properties().0;
+    let cuda = agcad_driver_cuda::CudaDevice::open(0).unwrap();
+    for (configs, max_cells) in [(1, 4096), (2, 1025)] {
+        let mut widths = Vec::new();
+        for aniso in [false, true] {
+            let config = StudioConfig { configs, coarse: 8, levels: 6, cap: 4096, max_cells,
+                max_rounds: 1, aniso, ..Default::default() };
+            let gpu = Studio::new(cuda.clone(), &base, &goal, config).unwrap();
+            let host = Studio::new(agcad_driver_cpu::CpuDevice::new(), &base, &goal, config).unwrap();
+            host.observe().unwrap();
+            let reference = host.results(configs as usize).unwrap();
+            // Repeat to exercise scratch-buffer reuse and clipping across CUDA blocks.
+            for _ in 0..3 {
+                gpu.observe().unwrap();
+                let measured = gpu.results(configs as usize).unwrap();
+                assert_eq!(measured.top.len(), configs as usize);
+                for (actual, expected) in measured.top.iter().zip(&reference.top) {
+                    assert_eq!(actual.obs.map(f64::to_bits), expected.obs.map(f64::to_bits));
+                    assert!(actual.obs[0] <= exact && exact <= actual.obs[1]);
+                }
+            }
+            widths.push(reference.top[0].obs[1] - reference.top[0].obs[0]);
+        }
+        if configs == 1 { assert!(widths[1] < widths[0]); }
+    }
 }

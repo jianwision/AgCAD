@@ -24,7 +24,7 @@ fn doc_round_trip(d: &Design) {
 
 fn run(g: &agcad_dops::Goal, configs: u32, rounds: u32) -> agcad_dops::RolloutSummary {
     let base = flange(60.0, 12.0, 6.0);
-    let c = StudioConfig { configs, records: 4, max_rounds: rounds, coarse: 8, levels: 5, cap: 4096, nodes: 12, budget: 64, tighten: 0, max_cells: 0, policy: policy::MOCK, island: 16 };
+    let c = StudioConfig { configs, records: 4, max_rounds: rounds, coarse: 8, levels: 5, cap: 4096, nodes: 12, budget: 64, tighten: 0, max_cells: 0, policy: policy::MOCK, island: 16, aniso: true };
     let st = Studio::new(CpuDevice::new(), &base, g, c).unwrap();
     st.run_host_loop().unwrap();
     st.results(configs as usize).unwrap()

@@ -88,7 +88,7 @@ impl Design {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StudioConfig {
     pub configs: u32,
     pub nodes: u32,
@@ -112,10 +112,12 @@ pub struct StudioConfig {
     /// per island, 2 ..= 64).
     pub policy: u32,
     pub island: u32,
+    /// Refine ambiguous cells along the axes that affect their distance interval.
+    pub aniso: bool,
 }
 
 impl Default for StudioConfig {
-    fn default() -> Self { StudioConfig { configs: 64, nodes: 16, records: 4, max_rounds: 32, coarse: 8, levels: 5, cap: 4096, budget: 64, tighten: 0, max_cells: 0, policy: 0, island: 16 } }
+    fn default() -> Self { StudioConfig { configs: 64, nodes: 16, records: 4, max_rounds: 32, coarse: 8, levels: 5, cap: 4096, budget: 64, tighten: 0, max_cells: 0, policy: 0, island: 16, aniso: true } }
 }
 
 /// One configuration's result after a rollout.
@@ -143,7 +145,7 @@ struct Bufs<B> {
     // ranking scratch
     rank_keys: B, rank_vals: B,
     stamps: B,
-    wl0: B, wl1: B, cls: B, flag: B, offs: B, crank: B, start: B, lvl: B, term: B, toffs: B, tlist: B, tcount: B, opt: B, samp: B, tscore: B, pool: B,
+    wl0: B, wl1: B, shape: B, flag: B, offs: B, crank: B, start: B, lvl: B, term: B, toffs: B, tlist: B, tcount: B, opt: B, samp: B, tscore: B, pool: B,
 }
 
 pub struct Studio<D: KernelExt> {
@@ -160,7 +162,7 @@ pub struct Studio<D: KernelExt> {
     /// Per-level argument blocks: [eval_trial][level].
     a_level: [Vec<ParamUpload<D>>; 2],
     scan: agcad_kernels::primitives::ScanPlan<D>,
-    scan_cls: agcad_kernels::primitives::ScanPlan<D>,
+    scan_requested: agcad_kernels::primitives::ScanPlan<D>,
     scan_term: agcad_kernels::primitives::ScanPlan<D>,
     a_validate: ParamUpload<D>,
     host_args: DopsArgs,
@@ -250,7 +252,7 @@ impl<D: KernelExt> Studio<D> {
             stamps: zeros(cfg.max_rounds as usize * STAGES * 8)?,
             wl0: zeros(capacity * 8)?,
             wl1: zeros(capacity * 8)?,
-            cls: zeros(capacity * 4)?,
+            shape: zeros(capacity * 4)?,
             flag: zeros(capacity * 4)?,
             offs: zeros(capacity * 4)?,
             crank: zeros(capacity * 4)?,
@@ -270,22 +272,22 @@ impl<D: KernelExt> Studio<D> {
             rev: b.rev.device_ptr(), budget: b.budget.device_ptr(), done: b.done.device_ptr(), cmds: b.cmds.device_ptr(), arena: b.arena.device_ptr(),
             status: b.status.device_ptr(), counts: b.counts.device_ptr(), domain_hit: b.domain_hit.device_ptr(), bbox: b.bbox.device_ptr(),
             obs: b.obs.device_ptr(), score: b.score.device_ptr(), trace: b.trace.device_ptr(), round: b.round.device_ptr(), active: b.active.device_ptr(), compiled: b.compiled.device_ptr(), tables: b.tables.device_ptr(),
-            wl0: b.wl0.device_ptr(), wl1: b.wl1.device_ptr(), cls: b.cls.device_ptr(), flag: b.flag.device_ptr(), offs: b.offs.device_ptr(), crank: b.crank.device_ptr(), start: b.start.device_ptr(), lvl: b.lvl.device_ptr(), term: b.term.device_ptr(), toffs: b.toffs.device_ptr(), tlist: b.tlist.device_ptr(), tcount: b.tcount.device_ptr(), opt: b.opt.device_ptr(), samp: b.samp.device_ptr(), tscore: b.tscore.device_ptr(), pool: b.pool.device_ptr(),
+            wl0: b.wl0.device_ptr(), wl1: b.wl1.device_ptr(), shape: b.shape.device_ptr(), flag: b.flag.device_ptr(), offs: b.offs.device_ptr(), crank: b.crank.device_ptr(), start: b.start.device_ptr(), lvl: b.lvl.device_ptr(), term: b.term.device_ptr(), toffs: b.toffs.device_ptr(), tlist: b.tlist.device_ptr(), tcount: b.tcount.device_ptr(), opt: b.opt.device_ptr(), samp: b.samp.device_ptr(), tscore: b.tscore.device_ptr(), pool: b.pool.device_ptr(),
             cond_handle: handle, configs: cfg.configs, nodes: cfg.nodes, params: k as u32, records: cfg.records, coarse: cfg.coarse, levels: cfg.levels,
-            eval_trial, max_rounds: cfg.max_rounds, level, capacity: capacity as u32, cap: cfg.cap, cfg_offset, tighten: cfg.tighten, policy: cfg.policy, island: island as u32, general_ok: base.nodes.iter().any(|n| n.kind >= profile::SKETCH || n.flags & (nflags::DRAFT | nflags::ROUND_Z | nflags::CHAMFER_Z) != 0) as u32, ops: crate::registry::op_table(agcad_ir::Catalog::global()),
+            eval_trial, max_rounds: cfg.max_rounds, level, capacity: capacity as u32, cap: cfg.cap, cfg_offset, tighten: cfg.tighten, policy: cfg.policy, island: island as u32, general_ok: base.nodes.iter().any(|n| n.kind >= profile::SKETCH || n.flags & (nflags::DRAFT | nflags::ROUND_Z | nflags::CHAMFER_Z) != 0) as u32, aniso: cfg.aniso as u32, _pad: 0, ops: crate::registry::op_table(agcad_ir::Catalog::global()),
         };
         let a_observe = upload_params(d, &s, &mk(0, 0, 0))?;
         let host_args = mk(1, 0, 0);
         let a_level = [(0..cfg.levels).map(|l| upload_params(d, &s, &mk(0, 0, l))).collect::<DriverResult<Vec<_>>>()?, (0..cfg.levels).map(|l| upload_params(d, &s, &mk(1, 0, l))).collect::<DriverResult<Vec<_>>>()?];
         let scan = agcad_kernels::primitives::ScanPlan::new(d, &s, &b.flag, &b.offs, capacity as u32)?;
-        let scan_cls = agcad_kernels::primitives::ScanPlan::new(d, &s, &b.cls, &b.crank, capacity as u32)?;
+        let scan_requested = agcad_kernels::primitives::ScanPlan::new(d, &s, &b.flag, &b.crank, capacity as u32)?;
         let scan_term = agcad_kernels::primitives::ScanPlan::new(d, &s, &b.term, &b.toffs, capacity as u32)?;
         let a_round = upload_params(d, &s, &host_args)?;
         let a_validate = upload_params(d, &s, &agcad_harness::wavefront::ValidateParams {
             cmds: b.cmds.device_ptr(), status: b.status.device_ptr(), allow: b.allow.device_ptr(), budget: b.budget.device_ptr(), revisions: b.rev.device_ptr(), keys: b.keys.device_ptr(), n: cfg.configs * cfg.records, configs: cfg.configs,
         })?;
         let a_stamp = (0..STAGES as u32).map(|stage| upload_params(d, &s, &StampParams { stamps: b.stamps.device_ptr(), round: b.round.device_ptr(), stage, max_rounds: cfg.max_rounds })).collect::<DriverResult<Vec<_>>>()?;
-        Ok(Studio { dev, s, lib, hv, prim, cfg, base: base.clone(), b, a_observe, a_round, a_level, scan, scan_cls, scan_term, a_validate, host_args, a_stamp, readback: Cell::new(0) })
+        Ok(Studio { dev, s, lib, hv, prim, cfg, base: base.clone(), b, a_observe, a_round, a_level, scan, scan_requested, scan_term, a_validate, host_args, a_stamp, readback: Cell::new(0) })
     }
 
     /// Re-initialize the rollout state in place for a new base design and goal (same shape:
@@ -337,7 +339,7 @@ impl<D: KernelExt> Studio<D> {
             let a = &self.a_level[t][l].buffer;
             d.launch(&self.s, self.lib, "ag_ad_classify", &self.per_entry(), a)?;
             d.launch(&self.s, self.lib, "ag_ad_start", &self.per_entry(), a)?;
-            self.scan_cls.launch(d, &self.s, self.prim)?;
+            self.scan_requested.launch(d, &self.s, self.prim)?;
             d.launch(&self.s, self.lib, "ag_ad_resolve", &self.per_entry(), a)?;
             self.scan.launch(d, &self.s, self.prim)?;
             d.launch(&self.s, self.lib, "ag_ad_clip", &self.per_entry(), a)?;
@@ -556,7 +558,7 @@ pub fn certify<D: KernelExt>(dev: Arc<D>, design: &Design, goal: &Goal, levels: 
 pub const CERTIFY_TIGHTEN: u32 = 96;
 
 pub fn certify_with<D: KernelExt>(dev: Arc<D>, design: &Design, goal: &Goal, levels: u32, cap: u32, tighten: u32) -> DriverResult<[f64; OBS]> {
-    let cfg = StudioConfig { configs: 1, nodes: design.nodes.len().max(1) as u32, records: 1, max_rounds: 1, coarse: 8, levels, cap, budget: 1, tighten, max_cells: 0, policy: 0, island: 16 };
+    let cfg = StudioConfig { configs: 1, nodes: design.nodes.len().max(1) as u32, records: 1, max_rounds: 1, coarse: 8, levels, cap, budget: 1, tighten, max_cells: 0, policy: 0, island: 16, aniso: true };
     let st = Studio::new_with(dev, design, goal, cfg, 0, Priority::Low)?;
     st.observe()?;
     let o: Vec<f64> = st.read(&st.b.obs, 0, OBS)?;

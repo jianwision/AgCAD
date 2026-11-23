@@ -127,10 +127,9 @@ This is the loop **LLM observes → sets a goal → GPU model plans and executes
 
   **Global cell budget** (`max_cells`): memory follows the budget instead of configs × cap. 4096 configurations at cap 65 536 / 512³ finest run in 2.7 s under a 32 M-cell budget; before, this exceeded VRAM at 12 s per round.
 
-  Ruled out by measurement: near-cubic root cells. They made plate bounds 3× wider, because the thin-z cells bound the dominant faces best. The fix will be orientation-aware anisotropic splitting.
+  Ruled out by measurement: near-cubic root cells. They made plate bounds 3× wider, because the thin-z cells bound the dominant faces best. The global worklist now splits along the axes that affect the distance interval. On the pocketed thin plate at a 4,096-cell cap, this narrowed the relative volume half-width from ±42.37% to ±19.89%. Use `bench-device --no-aniso` or `device_rollout` with `"aniso": false` to select uniform splitting.
 - **Next:**
   - a learned structural policy over feature-tape tokens, one token per node (CANTO-style native tokenization), trained from rollout traces; CMA-ES then tunes its parameters;
-  - anisotropic refinement in the global worklist (today it is only within the per-cell tightening);
   - shared-memory tapes;
   - open shells and multi-slab offsets (the general offset path);
   - an OCCT parity fuzz for `offset_inward`;

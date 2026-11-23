@@ -12,6 +12,12 @@ pub mod boolean;
 pub mod evaluate;
 pub mod file;
 pub mod knowledge;
+mod loft;
+mod loft_device;
+mod loft_sections;
+mod loft_network;
+mod surface_spline;
+mod surface_blend;
 pub mod mesh;
 pub mod part;
 pub mod physics;
@@ -24,6 +30,11 @@ use std::sync::Arc;
 
 pub fn standard_registry() -> Registry {
     let mut r = Registry::default();
+    r.register(Arc::new(surface_spline::Spline));
+    r.register(Arc::new(surface_blend::Blend));
+    for op in ["surface.multi_sections_surface", "part.multi_sections_solid"] {
+        r.register(Arc::new(loft::Loft(op)));
+    }
     for op in ["sketch.create", "sketch.point", "sketch.line", "sketch.circle", "sketch.arc", "sketch.rectangle", "sketch.profile", "sketch.polygon", "sketch.elongated_hole", "sketch.solve", "sketch.regions"] {
         r.register(Arc::new(sketch::SketchOp(op)));
     }

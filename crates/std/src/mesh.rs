@@ -95,9 +95,14 @@ impl FeatureImpl for MeshOp {
     fn execute(&self, ctx: &mut BuildContext<'_>, n: &FeatureNode) -> Result<Product, FeatureError> {
         match self.0 {
             "mesh.tessellate" => {
-                let s = solid(ctx, list(req(n, "items")?).first().ok_or_else(|| bad("no items"))?)?;
+                let item = list(req(n, "items")?).first().ok_or_else(|| bad("no items"))?;
                 let o = TessOptions { sag: num_or(ctx, n, "sag", 0.01)?, angle: num_or(ctx, n, "angle", 0.2)?, ..Default::default() };
-                Ok(Product::Mesh(ctx.kernel.tessellate(&s, &o)))
+                let mesh = match ctx.product(item)? {
+                    Product::Sheet(b) => agcad_geo::tessellate::tessellate(b, &o),
+                    Product::Solid(s) => ctx.kernel.tessellate(s, &o),
+                    _ => return Err(bad("tessellation requires a solid or sheet")),
+                };
+                Ok(Product::Mesh(mesh))
             }
             "convert.implicit_to_mesh" => {
                 let body = match ctx.product(req(n, "body")?)? { Product::Implicit(i) => i.clone(), _ => return Err(bad("expected an implicit body")) };

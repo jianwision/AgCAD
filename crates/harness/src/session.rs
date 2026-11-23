@@ -16,6 +16,21 @@ use agcad_trace::{Trace, TraceEvent};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 
+pub struct AcceptedGeometry {
+    pub exact: Option<Product>,
+    pub mesh: Option<agcad_geo::tessellate::Mesh>,
+    pub parameters: BTreeMap<String, f64>,
+}
+
+pub fn parameter_values(state: &agcad_runtime::document::PartState, u: &agcad_runtime::rebuild::UpdateResult) -> std::collections::BTreeMap<String, f64> {
+    state.order.iter().filter_map(|id| {
+        let f = &state.features[id];
+        if f.op != "knowledge.parameter" { return None; }
+        let Some(agcad_ir::Value::String(name)) = f.args.get("name") else { return None };
+        match u.products.get(id) { Some(Product::Scalar(v)) => Some((name.clone(), *v)), _ => None }
+    }).collect()
+}
+
 pub struct HarnessSession {
     pub requirements: Requirements,
     pub doc: PartDocument,
@@ -26,6 +41,9 @@ pub struct HarnessSession {
     /// AgIR statement id → feature id, per branch (programs may reference earlier statements).
     pub ids: HashMap<String, HashMap<String, FeatureId>>,
     pub last_update: Option<UpdateResult>,
+    /// Display/export geometry survives a failed edit. Rebuild and save still see its diagnostics.
+    pub accepted_bodies: HashMap<String, AcceptedGeometry>,
+    last_attempt: Option<(String, u32, bool)>,
     /// Output directory for file features (control-plane IO).
     pub out_dir: std::path::PathBuf,
 }
@@ -48,6 +66,10 @@ fn remap(v: &Value, ids: &HashMap<String, FeatureId>) -> Value {
 
 impl HarnessSession {
     pub fn new(requirements: Requirements, part_name: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let session = format!("{}-{stamp}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
         HarnessSession {
             requirements,
             doc: PartDocument::new(part_name),
@@ -57,7 +79,9 @@ impl HarnessSession {
             trace: Trace::default(),
             ids: HashMap::new(),
             last_update: None,
-            out_dir: std::env::temp_dir().join("agcad-out"),
+            accepted_bodies: HashMap::new(),
+            last_attempt: None,
+            out_dir: std::env::temp_dir().join("agcad-out").join(session),
         }
     }
 
@@ -163,13 +187,30 @@ impl HarnessSession {
         Some(r)
     }
 
-    fn body_feature(&self) -> Option<FeatureId> {
-        let u = self.last_update.as_ref()?;
-        u.products.iter().rev().find(|(_, p)| matches!(p, Product::Solid(_))).map(|(id, _)| *id)
+    pub fn selected_body<'a>(&self, update: &'a UpdateResult) -> Option<(&'a FeatureId, &'a Product)> {
+        let kind = self.requirements.deliver.body_type.as_str();
+        update.products.iter().rev().find(|(_, p)| match kind {
+            "SurfaceBody" => matches!(p, Product::Sheet(_)),
+            "SolidBody" => matches!(p, Product::Solid(_)),
+            _ => matches!(p, Product::Solid(_) | Product::Sheet(_) | Product::Mesh(_) | Product::Implicit(_)),
+        })
     }
 
     fn run_checks(&self, branch: &str, phase: Phase) -> Vec<CheckResult> {
-        let (Some(u), Some(body)) = (self.last_update.as_ref(), self.body_feature()) else { return vec![]; };
+        let Some(u) = self.last_update.as_ref() else { return vec![]; };
+        let Some((&body, _)) = self.selected_body(u) else {
+            let required = self.requirements.at_phase(phase);
+            let incompatible = u.products.values().any(|p| matches!(p, Product::Solid(_) | Product::Sheet(_)));
+            if phase == Phase::Finish || incompatible || !required.is_empty() {
+                return vec![CheckResult {
+                    requirement: "deliver.body_type".into(), verdict: Verdict::Fail,
+                    value: serde_json::Value::Null, margin: None, evidence: crate::requirements::Evidence::Exact,
+                    required_evidence: crate::requirements::Evidence::Exact, checker_version: crate::checker::CHECKER_VERSION,
+                    escalation: None, message: Some(format!("workspace requires a {}", self.requirements.deliver.body_type)),
+                }];
+            }
+            return vec![];
+        };
         let ws = self.doc.workspaces.get(branch).expect("workspace exists");
         self.requirements.at_phase(phase).into_iter().map(|h| check(h, &ws.state, self.kernel.as_ref(), &self.registry, &u.products, body)).collect()
     }
@@ -184,6 +225,9 @@ impl HarnessSession {
         let mut features = Vec::new();
         let mut unsupported = Vec::new();
         for o in &res.outcomes {
+            if let Some(&(device, patches)) = res.dispatches.get(&o.feature) {
+                self.trace.push(TraceEvent::GeometryDispatch { feature_ref: o.feature_ref.clone(), device: device.into(), patches });
+            }
             self.trace.push(TraceEvent::Feature { feature_ref: o.feature_ref.clone(), status: o.status.value(), message: o.error.as_ref().map(|e| e.message.clone()) });
             if o.status == AgStatus::UnsupportedOp { unsupported.push(o.feature_ref.clone()); }
             features.push(FeatureLine {
@@ -198,19 +242,47 @@ impl HarnessSession {
         let ok = res.ok();
         self.last_update = Some(res);
         let checks = self.run_checks(branch, phase);
+        let passed = checks.iter().all(|c| c.verdict == Verdict::Pass);
+        let accepted = ok && passed;
+        self.last_attempt = Some((branch.to_owned(), revision, accepted));
+        if accepted {
+            let u = self.last_update.as_ref().unwrap();
+            let selected = self.selected_body(u);
+            let exact = selected.and_then(|(_,p)| match p {
+                Product::Solid(_) | Product::Sheet(_) => Some(p.clone()),
+                _ => None,
+            });
+            let mesh = u.products.iter().rev().find_map(|(id,p)| match p {
+                Product::Mesh(m) if selected.is_none_or(|(body,_)| id >= body) => Some(m.clone()),
+                _ => None,
+            });
+            self.accepted_bodies.insert(branch.into(), AcceptedGeometry { exact, mesh, parameters: parameter_values(&state,u) });
+        }
         for c in &checks {
             self.trace.push(TraceEvent::Check { requirement: c.requirement.clone(), verdict: format!("{:?}", c.verdict), value: c.value.as_f64().unwrap_or(f64::NAN), bound: f64::NAN, evidence: format!("{:?}", c.evidence), checker_version: c.checker_version });
         }
         let _ = self.meter.charge_time(&self.requirements.budget, 0.0, t0.elapsed().as_secs_f64() * 1000.0);
-        let status = if !ok { "FEATURE_FAILED" } else if checks.iter().any(|c| c.verdict == Verdict::Fail) { AgStatus::RequirementFailed.name() } else { AgStatus::Accepted.name() };
+        let status = if !ok { "FEATURE_FAILED" } else if !passed { AgStatus::RequirementFailed.name() } else { AgStatus::Accepted.name() };
         UpdateReport {
-            status: status.into(), revision, requirements_rev: self.requirements.rev, workspace_state: if ok { "valid".into() } else { "invalid".into() },
+            status: status.into(), revision, requirements_rev: self.requirements.rev, workspace_state: if accepted { "valid".into() } else { "invalid".into() },
             features, checks, budget: self.meter.remaining(&self.requirements.budget), unsupported, topology_classes: None, proxy_fidelity: None, study: None,
         }
     }
 
+    fn current_attempt(&mut self, branch: &str) -> bool {
+        let Some(ws) = self.doc.workspaces.get(branch) else { return false };
+        if let Some((name, revision, accepted)) = &self.last_attempt {
+            if name == branch && *revision == ws.revision { return *accepted; }
+        }
+        self.update(branch, Phase::Update).status == AgStatus::Accepted.name()
+    }
+
     /// `document.save_version`: save-phase checks must pass; otherwise the workspace is kept.
     pub fn save_version(&mut self, branch: &str, label: &str) -> Result<u32, (AgStatus, String)> {
+        if !self.current_attempt(branch) {
+            let status = if self.last_update.as_ref().is_some_and(|u| !u.ok()) { AgStatus::TopologyFailed } else { AgStatus::RequirementFailed };
+            return Err((status, "workspace has a rejected update".into()));
+        }
         let checks = self.run_checks(branch, Phase::Save);
         if let Some(f) = checks.iter().find(|c| c.verdict != Verdict::Pass) {
             return Err((AgStatus::RequirementFailed, format!("{} {:?} (value {}); workspace kept for repair", f.requirement, f.verdict, f.value)));
@@ -225,10 +297,12 @@ impl HarnessSession {
 
     /// `document.finish`: finish-phase checks, write files (control plane), delivery report.
     pub fn finish(&mut self, branch: &str) -> DeliveryReport {
+        let accepted = self.current_attempt(branch);
         let checks = self.run_checks(branch, Phase::Finish);
+        let passed = accepted && checks.iter().all(|c| c.verdict == Verdict::Pass);
         let mut files = Vec::new();
         let mut delivered = true;
-        if let Some(u) = &self.last_update {
+        if let Some(u) = self.last_update.as_ref().filter(|_| passed) {
             for p in u.products.values() {
                 if let Product::Other(o) = p {
                     if let Some(fb) = o.downcast_ref::<agcad_std::file::FileBytes>() {
@@ -242,6 +316,8 @@ impl HarnessSession {
             }
         }
         let exec_ok = self.last_update.as_ref().is_some_and(|u| u.ok());
-        DeliveryReport::from_checks(checks, exec_ok, files, delivered && exec_ok)
+        let mut report = DeliveryReport::from_checks(checks, exec_ok, files, delivered && passed);
+        report.requirements_met &= accepted;
+        report
     }
 }

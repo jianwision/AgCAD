@@ -11,6 +11,7 @@ use crate::curve::Curve;
 use crate::math::V3;
 use crate::predicates::orient2d;
 use serde::{Deserialize, Serialize};
+mod patch;
 
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TessOptions {
@@ -108,16 +109,15 @@ struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
-    fn new(b: &'a Brep, o: &TessOptions) -> Self {
+    fn new(b: &'a Brep, grid: &patch::Grid) -> Self {
         let mut mesh = Mesh::default();
         let vmap: Vec<u32> = b.vertices.iter().map(|v| { mesh.positions.push(v.p); (mesh.positions.len() - 1) as u32 }).collect();
         let mut esamples = Vec::with_capacity(b.edges.len());
-        for e in &b.edges {
+        for (e, ts) in b.edges.iter().zip(&grid.stations) {
             let c = &b.curves[e.curve as usize];
-            let n = segments(c, e.t0, e.t1, o);
-            let mut v = Vec::with_capacity(n.saturating_sub(1));
-            for i in 1..n {
-                let t = e.t0 + (e.t1 - e.t0) * i as f64 / n as f64;
+            let mut v = Vec::with_capacity(ts.len()-2);
+            for &u in &ts[1..ts.len()-1] {
+                let t = e.t0 + (e.t1 - e.t0) * u;
                 mesh.positions.push(c.point(t));
                 v.push((t, (mesh.positions.len() - 1) as u32));
             }
@@ -152,8 +152,10 @@ impl<'a> Builder<'a> {
 
 /// Tessellate a B-rep (closed bodies give watertight meshes).
 pub fn tessellate(b: &Brep, o: &TessOptions) -> Mesh {
-    let mut bl = Builder::new(b, o);
+    let grid = patch::Grid::new(b,o);
+    let mut bl = Builder::new(b, &grid);
     for (fi, f) in b.faces.iter().enumerate() {
+        if grid.tessellate(fi,&mut bl) { continue; }
         let surf = &b.surfaces[f.surface as usize];
         if let Some(tris) = closed_periodic_grid(&mut bl, f, o) {
             for t in tris {

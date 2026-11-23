@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Standard features (CATIA Part Design / GSD / Sketcher / Knowledgeware ...)."
 
 [dependencies]
+bytemuck = { workspace = true }
 agcad-driver = { workspace = true }
 agcad-ir = { workspace = true }
 agcad-rtc = { workspace = true }

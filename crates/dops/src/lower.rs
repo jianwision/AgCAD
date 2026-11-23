@@ -876,6 +876,7 @@ pub fn raise(part: &PartState) -> Result<(Design, Vec<String>), String> {
                     (n.pref[10], n.val[10]) = size;
                 }
             }
+            "part.multi_sections_solid" => return Err(format!("{}: solid loft has no optimization tape representation", f.feature_ref())),
             other if other.starts_with("evaluate.") || other.starts_with("file.") => {}
             other => warnings.push(format!("{}: {other} has no device equivalent yet; skipped in the rollout", f.feature_ref())),
         }

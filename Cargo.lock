@@ -348,6 +348,7 @@ dependencies = [
  "agcad-runtime",
  "agcad-solver",
  "agcad-vm",
+ "bytemuck",
  "serde_json",
  "thiserror 2.0.21",
 ]

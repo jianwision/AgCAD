@@ -207,6 +207,24 @@ impl Jet {
 }
 
 impl NurbsSurface {
+    /// Evaluate position without computing the first and second derivatives.
+    pub fn point(&self, u: f64, v: f64) -> V3 {
+        let iu = find_span(self.nu - 1, self.du, u, &self.ku);
+        let iv = find_span(self.nv - 1, self.dv, v, &self.kv);
+        let bu = ders_basis(iu, u, self.du, 0, &self.ku);
+        let bv = ders_basis(iv, v, self.dv, 0, &self.kv);
+        let mut p = V3::ZERO;
+        let mut weight = 0.;
+        for (i, &a) in bu[0].iter().enumerate() {
+            for (j, &b) in bv[0].iter().enumerate() {
+                let k = (iu - self.du + i) * self.nv + iv - self.dv + j;
+                let w = a * b * self.weights[k];
+                p = p + self.poles[k] * w;
+                weight += w;
+            }
+        }
+        p * (1. / weight)
+    }
     pub fn domain(&self) -> ((f64, f64), (f64, f64)) { ((self.ku[self.du], self.ku[self.nu]), (self.kv[self.dv], self.kv[self.nv])) }
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.ku.len() != self.nu + self.du + 1 || self.kv.len() != self.nv + self.dv + 1 { return Err("knot count"); }

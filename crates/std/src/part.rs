@@ -39,7 +39,7 @@ fn limits(ctx: &BuildContext<'_>, n: &FeatureNode) -> Result<(f64, f64), Feature
     Ok((z0, z1))
 }
 
-fn combine(ctx: &mut BuildContext<'_>, n: &FeatureNode, tool: Solid, op: BoolOp2) -> Result<Product, FeatureError> {
+pub(crate) fn combine(ctx: &mut BuildContext<'_>, n: &FeatureNode, tool: Solid, op: BoolOp2) -> Result<Product, FeatureError> {
     ctx.tools.insert(n.id, (tool.clone(), op));
     let result = match (ctx.bodies.get(&n.container), op) {
         (None, BoolOp2::Union) => tool,

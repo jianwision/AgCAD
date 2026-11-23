@@ -113,6 +113,20 @@ fn dist_to_line(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
     ((p[0] - a[0]) * d[1] - (p[1] - a[1]) * d[0]).abs() / (d[0] * d[0] + d[1] * d[1]).sqrt()
 }
 
+/// Return the first pair of section edges that meet away from their shared endpoints.
+pub fn crossing_edges(edges: &[Seg2], tolerance: f64) -> Option<(usize, usize)> {
+    for (i, a) in edges.iter().enumerate() {
+        for (j, b) in edges.iter().enumerate().skip(i + 1) {
+            for p in intersections(a, b) {
+                if j == i + 1 && dist(p, a.end()) <= tolerance { continue; }
+                if i == 0 && j + 1 == edges.len() && dist(p, a.start()) <= tolerance { continue; }
+                return Some((i, j));
+            }
+        }
+    }
+    None
+}
+
 fn on_segment(s: &Seg2, p: [f64; 2]) -> bool {
     match *s {
         Seg2::Line { a, b } => {

@@ -50,7 +50,7 @@ pub fn check(req: &HardRequirement, part: &PartState, kernel: &dyn ExactKernel, 
     args.insert("body".into(), body_ref.clone());
     args.insert("items".into(), Value::List(vec![body_ref]));
     let node = FeatureNode { id: u32::MAX, op: req.measure.clone(), op_version: 1, args, container: 0, active: true, role: None };
-    let mut ctx = BuildContext { part, kernel, products: products.clone(), bodies: BTreeMap::new(), params: BTreeMap::new(), exprs: vec![], tools: BTreeMap::new(), names: BTreeMap::new() };
+    let mut ctx = BuildContext { part, kernel, dispatches: BTreeMap::new(), products: products.clone(), bodies: BTreeMap::new(), params: BTreeMap::new(), exprs: vec![], tools: BTreeMap::new(), names: BTreeMap::new() };
     let out = match imp.execute(&mut ctx, &node) {
         Ok(Product::Json(j)) => j,
         Ok(other) => return fail(format!("{} returned {other:?}, expected a report", req.measure)),
@@ -61,7 +61,9 @@ pub fn check(req: &HardRequirement, part: &PartState, kernel: &dyn ExactKernel, 
     let (verdict, margin) = if let Some(eq) = &req.eq {
         (if &value == eq { Verdict::Pass } else { Verdict::Fail }, None)
     } else {
-        let x = value.as_f64().unwrap_or(f64::NAN);
+        let Some(x) = value.as_f64().filter(|x| x.is_finite()) else {
+            return fail(format!("{} did not produce a finite numeric field '{}'", req.measure, req.field));
+        };
         let mut m = f64::INFINITY;
         if let Some(le) = req.le { m = m.min((le - x) / le.abs().max(1e-9)); }
         if let Some(ge) = req.ge { m = m.min((x - ge) / ge.abs().max(1e-9)); }

@@ -62,14 +62,7 @@ pub fn tools() -> Vec<Value> {
 }
 
 /// Values of `knowledge.parameter` features as last rebuilt.
-fn parameter_values(state: &agcad_runtime::document::PartState, u: &agcad_runtime::rebuild::UpdateResult) -> std::collections::BTreeMap<String, f64> {
-    state.order.iter().filter_map(|id| {
-        let f = &state.features[id];
-        if f.op != "knowledge.parameter" { return None; }
-        let Some(agcad_ir::Value::String(name)) = f.args.get("name") else { return None };
-        match u.products.get(id) { Some(Product::Scalar(v)) => Some((name.clone(), *v)), _ => None }
-    }).collect()
-}
+
 
 /// Minimal statement for an op: required inputs filled with typed example values.
 fn example_statement(o: &agcad_ir::OpManifest) -> Value {
@@ -146,12 +139,13 @@ impl Server {
 
     fn current_mesh(&self) -> Option<agcad_geo::tessellate::Mesh> {
         if let Some(im) = self.implicit.get(&self.branch) { return Some(im.mesh.mesh.clone()); }
-        let u = self.session.last_update.as_ref()?;
-        u.products.values().rev().find_map(|p| match p {
+        let geometry = self.session.accepted_bodies.get(&self.branch)?;
+        if let Some(mesh) = &geometry.mesh { return Some(mesh.clone()); }
+        match geometry.exact.as_ref()? {
+            Product::Sheet(b) => Some(agcad_geo::tessellate::tessellate(b, &Default::default())),
             Product::Solid(s) => Some(self.session.kernel.tessellate(s, &Default::default())),
-            Product::Mesh(m) => Some(m.clone()),
             _ => None,
-        })
+        }
     }
 
     /// Escalate a survivor to a new branch of Part Design features: deep certification on its
@@ -234,22 +228,22 @@ impl Server {
             }
             "query" => {
                 let role = args.get("role").and_then(Value::as_str).unwrap_or("");
-                let u = self.session.last_update.as_ref().ok_or("no update yet")?;
-                let names: Vec<Value> = u.products.values().rev().find_map(|p| if let Product::Solid(s) = p { Some(s.brep().faces.iter().filter(|f| role.is_empty() || f.name.contains(role)).map(|f| agcad_harness::report::untrusted(&f.name, "element_name")).collect()) } else { None }).unwrap_or_default();
+                let body = self.session.accepted_bodies.get(&self.branch).and_then(|a| a.exact.as_ref()).and_then(Product::exact_body);
+                let names: Vec<_> = body.iter().flat_map(|b| &b.faces).filter(|f| role.is_empty() || f.name.contains(role))
+                    .map(|f| agcad_harness::report::untrusted(&f.name, "element_name")).collect();
                 json!({ "elements": names })
             }
             "describe" => {
-                let u = self.session.last_update.as_ref().ok_or("no update yet")?;
-                let solid = u.products.values().rev().find_map(|p| if let Product::Solid(s) = p { Some(s.clone()) } else { None }).ok_or("no solid body")?;
-                let ws = self.session.doc.workspace(&self.branch).ok_or("no workspace")?;
-                let now = agcad_harness::describe::describe(&solid.brep(), &parameter_values(&ws.state, u));
+                let accepted = self.session.accepted_bodies.get(&self.branch).ok_or("no accepted geometry")?;
+                let body = accepted.exact.as_ref().and_then(Product::exact_body).ok_or("no accepted exact body")?;
+                let now = agcad_harness::describe::describe(&body, &accepted.parameters);
                 match args.get("against_version").and_then(Value::as_u64) {
                     None => now,
                     Some(vid) => {
                         let ver = self.session.doc.versions.get(vid as usize).ok_or(format!("no version {vid}"))?;
                         let old = agcad_runtime::rebuild::update(&ver.state, &self.session.registry, self.session.kernel.as_ref(), Default::default(), vec![]);
-                        let before = match old.products.values().rev().find_map(|p| if let Product::Solid(s) = p { Some(s.clone()) } else { None }) {
-                            Some(s) => agcad_harness::describe::describe(&s.brep(), &parameter_values(&ver.state, &old)),
+                        let before = match self.session.selected_body(&old).and_then(|(_,p)| p.exact_body()) {
+                            Some(b) => agcad_harness::describe::describe(&b, &agcad_harness::session::parameter_values(&ver.state, &old)),
                             None => json!({}),
                         };
                         json!({ "current": now, "against_version": vid, "diff": agcad_harness::describe::diff(&before, &now) })
@@ -276,19 +270,19 @@ impl Server {
             }
             "export" => {
                 let fmt = args.get("format").and_then(Value::as_str).unwrap_or("step_ap242");
-                let m = self.current_mesh().ok_or("nothing to export")?;
+                let mesh = || self.current_mesh().ok_or("nothing to export");
                 let _ = std::fs::create_dir_all(&self.session.out_dir);
                 let path = self.session.out_dir.join(match fmt { "stl" => "part.stl", "3mf" => "part.3mf", _ => "part.stp" });
                 let bytes = match fmt {
-                    "stl" => agcad_std::file::stl_binary(&m, "part"),
-                    "3mf" => agcad_geo::threemf::write_3mf(&[agcad_geo::threemf::ThreeMfObject { name: "part".into(), mesh: m, beams: vec![], material: None }]),
+                    "stl" => agcad_std::file::stl_binary(&mesh()?, "part"),
+                    "3mf" => agcad_geo::threemf::write_3mf(&[agcad_geo::threemf::ThreeMfObject { name: "part".into(), mesh: mesh()?, beams: vec![], material: None }]),
                     _ => {
                         if let Some(im) = self.implicit.get(&self.branch) {
                             return Err(format!("branch {} is a certified implicit body ({}): STEP needs an exact B-rep; export \"3mf\" or \"stl\"", self.branch, im.reason));
                         }
-                        let u = self.session.last_update.as_ref().ok_or("no update yet")?;
-                        let s = u.products.values().rev().find_map(|p| if let Product::Solid(s) = p { Some(s.clone()) } else { None }).ok_or("no solid body")?;
-                        agcad_geo::step_write::write_step(&s.brep(), &Default::default()).0.into_bytes()
+                        let body = self.session.accepted_bodies.get(&self.branch).and_then(|a| a.exact.as_ref())
+                            .and_then(Product::exact_body).ok_or("no accepted exact body to export")?;
+                        agcad_geo::step_write::write_step(&body, &Default::default()).0.into_bytes()
                     }
                 };
                 std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;

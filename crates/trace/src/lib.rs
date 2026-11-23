@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub enum TraceEvent {
     Session { session: u32, device: String, driver_version: u32, catalog_hash: String, build: String },
     Program { requirements_rev: u32, expected_revision: u32, agir_json: String },
+    GeometryDispatch { feature_ref: String, device: String, patches: usize },
     Feature { feature_ref: String, status: u16, message: Option<String> },
     Check { requirement: String, verdict: String, value: f64, bound: f64, evidence: String, checker_version: u32 },
     Budget { resource: String, used: f64, remaining: f64 },

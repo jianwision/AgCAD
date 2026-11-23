@@ -285,7 +285,7 @@ impl FeatureImpl for SketchOp {
             "sketch.regions" => {
                 let mut s = sketch_of(ctx, req(n, "sketch")?)?;
                 if !s.cons.is_empty() { let rep = s.solve()?; if rep.status != AgStatus::Accepted { return Err(FeatureError::new(rep.status, "sketch constraints did not converge")); } }
-                Ok(Product::Other(Arc::new(FramedRegions { frame: s.frame, regions: s.regions()? })))
+                Ok(Product::Other(Arc::new(s.framed_regions()?)))
             }
             _ => Err(FeatureError::new(AgStatus::UnsupportedOp, format!("{} not implemented", self.0))),
         }
@@ -297,6 +297,26 @@ impl FeatureImpl for SketchOp {
 pub struct FramedRegions {
     pub frame: Frame,
     pub regions: Vec<Profile>,
+    /// Original sketch-entity indices and endpoints, before loop chaining and normalization.
+    pub source_edges: Vec<(usize, [f64; 2], [f64; 2])>,
+}
+
+impl SketchData {
+    fn framed_regions(&self) -> Result<FramedRegions, FeatureError> {
+        let source_edges = self.ents.iter().enumerate().filter_map(|(i, entity)| {
+            match *entity {
+                Ent::Line { a, b, construction: false } | Ent::Arc { a, b, .. } => {
+                    Some((i, self.pts[a], self.pts[b]))
+                }
+                Ent::Circle { c, r } => {
+                    let seam = [self.pts[c][0] + self.rads[r], self.pts[c][1]];
+                    Some((i, seam, seam))
+                }
+                _ => None,
+            }
+        }).collect();
+        Ok(FramedRegions { frame: self.frame, regions: self.regions()?, source_edges })
+    }
 }
 
 pub fn regions_of(ctx: &BuildContext<'_>, v: &Value) -> Result<FramedRegions, FeatureError> {
@@ -306,11 +326,11 @@ pub fn regions_of(ctx: &BuildContext<'_>, v: &Value) -> Result<FramedRegions, Fe
             if let Some(s) = o.downcast_ref::<SketchData>() {
                 let mut s = s.clone();
                 if !s.cons.is_empty() { s.solve()?; }
-                return Ok(FramedRegions { frame: s.frame, regions: s.regions()? });
+                return s.framed_regions();
             }
             Err(bad("expected sketch regions"))
         }
-        Product::Regions(r) => Ok(FramedRegions { frame: Frame::WORLD, regions: r.clone() }),
+        Product::Regions(r) => Ok(FramedRegions { frame: Frame::WORLD, regions: r.clone(), source_edges:Vec::new() }),
         _ => Err(bad("expected sketch regions")),
     }
 }

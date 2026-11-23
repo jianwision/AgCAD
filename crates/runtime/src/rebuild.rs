@@ -33,6 +33,7 @@ impl ImplicitBody {
 #[derive(Clone)]
 pub enum Product {
     Solid(Solid),
+    Sheet(agcad_geo::brep::Brep),
     Mesh(Mesh),
     Implicit(ImplicitBody),
     Curve(Curve),
@@ -45,9 +46,20 @@ pub enum Product {
     Other(Arc<dyn Any + Send + Sync>),
 }
 
+impl Product {
+    pub fn exact_body(&self) -> Option<std::borrow::Cow<'_, agcad_geo::brep::Brep>> {
+        use std::borrow::Cow;
+        match self {
+            Product::Solid(Solid::Brep(b)) | Product::Sheet(b) => Some(Cow::Borrowed(b)),
+            Product::Solid(s) => Some(Cow::Owned(s.brep())),
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Debug for Product {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let k = match self { Product::Solid(_) => "Solid", Product::Mesh(_) => "Mesh", Product::Implicit(_) => "Implicit", Product::Curve(_) => "Curve", Product::Surface(_) => "Surface", Product::Frame(_) => "Frame", Product::Regions(_) => "Regions", Product::Scalar(_) => "Scalar", Product::Json(_) => "Json", Product::Other(_) => "Other" };
+        let k = match self { Product::Solid(_) => "Solid", Product::Sheet(_) => "Sheet", Product::Mesh(_) => "Mesh", Product::Implicit(_) => "Implicit", Product::Curve(_) => "Curve", Product::Surface(_) => "Surface", Product::Frame(_) => "Frame", Product::Regions(_) => "Regions", Product::Scalar(_) => "Scalar", Product::Json(_) => "Json", Product::Other(_) => "Other" };
         write!(f, "Product::{k}")
     }
 }
@@ -70,6 +82,7 @@ impl FeatureError {
 pub struct BuildContext<'a> {
     pub part: &'a PartState,
     pub kernel: &'a dyn ExactKernel,
+    pub dispatches: BTreeMap<FeatureId, (&'static str, usize)>,
     pub products: BTreeMap<FeatureId, Product>,
     /// Current solid of each Body container.
     pub bodies: BTreeMap<usize, Solid>,
@@ -146,6 +159,7 @@ pub struct FeatureOutcome {
 }
 
 pub struct UpdateResult {
+    pub dispatches: BTreeMap<FeatureId, (&'static str, usize)>,
     pub outcomes: Vec<FeatureOutcome>,
     pub products: BTreeMap<FeatureId, Product>,
     pub bodies: BTreeMap<usize, Solid>,
@@ -157,7 +171,7 @@ impl UpdateResult {
 
 /// Update the specification tree for one configuration.
 pub fn update(part: &PartState, registry: &Registry, kernel: &dyn ExactKernel, params: BTreeMap<String, f64>, exprs: Vec<ExprGraph>) -> UpdateResult {
-    let mut ctx = BuildContext { part, kernel, products: BTreeMap::new(), bodies: BTreeMap::new(), params, exprs, tools: BTreeMap::new(), names: BTreeMap::new() };
+    let mut ctx = BuildContext { part, kernel, dispatches: BTreeMap::new(), products: BTreeMap::new(), bodies: BTreeMap::new(), params, exprs, tools: BTreeMap::new(), names: BTreeMap::new() };
     let mut outcomes = Vec::new();
     for id in part.rebuild_order() {
         let node = &part.features[&id];
@@ -174,5 +188,5 @@ pub fn update(part: &PartState, registry: &Registry, kernel: &dyn ExactKernel, p
         };
         outcomes.push(FeatureOutcome { feature: id, feature_ref: node.feature_ref(), status, error });
     }
-    UpdateResult { outcomes, products: ctx.products, bodies: ctx.bodies }
+    UpdateResult { dispatches: ctx.dispatches, outcomes, products: ctx.products, bodies: ctx.bodies }
 }

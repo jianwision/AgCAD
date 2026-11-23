@@ -190,7 +190,7 @@ Legend:
 
 | Op | K | Opcode | Summary | Aliases | Inputs → Outputs | Phase | Backend | Axes | ∂ | MS |
 |---|---|---|---|---|---|---|---|---|---|---|
-| `query.named` |  | `0x0F00` | Resolve stable names (provenance paths or publications) at a revision. | — | `names:String[] → sel:Selection` | proxy | GPU | C,E |  | M2 |
+| `query.named` |  | `0x0F00` | Resolve stable names (provenance paths or publications) at a revision. | — | `names:String[], scope:Ref? → sel:Selection` | proxy | GPU | C,E |  | M2 |
 | `query.element_type` |  | `0x0F01` | Filter by element type (vertex, edge, face, body, sketch element, point/primitive). | — | `scope:Ref, type:Enum → sel:Selection` | proxy | GPU | C,E |  | M2 |
 | `query.created_by` |  | `0x0F02` | Elements created or modified by a feature, optionally by role. | — | `feature:FeatureRef, role:String? → sel:Selection` | proxy | GPU | C,E |  | M2 |
 | `query.parallel_to` |  | `0x0F03` | Faces/edges whose normal/tangent lies within an angle of a direction. | — | `scope:Ref, dir:Vec3, tol:Angle → sel:Selection` | proxy | GPU | C,E |  | M2 |
@@ -321,7 +321,7 @@ Legend:
 | `surface.cylinder` |  | `0x0603` | Cylindrical surface. | — | `center:Ref, dir:Ref, r:Length, limits:Interval → surf:SurfaceBody` | both | GPU | C,E,S | ✓ | M2 |
 | `surface.offset` | ● | `0x0604` | Offset surface (constant or variable) with self-intersection check. | — | `s:Ref, d:Length/Law → surf:SurfaceBody` | both | GPU | C,E,S | ✓ | M3 |
 | `surface.sweep` | ● | `0x0605` | Sweep: explicit, linear, circular, conic profiles; guides, spine, law, twist. | — | `profile:Ref, guides:Ref[], spine:Ref?, laws:Map? → surf:SurfaceBody` | both | GPU | C,E,S | ✓ | M3 |
-| `surface.multi_sections_surface` | ● | `0x0606` | Multi-sections surface (loft) with guides, spine, tangency and coupling. | loft, lofted surface | `sections:Ref[], guides:Ref[]?, coupling:Enum → surf:SurfaceBody` | both | GPU | C,E,S | ✓ | M3 |
+| `surface.multi_sections_surface` | ● | `0x0606` | Multi-sections surface (loft) with guides, spine, tangency and coupling. | loft, lofted surface | `sections:Ref[], guides:Ref[]?, coupling:Enum, ruled:Bool? → surf:SurfaceBody` | both | GPU | C,E,S | ✓ | M3 |
 | `surface.blend` |  | `0x0607` | Blend surface between two curves on supports with G0..G3 continuity and tension. | — | `a:Ref, b:Ref, order:Int[], tension:Scalar[]? → surf:SurfaceBody` | both | GPU | C,E,S | ✓ | M3 |
 | `surface.fill` | ● | `0x0608` | Fill an N-sided boundary with G0..G2 conditions to support surfaces. | n-sided patch, fill surface | `boundary:Ref[], supports:Ref[]?, order:Int[]? → surf:SurfaceBody` | both | GPU | C,E,S | ✓ | M3 |
 | `surface.net_surface` |  | `0x0609` | Surface from a network of curves in two directions (Gordon). | boundary surface, network surface | `u:Ref[], v:Ref[] → surf:SurfaceBody` | both | GPU | C,E,S | ✓ | M3 |
@@ -352,7 +352,7 @@ Legend:
 | `part.hole` |  | `0x0704` | Hole: simple, tapered, counterbored, countersunk, counterdrilled; threaded; standard tables. | hole wizard | `support:Ref, positions:Ref[], spec:HoleSpec → feature:FeatureRef` | both | GPU | C | ✓ | M2 |
 | `part.rib` |  | `0x0705` | Rib: sweep a profile along a center curve to add material. | sweep, swept boss | `profile:Ref, center:Ref, orientation:Enum → feature:FeatureRef` | both | GPU | C | ✓ | M2 |
 | `part.slot` |  | `0x0706` | Slot: sweep a profile along a center curve to remove material. | swept cut | `profile:Ref, center:Ref, orientation:Enum → feature:FeatureRef` | both | GPU | C | ✓ | M2 |
-| `part.multi_sections_solid` |  | `0x0707` | Multi-sections solid (loft) through sections with guides and coupling. | loft, lofted boss | `sections:Ref[], guides:Ref[]?, coupling:Enum → feature:FeatureRef` | both | GPU | C | ✓ | M2 |
+| `part.multi_sections_solid` |  | `0x0707` | Multi-sections solid (loft) through sections with guides and coupling. | loft, lofted boss | `sections:Ref[], guides:Ref[]?, coupling:Enum, ruled:Bool? → feature:FeatureRef` | both | GPU | C | ✓ | M2 |
 | `part.removed_multi_sections_solid` |  | `0x0708` | Removed multi-sections solid. | lofted cut | `sections:Ref[], guides:Ref[]?, coupling:Enum → feature:FeatureRef` | both | GPU | C | ✓ | M2 |
 | `part.stiffener` |  | `0x0709` | Stiffener from an open profile (from side / from top). | rib (solidworks), web | `profile:Ref, thickness:Length, mode:Enum → feature:FeatureRef` | both | GPU | C | ✓ | M2 |
 | `part.solid_combine` |  | `0x070A` | Solid from the intersection of two extruded profiles. | — | `a:Ref, b:Ref → feature:FeatureRef` | both | GPU | C | ✓ | M2 |

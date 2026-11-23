@@ -68,7 +68,13 @@ pub fn describe(b: &Brep, params: &BTreeMap<String, f64>) -> Value {
         "valid": v.valid, "problems": v.problems.iter().take(5).collect::<Vec<_>>(),
         "shells": b.shells.len(), "faces": b.faces.len(), "edges": b.edges.len(), "vertices": b.vertices.len(),
         "bounding_box": { "min": v6(bb.min), "max": v6(bb.max), "size": v6(bb.extent()) },
-        "volume": r6(volume), "area": r6(area), "centroid": v6(centroid), "evidence": "bounded",
+        "volume": (b.kind == agcad_geo::brep::BodyKind::Solid).then(|| r6(volume)), "area": r6(area),
+        "centroid": if b.kind == agcad_geo::brep::BodyKind::Sheet {
+            (area > 0.).then(|| v6(m.triangles.iter().fold(V3::ZERO, |sum, t| {
+                let [p,q,r] = t.map(|i| m.positions[i as usize]);
+                sum + (p+q+r) * ((q-p).cross(r-p).norm() / (6.*area))
+            })))
+        } else { Some(v6(centroid)) }, "evidence": "bounded",
         "holes": holes, "cylindrical_walls": walls, "planar_faces": planes, "other_faces": other,
         "parameters": params,
     })

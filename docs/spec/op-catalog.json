@@ -3853,7 +3853,8 @@
    "aliases": [],
    "summary": "Resolve stable names (provenance paths or publications) at a revision.",
    "inputs": [
-    "names:String[]"
+    "names:String[]",
+    "scope:Ref?"
    ],
    "outputs": [
     "sel:Selection"
@@ -7527,7 +7528,8 @@
    "inputs": [
     "sections:Ref[]",
     "guides:Ref[]?",
-    "coupling:Enum"
+    "coupling:Enum",
+    "ruled:Bool?"
    ],
    "outputs": [
     "surf:SurfaceBody"
@@ -8538,7 +8540,8 @@
    "inputs": [
     "sections:Ref[]",
     "guides:Ref[]?",
-    "coupling:Enum"
+    "coupling:Enum",
+    "ruled:Bool?"
    ],
    "outputs": [
     "feature:FeatureRef"

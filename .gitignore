@@ -6,3 +6,5 @@
 # Demo build output and bundled binaries (not source)
 /docs/Demo/output/
 /docs/Demo/**/*.whl
+/artifacts/
+/datasets/

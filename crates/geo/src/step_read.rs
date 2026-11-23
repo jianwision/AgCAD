@@ -272,7 +272,7 @@ impl<'a> Ctx<'a> {
             "ELLIPSE" => { let a = e.args(); Ok(Curve::Ellipse { frame: self.ax2(a[1].r().ok_or("ellipse pos")?)?, a: self.len(&a[2]), b: self.len(&a[3]) }) }
             "B_SPLINE_CURVE_WITH_KNOTS" => {
                 let a = e.args();
-                Ok(Curve::Nurbs(self.bcurve(a[1].num().unwrap_or(1.0) as usize, a[2].list(), a[5].list(), a[6].list(), None)?))
+                Ok(Curve::Nurbs(self.bcurve(a[1].num().unwrap_or(1.0) as usize, a[2].list(), a[6].list(), a[7].list(), None)?))
             }
             "COMPLEX" if e.part("B_SPLINE_CURVE").is_some() => {
                 let bc = e.part("B_SPLINE_CURVE").unwrap();

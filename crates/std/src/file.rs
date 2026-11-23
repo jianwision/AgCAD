@@ -34,6 +34,7 @@ pub fn stl_binary(m: &Mesh, name: &str) -> Vec<u8> {
 fn mesh_from(ctx: &BuildContext<'_>, v: &agcad_ir::Value, res: f64) -> Result<Mesh, FeatureError> {
     match ctx.product(v)? {
         Product::Mesh(m) => Ok(m.clone()),
+        Product::Sheet(b) => Ok(agcad_geo::tessellate::tessellate(b, &TessOptions { sag: res, ..Default::default() })),
         Product::Solid(s) => Ok(ctx.kernel.tessellate(s, &TessOptions { sag: res, ..Default::default() })),
         Product::Implicit(i) => crate::mesh::implicit_to_mesh(i, res),
         other => Err(bad(format!("cannot export {other:?} as a mesh"))),
@@ -50,15 +51,30 @@ impl FeatureImpl for FileOp {
         let first = items.first().ok_or_else(|| bad("no items to export"))?;
         let fb = match self.0 {
             "file.export_step" => {
-                let s = solid(ctx, first)?;
-                let b = s.brep();
-                let m = ctx.kernel.tessellate(&s, &TessOptions { sag: 1e-3, ..Default::default() });
-                let (v, a, c) = m.mass_properties();
+                let (b, validation) = match ctx.product(first)? {
+                    Product::Sheet(sheet) => (sheet.clone(), None),
+                    Product::Solid(s) => {
+                        let body = s.brep();
+                        // Boundary-only triangulation cannot measure the interior of a curved patch.
+                        let warped = body.surfaces.iter().any(|surface| {
+                            let agcad_geo::surface::Surface::Nurbs(patch) = surface else { return false };
+                            if (patch.du, patch.dv, patch.nu, patch.nv) != (1, 1, 2, 2) { return true; }
+                            let p = &patch.poles;
+                            let normal = (p[1] - p[0]).cross(p[2] - p[0]).normalized();
+                            (p[3] - p[0]).dot(normal).abs() > agcad_geo::brep::DEFAULT_LINEAR_TOL
+                        });
+                        let validation = (!warped).then(|| ctx.kernel.tessellate(s, &TessOptions {
+                            sag: 1e-3, ..Default::default()
+                        }).mass_properties());
+                        (body, validation)
+                    }
+                    other => return Err(bad(format!("cannot export {other:?} to STEP"))),
+                };
                 let opt = StepOptions {
                     schema: if text(n, "schema") == Some("ap214") { Schema::Ap214 } else { Schema::Ap242 },
                     profile: match text(n, "profile") { Some("solidworks") => ReceiverProfile::SolidWorks, Some("catia") => ReceiverProfile::Catia, _ => ReceiverProfile::Generic },
                     product_name: ctx.part.name.clone(),
-                    validation: Some((v, a, c)),
+                    validation,
                     ..Default::default()
                 };
                 let (txt, rep) = write_step(&b, &opt);
@@ -173,6 +189,7 @@ impl FeatureImpl for ImportStep {
         let b = bodies.into_iter().next().ok_or_else(|| FeatureError::new(AgStatus::TopologyFailed, format!("no bodies in {path} ({} entities)", rep.entities)))?;
         let v = b.validate();
         if !v.valid { return Err(FeatureError::new(AgStatus::GeometryCheckFailed, format!("imported body invalid: {:?}", v.problems.iter().take(3).collect::<Vec<_>>())).suggest("run direct.heal_body")); }
+        if b.kind == agcad_geo::brep::BodyKind::Sheet { return Ok(Product::Sheet(b)); }
         Ok(Product::Solid(agcad_geo::kernel::Solid::Brep(b)))
     }
 }

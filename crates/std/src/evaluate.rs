@@ -49,12 +49,20 @@ impl FeatureImpl for EvalOp {
                 Ok(Product::Json(json!({ "volume": vol, "area": area, "mass": vol * density, "centroid": [c.x, c.y, c.z], "evidence": "bounded", "bound": "tessellation sag" })))
             }
             "evaluate.bounding_box" => {
-                let s = first_solid(ctx)?;
-                let b = s.brep().bbox();
+                let items = arg(n, "items").or(arg(n, "body")).or(arg(n, "item")).ok_or_else(|| bad("no body input"))?;
+                let item = list(items).first().ok_or_else(|| bad("empty items"))?;
+                let b = ctx.product(item)?.exact_body().ok_or_else(|| bad("bounding box requires a solid or sheet"))?.bbox();
                 let e = b.extent();
                 Ok(Product::Json(json!({ "min": [b.min.x, b.min.y, b.min.z], "max": [b.max.x, b.max.y, b.max.z], "extent": [e.x, e.y, e.z], "max_extent": e.x.max(e.y).max(e.z), "evidence": "bounded" })))
             }
             "evaluate.check" => {
+                if let Some(v) = arg(n, "items").or(arg(n, "body")).or(arg(n, "item")).and_then(|v| list(v).first()) {
+                    if let Product::Sheet(sheet) = ctx.product(v)? {
+                        let r = sheet.validate();
+                        return Ok(Product::Json(json!({ "valid": r.valid, "topology_valid": r.valid,
+                            "watertight": false, "euler": r.euler, "problems": r.problems, "evidence": "exact" })));
+                    }
+                }
                 let s = first_solid(ctx)?;
                 let r = ctx.kernel.check(&s);
                 let m = mesh_of(ctx, &s, 0.01);
@@ -160,7 +168,14 @@ impl FeatureImpl for QueryOp {
     fn op(&self) -> &'static str { self.0 }
     fn execute(&self, ctx: &mut BuildContext<'_>, n: &FeatureNode) -> Result<Product, FeatureError> {
         let scope = arg(n, "scope").or(arg(n, "feature")).or(arg(n, "sel")).ok_or_else(|| bad("query needs a scope"))?;
-        let s = solid(ctx, scope)?.brep();
+        if self.0 == "query.named" {
+            if let Some([agcad_ir::Value::String(name)]) = arg(n, "names").map(list) {
+                if name.starts_with("section.") || (name.starts_with("side.") && name.contains('/')) {
+                    return crate::surface_blend::boundary(ctx, scope, name);
+                }
+            }
+        }
+        let s = ctx.product(scope)?.exact_body().ok_or_else(|| bad("query requires a solid or sheet"))?;
         let names: Vec<String> = match self.0 {
             "query.parallel_to" => {
                 let d = vec3(ctx, req(n, "dir")?)?.normalized();

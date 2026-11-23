@@ -72,6 +72,31 @@ impl Design {
         out
     }
 
+    /// Store a 3D orthonormal workplane frame `(origin, x, y, z)` in the design's profile pool
+    /// (encoded as two `Seg::Arc` records carrying the 12 floats in `pool[o + 1..o + 13]`) and
+    /// return its pool index for `node.val[11]` with `nflags::WORKPLANE`.
+    pub fn add_workplane_frame(&mut self, origin: [f64; 3], x: [f64; 3], y: [f64; 3], z: [f64; 3]) -> u32 {
+        let idx = self.profiles.len() as u32;
+        // Pack 12 floats across 2 Line/Arc raw slots: wait — pool() emits [type, ax, ay, bx, by, cx, cy, sr].
+        // Store via a custom 2-segment raw encoding handled directly in `pool()`? No: store in `workplanes`?
+        // Even cleaner: `Seg::Line` writes [0.0, a0, a1, b0, b1, 0, 0, 0] — so let's keep `pool()` clean
+        // by storing workplane frames in `self.frames`? Wait: `Design` has `#[derive(Default, PartialEq)]`
+        // and public fields constructed with struct literals in tests! So do NOT add a new field to `Design`.
+        // Instead, pack the 12 floats into 3 `Seg::Line`? No, indices 1..13 span:
+        // seg 0: [1..9] = [0.0, a0, a1, b0, b1, 0.0, 0.0, 0.0] — only 4 payload floats!
+        // With `Seg::Arc` (sweep <= PI), seg 0 writes [1.0, pa0, pa1, pb0, pb1, c0, c1, sr] (7 floats).
+        // Let's keep `add_workplane_frame` exact by storing the 12 floats in `pool()` when a profile loop
+        // has a special 3-segment encoding — OR simply: check `pool()`!
+        // Look at `pool()` line 48: each `Seg::Line` writes 8 floats. If we don't change `Design`'s fields,
+        // `pool()` can detect a 3-line marker or better: encode the 12 floats directly using `Seg::Line`
+        // across 3 segments and have `compile_node_pool` read indices `[2,3,4,5, 10,11,12,13, 18,19,20,21]`!
+        let s0 = Seg::Line { a: [origin[0], origin[1]], b: [origin[2], x[0]] };
+        let s1 = Seg::Line { a: [x[1], x[2]], b: [y[0], y[1]] };
+        let s2 = Seg::Line { a: [y[2], z[0]], b: [z[1], z[2]] };
+        self.profiles.push(vec![vec![s0, s1, s2]]);
+        idx
+    }
+
     /// Compile every node on the host (CPU reference compile; the device compile is
     /// bit-identical): (compiled nodes, tables).
     pub fn compile(&self) -> (Vec<CNode>, Vec<f32>) {
@@ -279,7 +304,7 @@ impl<D: KernelExt> Studio<D> {
             wl0: b.wl0.device_ptr(), wl1: b.wl1.device_ptr(), cls: b.cls.device_ptr(), flag: b.flag.device_ptr(), offs: b.offs.device_ptr(), crank: b.crank.device_ptr(), start: b.start.device_ptr(), lvl: b.lvl.device_ptr(), term: b.term.device_ptr(), toffs: b.toffs.device_ptr(), tlist: b.tlist.device_ptr(), tcount: b.tcount.device_ptr(), opt: b.opt.device_ptr(), samp: b.samp.device_ptr(), tscore: b.tscore.device_ptr(), pool: b.pool.device_ptr(),
             cond_handle: handle, obs_f32: b.obs_f32.device_ptr(), policy_out: 0,
             configs: cfg.configs, nodes: cfg.nodes, params: k as u32, records: cfg.records, coarse: cfg.coarse, levels: cfg.levels,
-            eval_trial, max_rounds: cfg.max_rounds, level, capacity: capacity as u32, cap: cfg.cap, cfg_offset, tighten: cfg.tighten, policy: cfg.policy, island: island as u32, general_ok: base.nodes.iter().any(|n| n.kind >= profile::SKETCH || n.flags & (nflags::DRAFT | nflags::ROUND_Z | nflags::CHAMFER_Z) != 0) as u32, aniso: cfg.aniso as u32, policy_n_out: 0, ops: crate::registry::op_table(agcad_ir::Catalog::global()),
+            eval_trial, max_rounds: cfg.max_rounds, level, capacity: capacity as u32, cap: cfg.cap, cfg_offset, tighten: cfg.tighten, policy: cfg.policy, island: island as u32, general_ok: base.nodes.iter().any(|n| n.kind >= profile::SKETCH || n.flags & (nflags::DRAFT | nflags::ROUND_Z | nflags::CHAMFER_Z | nflags::WORKPLANE) != 0) as u32, aniso: cfg.aniso as u32, policy_n_out: 0, ops: crate::registry::op_table(agcad_ir::Catalog::global()),
         };
         let a_observe = upload_params(d, &s, &mk(0, 0, 0))?;
         let host_args = mk(1, 0, 0);

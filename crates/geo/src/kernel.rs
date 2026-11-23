@@ -73,10 +73,15 @@ impl ExactKernel for NativeKernel {
                     None => Err(KernelError { status: AgStatus::TopologyFailed, message: "could not rebase layered operand".into() }),
                 }
             }
-            _ => Err(KernelError {
-                status: AgStatus::TopologyFailed,
-                message: "general B-rep boolean (non-parallel extrusions, curved/free-form operands) requires GPU SSI marching + topology builders (pass P11)".into(),
-            }),
+            _ => {
+                // Phase 3: general 3D polyhedral boolean fallback (non-parallel planar B-reps)
+                let ba = a.brep();
+                let bb = b.brep();
+                match crate::gpu_exact::boolean_general_polyhedral(&ba, &bb, op) {
+                    Ok(brep) => Ok(Solid::Brep(brep)),
+                    Err(msg) => Err(KernelError { status: AgStatus::TopologyFailed, message: msg }),
+                }
+            }
         }
     }
 

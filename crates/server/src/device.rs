@@ -19,7 +19,9 @@ pub fn parse_goal(args: &Value, names: &[String], body_bbox: Option<([f64; 3], [
         "satisfy" => 0,
         "min_volume" => 1,
         "max_volume" => 2,
-        o => return Err(format!("objective: \"satisfy\" | \"min_volume\" | \"max_volume\" (got {o})")),
+        "explore" => 3,
+        "moead" | "pareto" => 4,
+        o => return Err(format!("objective: \"satisfy\" | \"min_volume\" | \"max_volume\" | \"explore\" | \"moead\" (got {o})")),
     };
     match args.get("target_volume").and_then(Value::as_array) {
         Some(tv) => {
@@ -136,6 +138,45 @@ pub fn freeze_fixed(g: &mut Goal, base: &[f64]) {
     for (k, v) in base.iter().enumerate().take(agcad_dops::abi::MAX_PARAMS) {
         if g.param_lo[k].is_nan() { g.param_lo[k] = *v; g.param_hi[k] = *v; g.param_sign[k] = 0.0; }
     }
+}
+
+/// Fast pre-rollout reachability & sensitivity diagnostic (`set_goal` v2 / Pillar C2):
+/// computes Reynolds-transport `∂V/∂p` at the base design and estimates the first-order
+/// reachable volume range over `[param_lo, param_hi]` so the LLM sees immediately if a goal
+/// is unreachable by continuous parameter edits alone.
+pub fn probe_reachability(design: &agcad_dops::Design, goal: &Goal) -> Value {
+    let grad = agcad_dops::grad::reynolds_shape_gradients(design, goal, 24);
+    let mut lo_est = grad.volume;
+    let mut hi_est = grad.volume;
+    let mut sens = serde_json::Map::new();
+    for (j, name) in design.names.iter().enumerate().take(agcad_dops::abi::MAX_PARAMS) {
+        let dv = grad.d_vol.get(j).copied().unwrap_or(0.0);
+        let p0 = design.params[j];
+        let (plo, phi) = (goal.param_lo[j], goal.param_hi[j]);
+        if phi > plo {
+            let d_lo = dv * (plo - p0);
+            let d_hi = dv * (phi - p0);
+            lo_est += d_lo.min(d_hi);
+            hi_est += d_lo.max(d_hi);
+        }
+        sens.insert(name.clone(), json!({
+            "d_vol_dp": (dv * 100.0).round() / 100.0,
+            "discontinuous": grad.discontinuous.get(j).copied().unwrap_or(false),
+        }));
+    }
+    lo_est = lo_est.max(0.0);
+    let target_reachable = if goal.vol_hi > goal.vol_lo {
+        hi_est >= goal.vol_lo * 0.9 && lo_est <= goal.vol_hi * 1.1
+    } else {
+        true
+    };
+    json!({
+        "base_volume_sampled": (grad.volume * 10.0).round() / 10.0,
+        "linear_reachable_volume": [(lo_est * 10.0).round() / 10.0, (hi_est * 10.0).round() / 10.0],
+        "target_likely_reachable": target_reachable,
+        "sensitivities": sens,
+        "recommendation": if target_reachable { "continuous parameters span target" } else { "target appears outside continuous parameter bounds; consider widening ranges or enabling structural moves (new_holes)" },
+    })
 }
 
 pub struct RolloutRun {

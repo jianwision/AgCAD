@@ -51,6 +51,9 @@ pub mod profile {
     /// part.shaft / part.groove: full revolution of a pool sketch in (ρ, z) about the vertical
     /// axis through (v0, v1); v15 = pool index.
     pub const REVOLVE: u32 = 8;
+    /// Analytical TPMS / implicit lattice bounded by box [v0..v5]:
+    /// v6 = period (mm), v7 = half wall thickness (mm), v8 = kind (0 = Gyroid, 1 = Schwarz-P, 2 = Diamond).
+    pub const IMPLICIT: u32 = 9;
 }
 
 /// Segments per pool profile and the pool stride (f32): [count, 8 floats per segment …].
@@ -94,8 +97,11 @@ pub mod nflags {
     /// User pattern (transform.user_pattern): v6 = pool index of a points entry (each segment's
     /// start = one instance translation; ≤ 64 instances).
     pub const PATTERN_USER: u32 = 256;
+    /// Arbitrary 3D local workplane frame: v11 = pool index of a 12-float orthonormal frame
+    /// `[ox, oy, oz, xx, xy, xz, yx, yy, yz, zx, zy, zz]` staged at `table[FRAME_OFF..TABLE]`.
+    pub const WORKPLANE: u32 = 512;
     /// Profile modifiers carried into the compiled node.
-    pub const MODS: u32 = FILLET | CHAMFER | DRAFT | ROUND_Z | CHAMFER_Z;
+    pub const MODS: u32 = FILLET | CHAMFER | DRAFT | ROUND_Z | CHAMFER_Z | WORKPLANE;
 }
 
 /// One feature of the specification tree on the device (208 B).
@@ -140,6 +146,8 @@ pub struct CNode {
 pub const TABLE: usize = 640;
 /// Offset of the polygon normals / sketch segments in a node's table.
 pub const POLY: usize = 256;
+/// Offset of the optional 3D workplane frame (12 f32: origin + x/y/z axes) at the tail of `TABLE`.
+pub const FRAME_OFF: usize = 628;
 
 /// Arg-arena payload of a feature-creating command record (192 B).
 #[repr(C)]
@@ -191,7 +199,9 @@ pub struct Goal {
     pub centroid_hi: [f64; 3],
     /// 0 = satisfy (done when met); 1 = minimize / 2 = maximize the volume estimate subject
     /// to every constraint (never done; runs all rounds); 3 = explore (never done, every
-    /// feasible design scores 0: keeps a spread population for trade-off sets).
+    /// feasible design scores 0: keeps a spread population for trade-off sets);
+    /// 4 = MOEA/D Pareto (per-island deterministic Tchebycheff scalarization over volume,
+    /// surface area, and bounding-box extent so one rollout populates a diverse Pareto front).
     pub objective: u32,
     pub _pad2: u32,
     /// Objective normalization (mm³; 0 → 1).

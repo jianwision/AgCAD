@@ -40,6 +40,7 @@ extern "C" __device__ __attribute__((cudart_builtin)) void cudaGraphSetCondition
 #define PROFILE_SKETCH 6u
 #define PROFILE_MIRROR 7u
 #define PROFILE_REVOLVE 8u
+#define PROFILE_IMPLICIT 9u
 #define MAX_SEGS 48u
 #define PSTRIDE (1u + 8u * MAX_SEGS)
 #define MAX_BODIES 4
@@ -55,8 +56,11 @@ extern "C" __device__ __attribute__((cudart_builtin)) void cudaGraphSetCondition
 #define NF_ROUND_Z 64u
 #define NF_CHAMFER_Z 128u
 #define NF_PATTERN_USER 256u
-#define NF_MODS (NF_FILLET | NF_CHAMFER | NF_DRAFT | NF_ROUND_Z | NF_CHAMFER_Z)
-#define NF_ZMODS (NF_DRAFT | NF_ROUND_Z | NF_CHAMFER_Z)
+#define NF_WORKPLANE 512u
+#define NF_MODS (NF_FILLET | NF_CHAMFER | NF_DRAFT | NF_ROUND_Z | NF_CHAMFER_Z | NF_WORKPLANE)
+#define NF_ZMODS (NF_DRAFT | NF_ROUND_Z | NF_CHAMFER_Z | NF_WORKPLANE)
+#define NF_ZCAPS (NF_DRAFT | NF_ROUND_Z | NF_CHAMFER_Z)
+#define FRAME_OFF 628
 #define PARAM_ADD 1u
 #define FAR 1.0e30
 #define TAU 6.283185307179586
@@ -288,10 +292,26 @@ __device__ CNode compile_node(const Node& n, const double* params, const float* 
         double idx = floor(v[15]);
         if (idx >= 0.0 && (u64)idx < (u64)npool) {
             const float* src = pool + (u64)idx * PSTRIDE;
-            u32 ns = (u32)src[0]; if (ns > MAX_SEGS) ns = MAX_SEGS;
+            u32 max_s = ((n.flags & NF_WORKPLANE) != 0u) ? 46u : MAX_SEGS;
+            u32 ns = (u32)src[0]; if (ns > max_s) ns = max_s;
             for (u32 j = 0; j < 8u * ns; ++j) table[POLY + j] = src[1 + j];
             c.sides = ns;
         }
+    }
+    if ((n.flags & NF_WORKPLANE) != 0u) {
+        double idx = floor(v[11]);
+        float fr[12] = { 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f };
+        if (idx >= 0.0 && (u64)idx < (u64)npool) {
+            const float* src = pool + (u64)idx * PSTRIDE;
+            for (int k = 0; k < 3; ++k) {
+                int s = 1 + 8 * k;
+                fr[4 * k + 0] = src[s + 1];
+                fr[4 * k + 1] = src[s + 2];
+                fr[4 * k + 2] = src[s + 3];
+                fr[4 * k + 3] = src[s + 4];
+            }
+        }
+        for (int j = 0; j < 12; ++j) table[FRAME_OFF + j] = fr[j];
     }
     return c;
 }
@@ -411,16 +431,48 @@ __device__ __noinline__ float revolve_sdf(const CNode& c, const float* table, fl
     return sketch2d(table, c.sides, sqrtf(dx * dx + dy * dy), z);
 }
 
+__device__ __noinline__ float implicit_sdf(const CNode& c, float x, float y, float z) {
+    const float* v = c.v;
+    float x0 = fminn(v[0], v[2]), y0 = fminn(v[1], v[3]), x1 = fmaxx(v[0], v[2]), y1 = fmaxx(v[1], v[3]);
+    float z0 = fminn(v[4], v[5]), z1 = fmaxx(v[4], v[5]);
+    if (!(x1 > x0 && y1 > y0 && z1 > z0)) return FAR32;
+    float period = v[6], half_t = v[7];
+    if (!(period > 0.0f && half_t > 0.0f)) return FAR32;
+    float qx = fmaxx(x0 - x, x - x1), qy = fmaxx(y0 - y, y - y1), qz = fmaxx(z0 - z, z - z1);
+    float a = fmaxx(qx, 0.0f), b = fmaxx(qy, 0.0f), cc = fmaxx(qz, 0.0f);
+    float dbox = sqrtf(a * a + b * b + cc * cc) + fminn(fmaxx(qx, fmaxx(qy, qz)), 0.0f);
+    double k = TAU / (double)period;
+    double sx, cx, sy, cy, sz, cz;
+    ag_sincos(k * (double)x, &sx, &cx);
+    ag_sincos(k * (double)y, &sy, &cy);
+    ag_sincos(k * (double)z, &sz, &cz);
+    int kind = (int)floorf(v[8]);
+    double phi, lip;
+    if (kind == 1) { phi = cx + cy + cz; lip = 1.7320508075688772 * k; }
+    else if (kind == 2) { phi = sx * sy * sz + sx * cy * cz + cx * sy * cz + cx * cy * sz; lip = 2.0 * k; }
+    else { phi = sx * cy + sy * cz + sz * cx; lip = 1.4142135623730951 * k; }
+    float dlat = (float)(fabs(phi) / lip) - half_t;
+    return fmaxx(dbox, dlat);
+}
+
 // new profile kinds and z modifiers: out of line (the classic rect / circle / polygon path
 // below is the original hot code)
 __device__ __noinline__ float prism_sdf_rare(const CNode& c, const float* table, float x, float y, float z) {
+    if ((c.mods & NF_WORKPLANE) != 0u) {
+        const float* fr = table + FRAME_OFF;
+        float dx = x - fr[0], dy = y - fr[1], dz = z - fr[2];
+        x = dx * fr[3] + dy * fr[4] + dz * fr[5];
+        y = dx * fr[6] + dy * fr[7] + dz * fr[8];
+        z = dx * fr[9] + dy * fr[10] + dz * fr[11];
+    }
+    if (c.kind == PROFILE_IMPLICIT) return implicit_sdf(c, x, y, z);
     if (c.kind == PROFILE_REVOLVE) return revolve_sdf(c, table, x, y, z);
     const float* v = c.v;
     float z0 = v[4], z1 = v[5];
     if (!(z1 > z0)) return FAR32;
     float d2 = profile_d2(c, table, x, y);
     if (d2 == FAR32) return FAR32;
-    return ((c.mods & NF_ZMODS) != 0u) ? zmod(c, d2, z) : extrude32(d2, z, z0, z1);
+    return ((c.mods & NF_ZCAPS) != 0u) ? zmod(c, d2, z) : extrude32(d2, z, z0, z1);
 }
 
 // classic rect / circle / polygon prisms (tapes without general features)
@@ -524,7 +576,7 @@ __device__ u32 scan_mirror(const CNode* nodes, u32 count) {
             if (nodes[i].v[0] > 0.5f) m |= 1u;
             if (nodes[i].v[1] > 0.5f) m |= 2u;
         }
-        if (nodes[i].kind == PROFILE_SKETCH || nodes[i].kind == PROFILE_REVOLVE || (nodes[i].mods & NF_ZMODS) != 0u) m |= 4u;
+        if (nodes[i].kind == PROFILE_SKETCH || nodes[i].kind == PROFILE_REVOLVE || nodes[i].kind == PROFILE_IMPLICIT || (nodes[i].mods & NF_ZMODS) != 0u) m |= 4u;
     }
     return m;
 }
@@ -1168,6 +1220,19 @@ __device__ __forceinline__ Iv center_iv(float f, float r) { return mkiv(f - r, f
 __device__ __noinline__ Iv prism_iv_rare(const CNode& c, const float* table, Iv x, Iv y, Iv z) {
     const float* v = c.v;
     Iv far = mkiv(FAR32, FAR32);
+    if ((c.mods & NF_WORKPLANE) != 0u) {
+        const float* fr = table + FRAME_OFF;
+        Iv dx = iv_sub_ic(x, fr[0]), dy = iv_sub_ic(y, fr[1]), dz = iv_sub_ic(z, fr[2]);
+        x = iv_add(iv_add(iv_scale(dx, fr[3]), iv_scale(dy, fr[4])), iv_scale(dz, fr[5]));
+        y = iv_add(iv_add(iv_scale(dx, fr[6]), iv_scale(dy, fr[7])), iv_scale(dz, fr[8]));
+        z = iv_add(iv_add(iv_scale(dx, fr[9]), iv_scale(dy, fr[10])), iv_scale(dz, fr[11]));
+    }
+    if (c.kind == PROFILE_IMPLICIT) {
+        float wx = iv_wid(x), wy = iv_wid(y), wz = iv_wid(z);
+        float f = implicit_sdf(c, iv_mid(x), iv_mid(y), iv_mid(z));
+        if (f == FAR32) return far;
+        return center_iv(f, 0.5f * sqrtf(wx * wx + wy * wy + wz * wz));
+    }
     if (c.kind == PROFILE_REVOLVE) {
         if (c.sides == 0u) return far;
         Iv rho = iv_sqrt(iv_add(iv_sq(iv_sub_ic(x, v[0])), iv_sq(iv_sub_ic(y, v[1]))));
@@ -1176,16 +1241,24 @@ __device__ __noinline__ Iv prism_iv_rare(const CNode& c, const float* table, Iv 
     }
     float z0 = v[4], z1 = v[5];
     if (!(z1 > z0)) return far;
-    if ((c.mods & NF_ZMODS) != 0u) {
+    if ((c.mods & NF_ZCAPS) != 0u) {
         float wx = iv_wid(x), wy = iv_wid(y), wz = iv_wid(z);
-        float f = prism_sdf_c(c, table, iv_mid(x), iv_mid(y), iv_mid(z));
-        if (f == FAR32) return far;
+        float d2 = profile_d2(c, table, iv_mid(x), iv_mid(y));
+        if (d2 == FAR32) return far;
+        float f = zmod(c, d2, iv_mid(z));
         return center_iv(f, 0.5f * sqrtf(wx * wx + wy * wy + wz * wz));
     }
-    if (c.sides == 0u) return far;
-    float wx = iv_wid(x), wy = iv_wid(y);
-    float d = sketch2d(table, c.sides, iv_mid(x) - v[0], iv_mid(y) - v[1]);
-    return extrude_iv(center_iv(d, 0.5f * sqrtf(wx * wx + wy * wy)), z, z0, z1);
+    if (c.kind == PROFILE_SKETCH) {
+        if (c.sides == 0u) return far;
+        float wx = iv_wid(x), wy = iv_wid(y);
+        float d = sketch2d(table, c.sides, iv_mid(x) - v[0], iv_mid(y) - v[1]);
+        return extrude_iv(center_iv(d, 0.5f * sqrtf(wx * wx + wy * wy)), z, z0, z1);
+    }
+    // Workplane-transformed rect/circle/polygon: evaluate local box via 1-Lipschitz centre bound
+    float wx = iv_wid(x), wy = iv_wid(y), wz = iv_wid(z);
+    float d2 = profile_d2(c, table, iv_mid(x), iv_mid(y));
+    if (d2 == FAR32) return far;
+    return center_iv(extrude32(d2, iv_mid(z), z0, z1), 0.5f * sqrtf(wx * wx + wy * wy + wz * wz));
 }
 
 __device__ __forceinline__ Iv prism_iv_plain(const CNode& c, const float* table, Iv x, Iv y, Iv z) {
@@ -2037,7 +2110,7 @@ __device__ void eng_write(const Eng& e, double* o) {
 }
 
 struct Judge { bool met; double err, sc; };
-__device__ Judge judge(const Goal& goal, bool empty, bool dom, double ve, const double* eh, const Eng& en) {
+__device__ Judge judge(const Goal& goal, bool empty, bool dom, double ve, const double* eh, const Eng& en, u32 island_id, u32 n_islands) {
     Judge j;
     bool has_iv = goal.vol_hi > goal.vol_lo;
     double t = 0.5 * (goal.vol_lo + goal.vol_hi);
@@ -2046,7 +2119,26 @@ __device__ Judge judge(const Goal& goal, bool empty, bool dom, double ve, const 
     j.met = !empty && !dom && in_iv && eh[0] <= goal.max_ext[0] && eh[1] <= goal.max_ext[1] && eh[2] <= goal.max_ext[2] && en.violation == 0.0 && en.centroid_ok;
     double pen = ((en.area > 0.0) ? en.violation / en.area : 0.0) + (en.centroid_ok ? 0.0 : 1.0);
     double scale = (goal.obj_scale > 0.0) ? goal.obj_scale : 1.0;
-    j.sc = !j.met ? 1000.0 + fabs(j.err) + pen : (goal.objective == 1u ? ve / scale : (goal.objective == 2u ? -(ve / scale) : (goal.objective == 3u ? 0.0 : fabs(j.err))));
+    if (!j.met) {
+        j.sc = 1000.0 + fabs(j.err) + pen;
+    } else if (goal.objective == 1u) {
+        j.sc = ve / scale;
+    } else if (goal.objective == 2u) {
+        j.sc = -(ve / scale);
+    } else if (goal.objective == 3u) {
+        j.sc = 0.0;
+    } else if (goal.objective == 4u) {
+        // MOEA/D per-island Tchebycheff scalarization over (volume, surface_area, max_extent)
+        double u = ((double)island_id + 0.5) / (double)(n_islands > 0u ? n_islands : 1u);
+        double w_vol = 1.0 - 0.8 * u;
+        double w_area = 0.8 * u;
+        double area_scale = pow(scale, 2.0 / 3.0);
+        double nv = ve / scale;
+        double na = en.area / (area_scale > 1.0 ? area_scale : 1.0);
+        j.sc = dmax(w_vol * nv, w_area * na);
+    } else {
+        j.sc = fabs(j.err);
+    }
     return j;
 }
 
@@ -2079,7 +2171,10 @@ AG_KERNEL void ag_dop_decide(const DopsArgs* a) {
     bool hard = el[0] > goal.max_ext[0] || el[1] > goal.max_ext[1] || el[2] > goal.max_ext[2];
     double* obs = ag_ptr<double>(a->obs) + (u64)c * OBS;
     u32* cur_c = ag_ptr<u32>(a->cur_count);
-    Judge jd = judge(goal, empty, dom != 0u, ve, eh, en);
+    u32 isl_sz = (a->island < 2u) ? 2u : (a->island > MAX_ISLAND ? MAX_ISLAND : a->island);
+    u32 gcfg = a->cfg_offset + c;
+    u32 n_islands = (a->configs + isl_sz - 1u) / isl_sz;
+    Judge jd = judge(goal, empty, dom != 0u, ve, eh, en, gcfg / isl_sz, n_islands);
     double* score = ag_ptr<double>(a->score);
     bool write = (a->eval_trial == 0u);
     if (a->eval_trial != 0u) {

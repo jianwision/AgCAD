@@ -17,6 +17,7 @@
 pub mod brep;
 pub mod builders;
 pub mod curve;
+pub mod gpu_exact;
 pub mod intersect;
 pub mod kernel;
 pub mod layered;
@@ -25,6 +26,7 @@ pub mod nurbs;
 pub mod predicates;
 pub mod region2d;
 pub mod ssi;
+pub mod step_gpu;
 pub mod step_read;
 pub mod step_write;
 pub mod surface;

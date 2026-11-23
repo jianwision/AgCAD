@@ -350,6 +350,304 @@ pub fn stiffness<D: KernelExt>(dev: Arc<D>, design: &Design, lc: &LoadCase) -> D
     Ok(FeaReport { compliance: sv[sc::COMPLIANCE], max_disp: f64::from_bits(st[1]), iterations: sv[sc::ITER] as u32, converged: sv[sc::CONVERGED] != 0.0, voxels: st[2], dofs: st[3], levels: nlev as u32 })
 }
 
+/// Per-element von Mises stress proxy and self-adjoint compliance sensitivity (`∂C/∂ρ_e = -u_eᵀ K_e u_e`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct StressReport {
+    /// Maximum centroidal von Mises stress across solid elements (MPa).
+    pub max_von_mises: f64,
+    /// 99th-percentile von Mises stress (MPa; robust against re-entrant corner singularities).
+    pub p99_von_mises: f64,
+    /// Mean von Mises stress across solid elements (MPa).
+    pub mean_von_mises: f64,
+    /// World `(x, y, z)` centre of the highest-stress voxel (mm), for LLM spatial diagnostics.
+    pub worst_point: [f64; 3],
+    /// Centroidal von Mises stress per voxel (`0.0` for void voxels; length = `dims[0]*dims[1]*dims[2]`).
+    pub element_stress: Vec<f64>,
+    /// Exact self-adjoint compliance sensitivity `∂C/∂ρ_e = -u_eᵀ K_e u_e` per voxel (`<= 0`).
+    pub element_sensitivity: Vec<f64>,
+}
+
+/// Aggregated multi-load-case FEA result (worst-case compliance + worst-case von Mises stress).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultiLoadReport {
+    pub worst_compliance: f64,
+    pub max_von_mises: f64,
+    pub all_converged: bool,
+    pub per_case: Vec<(FeaReport, StressReport)>,
+}
+
+/// Solve stiffness AND extract centroidal von Mises stress + exact self-adjoint compliance
+/// sensitivity `∂C/∂ρ_e = -u_eᵀ K_e u_e` on `dev`.
+pub fn stiffness_with_stress<D: KernelExt>(dev: Arc<D>, design: &Design, lc: &LoadCase) -> DriverResult<(FeaReport, StressReport)> {
+    let d = &*dev;
+    let s = d.stream(Priority::Low)?;
+    let lib = d.load_library(&dops_library())?;
+    let nv = lc.dims.iter().map(|&n| n as usize).product::<usize>();
+    let nn = lc.dims.iter().map(|&n| n as usize + 1).product::<usize>();
+    let nd = 3 * nn;
+    if nv > 4_000_000 { return Err(EnqueueError::InvalidConfig(format!("FEA grid {:?} too large", lc.dims)).into()); }
+    let precond = match lc.precond { Precond::Auto => if nd >= MG_AUTO_DOFS { Precond::Multigrid } else { Precond::Jacobi }, p => p };
+    let (cn, tabs) = design.compile();
+    let ke_host = hex8_stiffness(lc.e, lc.nu, lc.h);
+    let up = |bytes: &[u8]| -> DriverResult<D::Buffer> { let b = d.alloc_bytes(&s, bytes.len().max(16))?; d.upload_from_host_async(&s, bytes, &b, 0)?; Ok(b) };
+    let zeros = |bytes: usize| -> DriverResult<D::Buffer> { let b = d.alloc_bytes(&s, bytes.max(16))?; d.memset_async(&s, &b, 0, bytes.max(16), 0)?; Ok(b) };
+    let tape = up(bytemuck::cast_slice(&cn))?;
+    let tables = up(bytemuck::cast_slice(&tabs))?;
+    let ke = up(bytemuck::cast_slice(&ke_host))?;
+    let solid = zeros(nv * 4)?;
+    let nflag = zeros(nn * 4)?;
+    let vecs: Vec<D::Buffer> = (0..7).map(|_| zeros(nd * 8)).collect::<DriverResult<_>>()?;
+    let part = zeros(2 * DOT_BLOCKS * 8)?;
+    let scal = zeros(sc::N * 8)?;
+    let stat = zeros(8 * 8)?;
+    let [x, r, z, p, ap, b, diag] = [0, 1, 2, 3, 4, 5, 6].map(|i| vecs[i].device_ptr());
+    let fa = FeaArgs {
+        tape: tape.device_ptr(), tables: tables.device_ptr(), solid: solid.device_ptr(), nflag: nflag.device_ptr(), ke: ke.device_ptr(),
+        x, r, z, p, ap, b, diag, scal: scal.device_ptr(), stat: stat.device_ptr(),
+        lo: lc.lo, h: lc.h, force: lc.force, tol: lc.tol, count: design.nodes.len() as u32, dims: lc.dims, axis: lc.support_axis,
+        precond: (precond == Precond::Multigrid) as u32, _pad: [0; 2],
+    };
+    let a = upload_params(d, &s, &fa)?;
+    let mut dims_l = vec![lc.dims];
+    if precond == Precond::Multigrid {
+        while dims_l.len() < MG_MAX_LEVELS {
+            let dl = *dims_l.last().unwrap();
+            if dl.iter().all(|&n| n <= 2) || dl.iter().map(|&n| n as usize + 1).product::<usize>() <= 64 { break; }
+            dims_l.push(dl.map(|n| n.div_ceil(2)));
+        }
+    }
+    let nlev = dims_l.len();
+    let mut mg_bufs: Vec<D::Buffer> = Vec::new();
+    let mut lv: Vec<MgArgs> = Vec::new();
+    if precond == Precond::Multigrid {
+        for (l, dl) in dims_l.iter().enumerate() {
+            let (ne, nnl) = (dl.iter().map(|&n| n as usize).product::<usize>(), dl.iter().map(|&n| n as usize + 1).product::<usize>());
+            let mut buf = |bytes: usize| -> DriverResult<u64> { let b = zeros(bytes)?; let ptr = b.device_ptr(); mg_bufs.push(b); Ok(ptr) };
+            let w = buf(ne * 8)?;
+            let nf = if l == 0 { nflag.device_ptr() } else { buf(nnl * 4)? };
+            let dg = buf(nnl * 24)?;
+            let (xx, rr) = if l == 0 { (z, r) } else { (buf(nnl * 24)?, buf(nnl * 24)?) };
+            let t = buf(nnl * 24)?;
+            lv.push(MgArgs { w, nflag: nf, diag: dg, x: xx, r: rr, t, cw: 0, cnflag: 0, cx: 0, cr: 0, solid: solid.device_ptr(), ke: ke.device_ptr(), scal: scal.device_ptr(), _pad0: 0,
+                scale: (1u64 << l) as f64, omega: MG_OMEGA, dims: *dl, cdims: [0; 3], mode: 0, _pad1: 0 });
+        }
+        for l in 0..nlev - 1 { let c = lv[l + 1]; let m = &mut lv[l]; m.cw = c.w; m.cnflag = c.nflag; m.cx = c.x; m.cr = c.r; m.cdims = c.dims; }
+    }
+    let up_mg = |m: &MgArgs, mode: u32| upload_params(d, &s, &MgArgs { mode, ..*m });
+    let mg0: Vec<_> = lv.iter().map(|m| up_mg(m, 0)).collect::<DriverResult<_>>()?;
+    let mg1: Vec<_> = lv.iter().map(|m| up_mg(m, 1)).collect::<DriverResult<_>>()?;
+    let dot = |a0: u64, b0: u64, a1: u64, b1: u64, slot0: usize, slot1: usize, ndots: u32, always: u32| upload_params(d, &s, &DotArgs { a0, b0, a1, b1, part: part.device_ptr(), scal: scal.device_ptr(), n: nd as u64, slot0: slot0 as u32, slot1: slot1 as u32, ndots, always });
+    let d_init_rz = dot(r, z, r, r, sc::RZ, sc::RR, 2, 1)?;
+    let d_init_bb = dot(b, b, b, b, sc::BB, sc::BB, 1, 1)?;
+    let d_pap = dot(p, ap, p, ap, sc::PAP, sc::PAP, 1, 0)?;
+    let d_rz = dot(r, z, r, r, sc::RZN, sc::RR, 2, 0)?;
+    let d_c = dot(x, b, x, b, sc::COMPLIANCE, sc::COMPLIANCE, 1, 1)?;
+    let lin = |n: usize| LaunchConfig::linear((n as u64).min(4096 * 256), 256);
+    let (pdot, fdot, one) = (LaunchConfig::linear((DOT_BLOCKS * DOT_T) as u64, DOT_T as u32), LaunchConfig::linear(DOT_T as u64, DOT_T as u32), LaunchConfig::linear(1, 32));
+    let run_dot = |da: &agcad_kernels::params::ParamUpload<D>| -> DriverResult<()> {
+        d.launch(&s, lib, "ag_fea_dot_part", &pdot, &da.buffer)?;
+        d.launch(&s, lib, "ag_fea_dot_final", &fdot, &da.buffer)?;
+        Ok(())
+    };
+    d.launch(&s, lib, "ag_fea_voxelize", &lin(nv), &a.buffer)?;
+    d.launch(&s, lib, "ag_fea_nodes", &lin(nn), &a.buffer)?;
+    d.launch(&s, lib, "ag_fea_flags", &lin(nn), &a.buffer)?;
+    let ndl = |l: usize| 3 * dims_l[l].iter().map(|&n| n as usize + 1).product::<usize>();
+    let nel = |l: usize| dims_l[l].iter().map(|&n| n as usize).product::<usize>();
+    if !lv.is_empty() {
+        d.launch(&s, lib, "ag_mg_weights0", &lin(nel(0)), &mg0[0].buffer)?;
+        for l in 0..nlev - 1 {
+            d.launch(&s, lib, "ag_mg_coarsen", &lin(nel(l + 1)), &mg0[l].buffer)?;
+            d.launch(&s, lib, "ag_mg_nodes", &lin(ndl(l + 1) / 3), &mg0[l].buffer)?;
+        }
+        for l in 0..nlev { d.launch(&s, lib, "ag_mg_diag", &lin(ndl(l)), &mg0[l].buffer)?; }
+    }
+    let vcycle = || -> DriverResult<()> {
+        let smooth = |l: usize, n: u32, first: bool| -> DriverResult<()> {
+            for k in 0..n {
+                if first && k == 0 { d.launch(&s, lib, "ag_mg_smooth", &lin(ndl(l)), &mg0[l].buffer)?; continue; }
+                d.launch(&s, lib, "ag_mg_matvec", &lin(ndl(l)), &mg1[l].buffer)?;
+                d.launch(&s, lib, "ag_mg_smooth", &lin(ndl(l)), &mg1[l].buffer)?;
+            }
+            Ok(())
+        };
+        for l in 0..nlev - 1 {
+            smooth(l, MG_PRE, true)?;
+            d.launch(&s, lib, "ag_mg_matvec", &lin(ndl(l)), &mg1[l].buffer)?;
+            d.launch(&s, lib, "ag_mg_resid", &lin(ndl(l)), &mg1[l].buffer)?;
+            d.launch(&s, lib, "ag_mg_restrict", &lin(ndl(l + 1)), &mg1[l].buffer)?;
+        }
+        smooth(nlev - 1, MG_COARSE_SWEEPS, true)?;
+        for l in (0..nlev - 1).rev() {
+            d.launch(&s, lib, "ag_mg_prolong", &lin(ndl(l)), &mg1[l].buffer)?;
+            smooth(l, MG_POST, false)?;
+        }
+        Ok(())
+    };
+    d.launch(&s, lib, "ag_fea_init", &lin(nd), &a.buffer)?;
+    if !lv.is_empty() { vcycle()?; d.launch(&s, lib, "ag_fea_setp", &lin(nd), &a.buffer)?; }
+    run_dot(&d_init_rz)?;
+    run_dot(&d_init_bb)?;
+    d.launch(&s, lib, "ag_fea_start", &one, &a.buffer)?;
+    let mut it = 0u32;
+    while it < lc.max_iter {
+        let chunk = 32.min(lc.max_iter - it);
+        for _ in 0..chunk {
+            d.launch(&s, lib, "ag_fea_check", &one, &a.buffer)?;
+            d.launch(&s, lib, "ag_fea_matvec", &lin(nd), &a.buffer)?;
+            run_dot(&d_pap)?;
+            d.launch(&s, lib, "ag_fea_update1", &lin(nd), &a.buffer)?;
+            if !lv.is_empty() { vcycle()?; }
+            run_dot(&d_rz)?;
+            d.launch(&s, lib, "ag_fea_update2", &lin(nd), &a.buffer)?;
+            d.launch(&s, lib, "ag_fea_step", &one, &a.buffer)?;
+        }
+        it += chunk;
+        let mut pin = d.pinned(8)?;
+        d.download_packed_async(&s, &[Region { buf: &scal, offset: sc::DONE * 8, bytes: 8 }], &mut pin)?;
+        d.sync(&s)?;
+        if bytemuck::pod_read_unaligned::<f64>(&pin.as_bytes()[..8]) != 0.0 { break; }
+    }
+    d.launch(&s, lib, "ag_fea_finish", &one, &a.buffer)?;
+    run_dot(&d_c)?;
+    d.launch(&s, lib, "ag_fea_maxdisp", &lin(nn), &a.buffer)?;
+    let total_dl = sc::N * 8 + 64 + nv * 4 + nd * 8;
+    let mut pin = d.pinned(total_dl)?;
+    d.download_packed_async(
+        &s,
+        &[
+            Region { buf: &scal, offset: 0, bytes: sc::N * 8 },
+            Region { buf: &stat, offset: 0, bytes: 64 },
+            Region { buf: &solid, offset: 0, bytes: nv * 4 },
+            Region { buf: &vecs[0], offset: 0, bytes: nd * 8 },
+        ],
+        &mut pin,
+    )?;
+    d.sync(&s)?;
+    let raw = pin.as_bytes();
+    let sv: Vec<f64> = bytemuck::pod_collect_to_vec(&raw[..sc::N * 8]);
+    let st: Vec<u64> = bytemuck::pod_collect_to_vec(&raw[sc::N * 8..sc::N * 8 + 64]);
+    let sol: Vec<u32> = bytemuck::pod_collect_to_vec(&raw[sc::N * 8 + 64..sc::N * 8 + 64 + nv * 4]);
+    let u_vec: Vec<f64> = bytemuck::pod_collect_to_vec(&raw[sc::N * 8 + 64 + nv * 4..total_dl]);
+
+    let fea_rep = FeaReport {
+        compliance: sv[sc::COMPLIANCE],
+        max_disp: f64::from_bits(st[1]),
+        iterations: sv[sc::ITER] as u32,
+        converged: sv[sc::CONVERGED] != 0.0,
+        voxels: st[2],
+        dofs: st[3],
+        levels: nlev as u32,
+    };
+
+    // Centroidal strain-displacement matrix B(0,0,0) for Q8 hex of edge h
+    let corners = [[-1.0, -1.0, -1.0], [1.0, -1.0, -1.0], [1.0, 1.0, -1.0], [-1.0, 1.0, -1.0], [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, 1.0], [-1.0, 1.0, 1.0]];
+    let mut b0 = [[0.0f64; 24]; 6];
+    for (a_i, c) in corners.iter().enumerate() {
+        let (dx, dy, dz) = (0.25 * c[0] / lc.h, 0.25 * c[1] / lc.h, 0.25 * c[2] / lc.h);
+        b0[0][3 * a_i] = dx; b0[1][3 * a_i + 1] = dy; b0[2][3 * a_i + 2] = dz;
+        b0[3][3 * a_i] = dy; b0[3][3 * a_i + 1] = dx;
+        b0[4][3 * a_i + 1] = dz; b0[4][3 * a_i + 2] = dy;
+        b0[5][3 * a_i] = dz; b0[5][3 * a_i + 2] = dx;
+    }
+    let lam = lc.e * lc.nu / ((1.0 + lc.nu) * (1.0 - 2.0 * lc.nu));
+    let mu = lc.e / (2.0 * (1.0 + lc.nu));
+    let dmat = [
+        [lam + 2.0 * mu, lam, lam, 0.0, 0.0, 0.0],
+        [lam, lam + 2.0 * mu, lam, 0.0, 0.0, 0.0],
+        [lam, lam, lam + 2.0 * mu, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, mu, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, mu, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, mu],
+    ];
+    let dims = [lc.dims[0] as usize, lc.dims[1] as usize, lc.dims[2] as usize];
+    let (nx, ny) = (dims[0] + 1, dims[1] + 1);
+    let mut element_stress = vec![0.0f64; nv];
+    let mut element_sensitivity = vec![0.0f64; nv];
+    let mut solid_stresses = Vec::new();
+    let mut max_vm = 0.0f64;
+    let mut worst_point = lc.lo;
+    for k in 0..dims[2] {
+        for j in 0..dims[1] {
+            for i in 0..dims[0] {
+                let vid = (k * dims[1] + j) * dims[0] + i;
+                if sol[vid] == 0 { continue; }
+                let mut ue = [0.0f64; 24];
+                for (q, cc) in CORNER.iter().enumerate() {
+                    let nid = ((k + cc[2]) * ny + (j + cc[1])) * nx + (i + cc[0]);
+                    ue[3 * q] = u_vec[3 * nid];
+                    ue[3 * q + 1] = u_vec[3 * nid + 1];
+                    ue[3 * q + 2] = u_vec[3 * nid + 2];
+                }
+                // Strain ε = B0 u_e, stress σ = D ε
+                let mut eps = [0.0f64; 6];
+                for row in 0..6 {
+                    let mut acc = 0.0;
+                    for col in 0..24 { acc += b0[row][col] * ue[col]; }
+                    eps[row] = acc;
+                }
+                let mut sig = [0.0f64; 6];
+                for row in 0..6 {
+                    let mut acc = 0.0;
+                    for col in 0..6 { acc += dmat[row][col] * eps[col]; }
+                    sig[row] = acc;
+                }
+                let s01 = sig[0] - sig[1];
+                let s12 = sig[1] - sig[2];
+                let s20 = sig[2] - sig[0];
+                let vm = (0.5 * (s01 * s01 + s12 * s12 + s20 * s20) + 3.0 * (sig[3] * sig[3] + sig[4] * sig[4] + sig[5] * sig[5])).max(0.0).sqrt();
+                element_stress[vid] = vm;
+                solid_stresses.push(vm);
+                if vm > max_vm {
+                    max_vm = vm;
+                    worst_point = [lc.lo[0] + (i as f64 + 0.5) * lc.h, lc.lo[1] + (j as f64 + 0.5) * lc.h, lc.lo[2] + (k as f64 + 0.5) * lc.h];
+                }
+                // Exact self-adjoint compliance sensitivity: ∂C/∂ρ_e = -u_eᵀ K_e u_e
+                let mut uku = 0.0f64;
+                for row in 0..24 {
+                    let mut ku = 0.0;
+                    for col in 0..24 { ku += ke_host[row * 24 + col] * ue[col]; }
+                    uku += ue[row] * ku;
+                }
+                element_sensitivity[vid] = -uku;
+            }
+        }
+    }
+    let mean_von_mises = if solid_stresses.is_empty() { 0.0 } else { solid_stresses.iter().sum::<f64>() / solid_stresses.len() as f64 };
+    solid_stresses.sort_by(|a, b| a.total_cmp(b));
+    let p99_von_mises = if solid_stresses.is_empty() {
+        0.0
+    } else {
+        solid_stresses[((solid_stresses.len() - 1) * 99) / 100]
+    };
+    let stress_rep = StressReport {
+        max_von_mises: max_vm,
+        p99_von_mises,
+        mean_von_mises,
+        worst_point,
+        element_stress,
+        element_sensitivity,
+    };
+    Ok((fea_rep, stress_rep))
+}
+
+/// Evaluate multiple FEA load cases on `design`, returning worst-case compliance, max von Mises
+/// stress, and per-case reports.
+pub fn stiffness_multi_load<D: KernelExt>(dev: Arc<D>, design: &Design, cases: &[LoadCase]) -> DriverResult<MultiLoadReport> {
+    let mut per_case = Vec::with_capacity(cases.len());
+    let mut worst_compliance = 0.0f64;
+    let mut max_von_mises = 0.0f64;
+    let mut all_converged = true;
+    for lc in cases {
+        let (f, st) = stiffness_with_stress(dev.clone(), design, lc)?;
+        worst_compliance = worst_compliance.max(f.compliance);
+        max_von_mises = max_von_mises.max(st.max_von_mises);
+        all_converged &= f.converged;
+        per_case.push((f, st));
+    }
+    Ok(MultiLoadReport { worst_compliance, max_von_mises, all_converged, per_case })
+}
+
 // ------------------------------------------------------------------------------------
 // CPU reference kernels (twins of the ag_fea_* kernels in cu/dops.cu)
 // ------------------------------------------------------------------------------------

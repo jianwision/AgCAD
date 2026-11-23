@@ -202,10 +202,27 @@ pub fn compile_node_pool(n: &Node, params: &[f64], pool: &[f32], table: &mut [f3
         let idx = v[15].floor();
         if idx >= 0.0 && ((idx as usize) + 1) * PSTRIDE <= pool.len() {
             let o = idx as usize * PSTRIDE;
-            let ns = (pool[o] as usize).min(MAX_SEGS);
+            let max_s = if n.flags & nflags::WORKPLANE != 0 { 46 } else { MAX_SEGS };
+            let ns = (pool[o] as usize).min(max_s);
             table[POLY..POLY + 8 * ns].copy_from_slice(&pool[o + 1..o + 1 + 8 * ns]);
             c.sides = ns as u32;
         }
+    }
+    if n.flags & nflags::WORKPLANE != 0 {
+        let idx = v[11].floor();
+        // Default identity frame; 12 floats encoded in 3 Seg::Line payloads in the pool
+        let mut fr = [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        if idx >= 0.0 && ((idx as usize) + 1) * PSTRIDE <= pool.len() {
+            let o = idx as usize * PSTRIDE;
+            for k in 0..3 {
+                let s = o + 1 + 8 * k;
+                fr[4 * k] = pool[s + 1];
+                fr[4 * k + 1] = pool[s + 2];
+                fr[4 * k + 2] = pool[s + 3];
+                fr[4 * k + 3] = pool[s + 4];
+            }
+        }
+        table[FRAME_OFF..FRAME_OFF + 12].copy_from_slice(&fr);
     }
     c
 }
@@ -317,7 +334,63 @@ fn zmod(c: &CNode, d2: f32, z: f32) -> f32 {
     extrude32(d, z, z0, z1)
 }
 
-const ZMODS: u32 = nflags::DRAFT | nflags::ROUND_Z | nflags::CHAMFER_Z;
+const ZMODS: u32 = nflags::DRAFT | nflags::ROUND_Z | nflags::CHAMFER_Z | nflags::WORKPLANE;
+
+/// Transform world point (x, y, z) into the node's local orthonormal workplane frame.
+#[inline]
+fn to_workplane_pt(table: &[f32], x: f32, y: f32, z: f32) -> (f32, f32, f32) {
+    let f = &table[FRAME_OFF..FRAME_OFF + 12];
+    let (dx, dy, dz) = (x - f[0], y - f[1], z - f[2]);
+    (
+        dx * f[3] + dy * f[4] + dz * f[5],
+        dx * f[6] + dy * f[7] + dz * f[8],
+        dx * f[9] + dy * f[10] + dz * f[11],
+    )
+}
+
+/// Transform world interval box into the node's local orthonormal workplane frame.
+#[inline]
+fn to_workplane_iv(table: &[f32], x: Iv, y: Iv, z: Iv) -> (Iv, Iv, Iv) {
+    let f = &table[FRAME_OFF..FRAME_OFF + 12];
+    let (dx, dy, dz) = (sub_ic(x, f[0]), sub_ic(y, f[1]), sub_ic(z, f[2]));
+    let lx = add(add(scale(dx, f[3]), scale(dy, f[4])), scale(dz, f[5]));
+    let ly = add(add(scale(dx, f[6]), scale(dy, f[7])), scale(dz, f[8]));
+    let lz = add(add(scale(dx, f[9]), scale(dy, f[10])), scale(dz, f[11]));
+    (lx, ly, lz)
+}
+
+/// Analytical TPMS implicit lattice SDF (Gyroid / Schwarz-P / Diamond) bounded by [v0..v5],
+/// normalized by its exact Lipschitz upper bound so `|f| ≤ distance to surface`.
+fn implicit_sdf(c: &CNode, x: f32, y: f32, z: f32) -> f32 {
+    let v = &c.v;
+    let (x0, y0, x1, y1, z0, z1) = (v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3]), v[4].min(v[5]), v[4].max(v[5]));
+    if !(x1 > x0 && y1 > y0 && z1 > z0) { return FAR32; }
+    let period = v[6];
+    let half_t = v[7];
+    if !(period > 0.0 && half_t > 0.0) { return FAR32; }
+    let qx = (x0 - x).max(x - x1);
+    let qy = (y0 - y).max(y - y1);
+    let qz = (z0 - z).max(z - z1);
+    let (a, b, cc) = (qx.max(0.0), qy.max(0.0), qz.max(0.0));
+    let dbox = (a * a + b * b + cc * cc).sqrt() + qx.max(qy.max(qz)).min(0.0);
+    let k = core::f64::consts::TAU / period as f64;
+    let (sx, cx) = sincos(k * x as f64);
+    let (sy, cy) = sincos(k * y as f64);
+    let (sz, cz) = sincos(k * z as f64);
+    let kind = v[8].floor() as i32;
+    let (phi, lip) = if kind == 1 {
+        // Schwarz-P: cos(kx) + cos(ky) + cos(kz), |∇φ| ≤ √3 · k
+        (cx + cy + cz, 1.7320508075688772 * k)
+    } else if kind == 2 {
+        // Diamond: sin x sin y sin z + sin x cos y cos z + cos x sin y cos z + cos x cos y sin z, |∇φ| ≤ 2 · k
+        (sx * sy * sz + sx * cy * cz + cx * sy * cz + cx * cy * sz, 2.0 * k)
+    } else {
+        // Gyroid: sin x cos y + sin y cos z + sin z cos x, |∇φ| ≤ √2 · k
+        (sx * cy + sy * cz + sz * cx, 1.4142135623730951 * k)
+    };
+    let dlat = ((phi.abs() / lip) as f32) - half_t;
+    dbox.max(dlat)
+}
 
 /// Full revolution of a pool sketch in (ρ, z) about the vertical axis through (v0, v1).
 fn revolve_sdf(c: &CNode, table: &[f32], x: f32, y: f32, z: f32) -> f32 {
@@ -338,13 +411,14 @@ fn extrude32(d2: f32, z: f32, z0: f32, z1: f32) -> f32 {
     (a * a + b * b).sqrt() + d2.max(dz).min(0.0)
 }
 
-/// Distance bound of a compiled prism (f32; twin of `prism_sdf_c` in cu/dops.cu).
-pub fn prism_sdf_c(c: &CNode, table: &[f32], x: f32, y: f32, z: f32) -> f32 {
+/// Distance bound of a compiled prism in its own local frame (before optional WORKPLANE).
+fn prism_sdf_local(c: &CNode, table: &[f32], x: f32, y: f32, z: f32) -> f32 {
+    if c.kind == profile::IMPLICIT { return implicit_sdf(c, x, y, z); }
     if c.kind == profile::REVOLVE { return revolve_sdf(c, table, x, y, z); }
     let v = &c.v;
     let (z0, z1) = (v[4], v[5]);
     if !(z1 > z0) { return FAR32; }
-    if c.mods & ZMODS != 0 {
+    if c.mods & (nflags::DRAFT | nflags::ROUND_Z | nflags::CHAMFER_Z) != 0 {
         let d2 = profile_d2(c, table, x, y);
         return if d2 == FAR32 { FAR32 } else { zmod(c, d2, z) };
     }
@@ -362,6 +436,15 @@ pub fn prism_sdf_c(c: &CNode, table: &[f32], x: f32, y: f32, z: f32) -> f32 {
     let d2 = profile_d2(c, table, x, y);
     if d2 == FAR32 { return FAR32; }
     extrude32(d2, z, z0, z1)
+}
+
+/// Distance bound of a compiled prism (f32; twin of `prism_sdf_c` in cu/dops.cu).
+pub fn prism_sdf_c(c: &CNode, table: &[f32], x: f32, y: f32, z: f32) -> f32 {
+    if c.mods & nflags::WORKPLANE != 0 {
+        let (lx, ly, lz) = to_workplane_pt(table, x, y, z);
+        return prism_sdf_local(c, table, lx, ly, lz);
+    }
+    prism_sdf_local(c, table, x, y, z)
 }
 
 /// Signed-distance bound of a compiled tape (f32).
@@ -487,9 +570,19 @@ fn center_iv(f: f32, r: f32) -> Iv { iv(f - r, f + r) }
 #[inline] fn mid(a: Iv) -> f32 { 0.5 * (a.lo + a.hi) }
 #[inline] fn wid(a: Iv) -> f32 { a.hi - a.lo }
 
-pub fn prism_iv(c: &CNode, table: &[f32], x: Iv, y: Iv, z: Iv) -> Iv {
+pub fn prism_iv(c: &CNode, table: &[f32], mut x: Iv, mut y: Iv, mut z: Iv) -> Iv {
     let v = &c.v;
     let far = iv(FAR32, FAR32);
+    if c.mods & nflags::WORKPLANE != 0 {
+        let (lx, ly, lz) = to_workplane_iv(table, x, y, z);
+        x = lx; y = ly; z = lz;
+    }
+    if c.kind == profile::IMPLICIT {
+        let (wx, wy, wz) = (wid(x), wid(y), wid(z));
+        let f = implicit_sdf(c, mid(x), mid(y), mid(z));
+        if f == FAR32 { return far; }
+        return center_iv(f, 0.5 * (wx * wx + wy * wy + wz * wz).sqrt());
+    }
     if c.kind == profile::REVOLVE {
         if c.sides == 0 { return far; }
         let rho = isqrt(add(sq(sub_ic(x, v[0])), sq(sub_ic(y, v[1]))));
@@ -498,10 +591,11 @@ pub fn prism_iv(c: &CNode, table: &[f32], x: Iv, y: Iv, z: Iv) -> Iv {
     }
     let (z0, z1) = (v[4], v[5]);
     if !(z1 > z0) { return far; }
-    if c.mods & ZMODS != 0 {
+    if c.mods & (nflags::DRAFT | nflags::ROUND_Z | nflags::CHAMFER_Z) != 0 {
         let (wx, wy, wz) = (wid(x), wid(y), wid(z));
-        let f = prism_sdf_c(c, table, mid(x), mid(y), mid(z));
-        if f == FAR32 { return far; }
+        let d2 = profile_d2(c, table, mid(x), mid(y));
+        if d2 == FAR32 { return far; }
+        let f = zmod(c, d2, mid(z));
         return center_iv(f, 0.5 * (wx * wx + wy * wy + wz * wz).sqrt());
     }
     if c.kind == profile::SKETCH {
@@ -509,6 +603,12 @@ pub fn prism_iv(c: &CNode, table: &[f32], x: Iv, y: Iv, z: Iv) -> Iv {
         let (wx, wy) = (wid(x), wid(y));
         let d = sketch2d(table, c.sides, mid(x) - v[0], mid(y) - v[1]);
         return extrude_iv(center_iv(d, 0.5 * (wx * wx + wy * wy).sqrt()), z, z0, z1);
+    }
+    if c.mods & nflags::WORKPLANE != 0 {
+        let (wx, wy, wz) = (wid(x), wid(y), wid(z));
+        let d2 = profile_d2(c, table, mid(x), mid(y));
+        if d2 == FAR32 { return far; }
+        return center_iv(extrude32(d2, mid(z), z0, z1), 0.5 * (wx * wx + wy * wy + wz * wz).sqrt());
     }
     if c.kind == profile::RECT {
         let (x0, y0, x1, y1) = (v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3]));
@@ -760,7 +860,7 @@ pub fn scan_mirror(nodes: &[CNode]) -> u32 {
             if c.v[0] > 0.5 { m |= 1; }
             if c.v[1] > 0.5 { m |= 2; }
         }
-        if c.kind == profile::SKETCH || c.kind == profile::REVOLVE || c.mods & ZMODS != 0 { m |= 4; }
+        if c.kind == profile::SKETCH || c.kind == profile::REVOLVE || c.kind == profile::IMPLICIT || c.mods & ZMODS != 0 { m |= 4; }
     }
     m
 }

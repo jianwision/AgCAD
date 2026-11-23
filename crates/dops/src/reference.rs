@@ -1210,11 +1210,13 @@ impl Eng {
     }
 }
 
-/// Goal judgement of one evaluation: (met, relative volume error, score). Satisfy mode:
-/// met = feasible and the estimate in the target interval, score |err| (1000 + … if not
-/// met). Objective modes: met = feasible (and in the interval if one is given), score
-/// ±volume / obj_scale.
+/// Goal judgement of one evaluation: (met, relative volume error, score).
 pub fn judge(goal: &Goal, empty: bool, dom: bool, ve: f64, eh: [f64; 3], en: &Eng) -> (bool, f64, f64) {
+    judge_island(goal, empty, dom, ve, eh, en, 0, 1)
+}
+
+/// Goal judgement with per-island MOEA/D Pareto scalarization (`goal.objective == 4`).
+pub fn judge_island(goal: &Goal, empty: bool, dom: bool, ve: f64, eh: [f64; 3], en: &Eng, island_id: u32, n_islands: u32) -> (bool, f64, f64) {
     let has_iv = goal.vol_hi > goal.vol_lo;
     let t = 0.5 * (goal.vol_lo + goal.vol_hi);
     let err = if has_iv { (ve - t) / t } else { 0.0 };
@@ -1222,9 +1224,25 @@ pub fn judge(goal: &Goal, empty: bool, dom: bool, ve: f64, eh: [f64; 3], en: &En
     let met = !empty && !dom && in_iv && eh[0] <= goal.max_ext[0] && eh[1] <= goal.max_ext[1] && eh[2] <= goal.max_ext[2] && en.violation == 0.0 && en.centroid_ok;
     let pen = if en.area > 0.0 { en.violation / en.area } else { 0.0 } + if en.centroid_ok { 0.0 } else { 1.0 };
     let scale = if goal.obj_scale > 0.0 { goal.obj_scale } else { 1.0 };
-    // objective 3 (explore, for trade-off sets): every feasible design is equally good, so
-    // elitist search keeps the population spread over the feasible region
-    let sc = if !met { 1000.0 + err.abs() + pen } else if goal.objective == 1 { ve / scale } else if goal.objective == 2 { -(ve / scale) } else if goal.objective == 3 { 0.0 } else { err.abs() };
+    let sc = if !met {
+        1000.0 + err.abs() + pen
+    } else if goal.objective == 1 {
+        ve / scale
+    } else if goal.objective == 2 {
+        -(ve / scale)
+    } else if goal.objective == 3 {
+        0.0
+    } else if goal.objective == 4 {
+        let u = (island_id as f64 + 0.5) / (n_islands.max(1) as f64);
+        let w_vol = 1.0 - 0.8 * u;
+        let w_area = 0.8 * u;
+        let area_scale = scale.powf(2.0 / 3.0).max(1.0);
+        let nv = ve / scale;
+        let na = en.area / area_scale;
+        (w_vol * nv).max(w_area * na)
+    } else {
+        err.abs()
+    };
     (met, err, sc)
 }
 
@@ -1263,7 +1281,10 @@ pub unsafe fn ag_dop_decide(params: *const u8, _: &LaunchConfig) {
         let en = engineering(&gr, &goal, cc, ve);
         let empty = cc[cnt::INSIDE] + cc[cnt::BOUNDARY] == 0;
         let hard = el[0] > goal.max_ext[0] || el[1] > goal.max_ext[1] || el[2] > goal.max_ext[2];
-        let (met, err, sc) = judge(&goal, empty, dom[c] != 0, ve, eh, &en);
+        let isl_sz = a.island.clamp(2, MAX_ISLAND as u32);
+        let gcfg = a.cfg_offset + c as u32;
+        let n_islands = a.configs.div_ceil(isl_sz);
+        let (met, err, sc) = judge_island(&goal, empty, dom[c] != 0, ve, eh, &en, gcfg / isl_sz, n_islands);
         let mut write = a.eval_trial == 0;
         if a.eval_trial != 0 {
             let (mut acc, mut rej) = (0u32, 0u32);

@@ -10,7 +10,16 @@ use agcad_geo::tessellate::Mesh;
 pub enum View { Iso, Top, Front, Right }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Mode { Shaded, FaceIds }
+pub enum Mode { Shaded, FaceIds, Heatmap }
+
+/// Perceptually uniform engineering heatmap colormap (`t ∈ [0, 1]`: blue → cyan → green → yellow → red).
+pub fn heatmap_color(t: f32) -> [u8; 3] {
+    let t = t.clamp(0.0, 1.0);
+    let r = (1.5 - (4.0 * t - 3.0).abs()).clamp(0.0, 1.0);
+    let g = (1.5 - (4.0 * t - 2.0).abs()).clamp(0.0, 1.0);
+    let b = (1.5 - (4.0 * t - 1.0).abs()).clamp(0.0, 1.0);
+    [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8]
+}
 
 fn basis(v: View) -> (V3, V3, V3) {
     match v {
@@ -46,6 +55,13 @@ pub fn rasterize(m: &Mesh, view: View, mode: Mode, w: usize, h: usize) -> Vec<u8
         let color = match mode {
             Mode::FaceIds => face_color(m.face_of.get(ti).copied().unwrap_or(0)),
             Mode::Shaded => { let s = (0.25 + 0.75 * n3.dot(light).abs()).min(1.0); [(150.0 * s) as u8, (170.0 * s) as u8, (200.0 * s) as u8] }
+            Mode::Heatmap => {
+                // Default heatmap channel: overhang / undercut indicator from z-normal (1 = downward facing)
+                let t = ((0.5 - 0.5 * n3.z) as f32).clamp(0.0, 1.0);
+                let c = heatmap_color(t);
+                let s = (0.35 + 0.65 * n3.dot(light).abs()).min(1.0) as f32;
+                [(c[0] as f32 * s) as u8, (c[1] as f32 * s) as u8, (c[2] as f32 * s) as u8]
+            }
         };
         let (x0, x1) = (a.0.min(b.0).min(c.0).floor().max(0.0) as usize, (a.0.max(b.0).max(c.0).ceil() as usize).min(w - 1));
         let (y0, y1) = (a.1.min(b.1).min(c.1).floor().max(0.0) as usize, (a.1.max(b.1).max(c.1).ceil() as usize).min(h - 1));
@@ -180,6 +196,13 @@ pub fn pack_screen_tris(m: &Mesh, view: View, mode: Mode, w: usize, h: usize) ->
         let color = match mode {
             Mode::FaceIds => face_color(m.face_of.get(ti).copied().unwrap_or(0)),
             Mode::Shaded => { let s = (0.25 + 0.75 * n3.dot(light).abs()).min(1.0); [(150.0 * s) as u8, (170.0 * s) as u8, (200.0 * s) as u8] }
+            Mode::Heatmap => {
+                // Default heatmap channel: overhang / undercut indicator from z-normal (1 = downward facing)
+                let t = ((0.5 - 0.5 * n3.z) as f32).clamp(0.0, 1.0);
+                let c = heatmap_color(t);
+                let s = (0.35 + 0.65 * n3.dot(light).abs()).min(1.0) as f32;
+                [(c[0] as f32 * s) as u8, (c[1] as f32 * s) as u8, (c[2] as f32 * s) as u8]
+            }
         };
         out.extend([a.0 as f32, a.1 as f32, a.2 as f32, b.0 as f32, b.1 as f32, b.2 as f32, c.0 as f32, c.1 as f32, c.2 as f32, color[0] as f32, color[1] as f32, color[2] as f32]);
     }
@@ -202,6 +225,89 @@ pub fn rasterize_device<D: agcad_driver::KernelExt>(dev: &D, s: &D::Stream, m: &
     dev.download_packed_async(s, &[Region { buf: &ob, offset: 0, bytes: img_bytes }], &mut pin)?;
     dev.sync(s)?;
     Ok(pin.as_bytes()[..img_bytes].to_vec())
+}
+
+/// Rasterize an arbitrary per-triangle scalar field (e.g. von Mises stress, wall thickness,
+/// undercut severity) using [`heatmap_color`] over `[min_v, max_v]`.
+pub fn rasterize_heatmap(m: &Mesh, view: View, tri_values: &[f32], min_v: f32, max_v: f32, w: usize, h: usize) -> Vec<u8> {
+    if m.positions.is_empty() || m.triangles.is_empty() { return vec![255u8; w * h * 3]; }
+    let (r, u, d) = basis(view);
+    let proj: Vec<(f64, f64, f64)> = m.positions.iter().map(|p| (p.dot(r), p.dot(u), p.dot(d))).collect();
+    let (mut minx, mut maxx, mut miny, mut maxy) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+    for p in &proj { minx = minx.min(p.0); maxx = maxx.max(p.0); miny = miny.min(p.1); maxy = maxy.max(p.1); }
+    let scale = 0.9 * (w as f64 / (maxx - minx).max(1e-9)).min(h as f64 / (maxy - miny).max(1e-9));
+    let (cx, cy) = ((minx + maxx) / 2.0, (miny + maxy) / 2.0);
+    let sx = |p: (f64, f64, f64)| (w as f64 / 2.0 + (p.0 - cx) * scale, h as f64 / 2.0 - (p.1 - cy) * scale, p.2);
+    let mut img = vec![255u8; w * h * 3];
+    let mut z = vec![f64::NEG_INFINITY; w * h];
+    let light = v3(0.3, 0.5, 0.8).normalized();
+    let inv_span = 1.0 / (max_v - min_v).abs().max(1e-9);
+    for (ti, t) in m.triangles.iter().enumerate() {
+        let (a, b, c) = (sx(proj[t[0] as usize]), sx(proj[t[1] as usize]), sx(proj[t[2] as usize]));
+        let area = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+        if area.abs() < 1e-12 { continue; }
+        let n3 = (m.positions[t[1] as usize] - m.positions[t[0] as usize]).cross(m.positions[t[2] as usize] - m.positions[t[0] as usize]).normalized();
+        let val = tri_values.get(ti).copied().unwrap_or(min_v);
+        let col = heatmap_color((val - min_v) * inv_span);
+        let shade = (0.35 + 0.65 * n3.dot(light).abs()).min(1.0) as f32;
+        let color = [(col[0] as f32 * shade) as u8, (col[1] as f32 * shade) as u8, (col[2] as f32 * shade) as u8];
+        let (x0, x1) = (a.0.min(b.0).min(c.0).floor().max(0.0) as usize, (a.0.max(b.0).max(c.0).ceil() as usize).min(w - 1));
+        let (y0, y1) = (a.1.min(b.1).min(c.1).floor().max(0.0) as usize, (a.1.max(b.1).max(c.1).ceil() as usize).min(h - 1));
+        for y in y0..=y1 { for x in x0..=x1 {
+            let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+            let w0 = ((b.0 - px) * (c.1 - py) - (b.1 - py) * (c.0 - px)) / area;
+            let w1 = ((c.0 - px) * (a.1 - py) - (c.1 - py) * (a.0 - px)) / area;
+            let w2 = 1.0 - w0 - w1;
+            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 { continue; }
+            let depth = -(w0 * a.2 + w1 * b.2 + w2 * c.2);
+            let i = y * w + x;
+            if depth > z[i] { z[i] = depth; img[i * 3..i * 3 + 3].copy_from_slice(&color); }
+        }}
+    }
+    img
+}
+
+/// Stitch 4 quadrant views (Iso, Top, Front, Right) into a single `2*tile_w × 2*tile_h` contact sheet.
+fn stitch_quadrants(quads: [&[u8]; 4], tw: usize, th: usize) -> Vec<u8> {
+    let (w, h) = (tw * 2, th * 2);
+    let mut out = vec![220u8; w * h * 3];
+    let offs = [(0, 0), (tw, 0), (0, th), (tw, th)];
+    for (q, (ox, oy)) in quads.iter().zip(offs) {
+        for y in 0..th {
+            let src = &q[y * tw * 3..(y + 1) * tw * 3];
+            let dst_off = ((oy + y) * w + ox) * 3;
+            out[dst_off..dst_off + tw * 3].copy_from_slice(src);
+        }
+    }
+    // 1-px dark gray divider cross
+    for x in 0..w { let idx = (th * w + x) * 3; out[idx..idx + 3].copy_from_slice(&[80, 80, 80]); }
+    for y in 0..h { let idx = (y * w + tw) * 3; out[idx..idx + 3].copy_from_slice(&[80, 80, 80]); }
+    out
+}
+
+/// 2×2 multi-view contact sheet (Iso / Top / Front / Right) on host.
+pub fn contact_sheet(m: &Mesh, mode: Mode, tile_w: usize, tile_h: usize) -> Vec<u8> {
+    let q0 = rasterize(m, View::Iso, mode, tile_w, tile_h);
+    let q1 = rasterize(m, View::Top, mode, tile_w, tile_h);
+    let q2 = rasterize(m, View::Front, mode, tile_w, tile_h);
+    let q3 = rasterize(m, View::Right, mode, tile_w, tile_h);
+    stitch_quadrants([&q0, &q1, &q2, &q3], tile_w, tile_h)
+}
+
+/// 2×2 multi-view contact sheet (Iso / Top / Front / Right) rasterized on device.
+pub fn contact_sheet_device<D: agcad_driver::KernelExt>(
+    dev: &D,
+    s: &D::Stream,
+    m: &Mesh,
+    mode: Mode,
+    tile_w: usize,
+    tile_h: usize,
+) -> agcad_driver::DriverResult<Vec<u8>> {
+    let q0 = rasterize_device(dev, s, m, View::Iso, mode, tile_w, tile_h)?;
+    let q1 = rasterize_device(dev, s, m, View::Top, mode, tile_w, tile_h)?;
+    let q2 = rasterize_device(dev, s, m, View::Front, mode, tile_w, tile_h)?;
+    let q3 = rasterize_device(dev, s, m, View::Right, mode, tile_w, tile_h)?;
+    Ok(stitch_quadrants([&q0, &q1, &q2, &q3], tile_w, tile_h))
 }
 
 #[cfg(test)]

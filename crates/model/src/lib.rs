@@ -8,8 +8,10 @@
 
 pub mod adaptor;
 pub mod cumodel;
+pub mod dagger;
 pub mod encoder;
 pub mod llm;
 pub mod replay;
+pub mod tokenizer;
 
 pub use adaptor::{CapabilityManifest, Decision, ModelAdaptor, Observation};

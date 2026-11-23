@@ -138,10 +138,14 @@ This is the loop **LLM observes → sets a goal → GPU model plans and executes
   - **NanoVDB + Dual Contouring (`geo::vdb`, `dops::mesh`):** sparse 8³-leaf narrow-band `NanoVdbGrid` with binary serialization and feature-preserving Hermite QEF Dual Contouring (`extract_nanovdb`, `extract_dual_contour`).
   - **Open & multi-slab exact shells (`geo::layered`):** `LayeredSolid::shell_open` and `shell_multi_slab`.
   - **GPU NURBS grid eval, batched study mass, GPU rasterizer:** `ag_nurbs_eval_grid` (`loft.cu` + `loft_device`), `study::evaluate_mass_device` (`ag_mesh_terms`), and pixel-parallel `ag_rasterize` (`harness/cu/render.cu` + `render::rasterize_device`).
-- **Next (Phase 3–4):**
-  - GPU exact B-rep kernel (filtered predicates, co-surface 2D booleans, GPU SSI marching, OptiX-classified topology builders, GPU STEP encoder);
-  - learned CANTO-style feature-tape structural policy trained from rollout traces via Candle Expert-Iteration/DAgger;
-  - Reynolds-transport shape gradients inside `ag_ad_fill` + on-device MOEA/D Pareto islands.
+- **Phase 3 & Phase 4 (GPU exact B-rep, prefix-scan STEP, 3D workplanes, TPMS lattices, differentiable CAD, MOEA/D Pareto, CANTO/DAgger & L2/L4 sandbox — build & verification deferred):**
+  - **GPU-native exact B-rep (`geo/cu/exact_geo.cu`, `geo::gpu_exact`):** filtered `orient2d`/`orient3d` kernels with inconclusive slow-path compaction + deterministic SoS (`orient2d_sos`, `orient3d_sos`), spatial AABB overlap broadphase (`ag_geo_aabb_overlap_pairs`), batched minimal-norm analytic SSI Newton refinement (`ag_geo_ssi_refine_batch`), parallel ray-parity fragment classification (`ag_geo_classify_faces`), quantized twin-welding, and general non-parallel polyhedral B-rep booleans wired into `NativeKernel::boolean`.
+  - **GPU prefix-scan STEP AP242 encoder (`geo::step_gpu`):** 4-stage `number → format → exclusive_scan → ag_geo_step_scatter` pipeline producing byte-identical STEP output to `step_write::write_step`, wired into MCP `export`.
+  - **Expressive GPU feature tape (`dops::abi`, `math.rs`, `dops.cu`):** arbitrary 3D orthonormal workplanes (`nflags::WORKPLANE`, `Design::add_workplane_frame`) and analytical Lipschitz-bounded TPMS implicit lattices (`profile::IMPLICIT`: Gyroid, Schwarz-P, Diamond) with bitwise CUDA ≡ CPU parity.
+  - **Differentiable GPU CAD & multi-load stress FEA (`dops::grad`, `dops::fea`):** Reynolds-transport shape gradients (`reynolds_shape_gradients`) + projected-gradient polish (`gradient_polish_volume`); centroidal von Mises stress proxy (`max`, `p99`, `mean`, worst voxel hotspot), exact self-adjoint compliance sensitivity (`∂C/∂ρ_e = -u_eᵀ K_e u_e`), and `stiffness_multi_load`.
+  - **On-device MOEA/D Pareto islands (`dops.cu`, `reference.rs`, `server`):** `objective = 4` (`"moead"`) assigns deterministic per-island Tchebycheff weights over `(volume, surface_area)` inside the rollout loop.
+  - **CANTO tokenizer, spatial boundary encoder & DAgger trainer (`model::{tokenizer, encoder, dagger}`):** `tokenize_tape` / `pack_policy_input`, 32-float `encode_boundary_cells`, JSONL `RolloutDataset`, deterministic `train_mlp_bc` outputting `safetensors` for `ResidentMlp`, and automated `verify_kernel_parity` (`AG-07-005`).
+  - **LLM visual perception, `set_goal` v2 & L2/L4 self-improvement (`harness::render`, `server`, `improve::{sandbox, benchmark}`):** `Mode::Heatmap`, `rasterize_heatmap`, 2×2 multi-view contact sheets (`view: "sheet"` on GPU/CPU), `set_goal` `probe: true` reachability/sensitivity diagnostics, process-isolated L2/L4 `compute-sanitizer` sandbox runner, and 4-family head-to-head benchmark scorecard (`AG-10-002`).
 
 ## Op coverage (293 catalog ops)
 

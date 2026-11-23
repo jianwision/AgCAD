@@ -277,8 +277,23 @@ impl Server {
             }
             "render" => {
                 let m = self.current_mesh().ok_or("nothing to render")?;
+                let mode = match args.get("mode").and_then(Value::as_str) {
+                    Some("face_ids") => Mode::FaceIds,
+                    Some("heatmap") => Mode::Heatmap,
+                    _ => Mode::Shaded,
+                };
+                if args.get("view").and_then(Value::as_str) == Some("sheet") {
+                    let (tw, th) = (256, 256);
+                    let rgb = if let Some(dev) = self.device_cache.cuda_device() {
+                        agcad_driver::AgDevice::stream(&*dev, agcad_driver::Priority::Low)
+                            .and_then(|s| agcad_harness::render::contact_sheet_device(&*dev, &s, &m, mode, tw, th))
+                            .unwrap_or_else(|_| agcad_harness::render::contact_sheet(&m, mode, tw, th))
+                    } else {
+                        agcad_harness::render::contact_sheet(&m, mode, tw, th)
+                    };
+                    return Ok(json!({ "png_base64": b64(&png(&rgb, tw * 2, th * 2)), "width": tw * 2, "height": th * 2, "view": "sheet", "quadrants": ["iso", "top", "front", "right"] }));
+                }
                 let view = match args.get("view").and_then(Value::as_str) { Some("top") => View::Top, Some("front") => View::Front, Some("right") => View::Right, _ => View::Iso };
-                let mode = if args.get("mode").and_then(Value::as_str) == Some("face_ids") { Mode::FaceIds } else { Mode::Shaded };
                 let (w, h) = (512, 512);
                 let rgb = if let Some(dev) = self.device_cache.cuda_device() {
                     agcad_driver::AgDevice::stream(&*dev, agcad_driver::Priority::Low)
@@ -303,7 +318,14 @@ impl Server {
                         }
                         let body = self.session.accepted_bodies.get(&self.branch).and_then(|a| a.exact.as_ref())
                             .and_then(Product::exact_body).ok_or("no accepted exact body to export")?;
-                        agcad_geo::step_write::write_step(&body, &Default::default()).0.into_bytes()
+                        if let Some(dev) = self.device_cache.cuda_device() {
+                            agcad_driver::AgDevice::stream(&*dev, agcad_driver::Priority::Low)
+                                .and_then(|s| agcad_geo::step_gpu::write_step_device(&*dev, &s, &body, &Default::default()))
+                                .map(|(b, _)| b)
+                                .unwrap_or_else(|_| agcad_geo::step_write::write_step(&body, &Default::default()).0.into_bytes())
+                        } else {
+                            agcad_geo::step_write::write_step(&body, &Default::default()).0.into_bytes()
+                        }
                     }
                 };
                 std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
@@ -321,8 +343,15 @@ impl Server {
                 self.dfm = device::parse_dfm(args, &g);
                 self.goal = Some((g, design.names.clone()));
                 self.load = load;
+                let probe = if args.get("probe").and_then(Value::as_bool).unwrap_or(false) {
+                    Some(device::probe_reachability(&design, &g))
+                } else {
+                    None
+                };
+                let obj_name = ["satisfy", "min_volume", "max_volume", "explore", "moead"].get(g.objective as usize).copied().unwrap_or("satisfy");
                 json!({ "ok": true, "parameters": design.names, "device_features": design.nodes.len(), "notes": notes, "raise_warnings": warnings,
-                        "goal": { "objective": (["satisfy", "min_volume", "max_volume"][g.objective as usize]), "target_volume": (g.vol_hi > g.vol_lo).then_some([g.vol_lo, g.vol_hi]), "max_extent": g.max_ext, "domain": { "min": g.domain_lo, "max": g.domain_hi },
+                        "reachability": probe,
+                        "goal": { "objective": obj_name, "target_volume": (g.vol_hi > g.vol_lo).then_some([g.vol_lo, g.vol_hi]), "max_extent": g.max_ext, "domain": { "min": g.domain_lo, "max": g.domain_hi },
                                   "min_wall": (g.min_wall > 0.0).then_some(g.min_wall), "min_clearance": (g.min_gap > 0.0).then_some(g.min_gap), "machining_3ax": g.machining_3ax == 1,
                                   "stiffness": load.map(|l| json!({ "support_axis": l.support_axis, "force": l.force, "max_compliance": l.max_compliance })),
                                   "ray_check": self.dfm.as_ref().map(|d| json!({ "machining": d.set, "min_wall": d.min_wall, "min_clearance": d.min_clearance, "on": "survivors" })),
@@ -365,11 +394,13 @@ impl Server {
                 // a trade-off set needs a spread population: explore instead of stopping at the
                 // first design that satisfies the goal
                 let mut g = g;
-                if pareto.is_some() && g.objective == 0 { g.objective = 3; }
+                if pareto.is_some() && g.objective == 0 {
+                    g.objective = if args.get("moead").and_then(Value::as_bool).unwrap_or(false) { 4 } else { 3 };
+                }
                 let run = device::run(&mut self.device_cache, &design, &g, cfg, read_k, prefer_cuda)?;
                 let mut out = device::summarize(&device::RolloutRun { summary: agcad_dops::RolloutSummary { top: run.summary.top.iter().take(top_k).cloned().collect(), ..run.summary.clone() }, ..run }, &run.summary.top.first().map(|s| s.design.names.clone()).unwrap_or(names.clone()));
                 out["policy"] = json!(match pol { 1 => "cmaes", 2 => "cumodel", 3 => "hybrid", _ => "mock" });
-                out["objective"] = json!(["satisfy", "min_volume", "max_volume", "explore"][g.objective as usize]);
+                out["objective"] = json!(["satisfy", "min_volume", "max_volume", "explore", "moead"].get(g.objective as usize).copied().unwrap_or("satisfy"));
                 out["raise_warnings"] = json!(warnings);
                 // stiffness escalation on the survivors (voxel PCG on the device)
                 let mut stiff_ok = vec![true; run.summary.top.len()];

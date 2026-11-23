@@ -13,6 +13,7 @@
 pub mod abi;
 pub mod examples;
 pub mod fea;
+pub mod grad;
 pub mod lower;
 pub mod math;
 pub mod mesh;

@@ -5,6 +5,8 @@ use crate::nurbs::NurbsSurface;
 use crate::surface::Surface;
 
 // Edges are ordered bottom, right, top, left. The flag follows increasing U or V.
+mod batch;
+
 type Sides = [(usize, bool); 4];
 
 fn sides(b: &Brep, f: &Face, s: &NurbsSurface) -> Option<Sides> {
@@ -42,11 +44,12 @@ fn sides(b: &Brep, f: &Face, s: &NurbsSurface) -> Option<Sides> {
 
 pub(super) struct Grid {
     faces: Vec<Option<Sides>>,
+    pub(super) points: Option<batch::Points>,
     pub stations: Vec<Vec<f64>>,
 }
 
 impl Grid {
-    pub fn new(b: &Brep, o: &TessOptions) -> Self {
+    pub fn new(b: &Brep, o: &TessOptions) -> agcad_driver::DriverResult<Self> {
         let mut counts: Vec<_> = b
             .edges
             .iter()
@@ -54,46 +57,57 @@ impl Grid {
             .collect();
         let mut breaks = vec![Vec::new(); counts.len()];
         let mut linked = vec![Vec::new(); counts.len()];
-        let faces = b
+        let faces: Vec<_> = b
             .faces
             .iter()
-            .map(|f| {
-                let Surface::Nurbs(s) = &b.surfaces[f.surface as usize] else {
-                    return None;
-                };
-                let sides = sides(b, f, s)?;
-                let ((u0, u1), (v0, v1)) = s.domain();
-                let (du, dv) = (u1 - u0, v1 - v0);
-                let mut curvature = [0.0_f64; 2];
-                for us in s.ku.windows(2).filter(|w| w[1] > w[0]) {
-                    for vs in s.kv.windows(2).filter(|w| w[1] > w[0]) {
-                        for a in [0.01, 0.5, 0.99] {
-                            for e in [0.01, 0.5, 0.99] {
-                                let jet =
-                                    s.jet(us[0] + (us[1] - us[0]) * a, vs[0] + (vs[1] - vs[0]) * e);
-                                let normal = jet.normal();
-                                let twist = jet.duv.dot(normal).abs() * du * dv;
-                                curvature[0] = curvature[0].max(jet.duu.norm() * du * du + twist);
-                                curvature[1] = curvature[1].max(jet.dvv.norm() * dv * dv + twist);
-                            }
-                        }
-                    }
-                }
-                for (axis, knots, lo, delta) in [(0, &s.ku, u0, du), (1, &s.kv, v0, dv)] {
-                    let (a, z) = (sides[axis].0, sides[axis + 2].0);
-                    linked[a].push(z);
-                    linked[z].push(a);
-                    // Include the cross derivative to resolve twisted bilinear faces.
-                    let n = (curvature[axis] / (2. * o.sag.max(1e-12))).sqrt().ceil() as usize;
-                    counts[a] = counts[a].max(n.min(o.max_segments_per_edge));
-                    for &k in knots.iter().filter(|&&k| k > lo && k < lo + delta) {
-                        let t = (k - lo) / delta;
-                        breaks[a].extend([t, 1. - t]);
-                    }
-                }
-                Some(sides)
+            .map(|f| match &b.surfaces[f.surface as usize] {
+                Surface::Nurbs(s) => sides(b, f, s),
+                _ => None,
             })
             .collect();
+        let mut batch = batch::Batch::new(b, &faces);
+        let curvatures = batch.curvature(faces.len())?;
+        for (i, sides) in faces.iter().enumerate() {
+            let Some(sides) = sides else {
+                continue;
+            };
+            let Surface::Nurbs(s) = &b.surfaces[b.faces[i].surface as usize] else {
+                continue;
+            };
+            let ((u0, u1), (v0, v1)) = s.domain();
+            let (du, dv) = (u1 - u0, v1 - v0);
+            let from_device = curvatures.as_ref().and_then(|c| c[i]);
+            // A last-bit difference at a subdivision boundary can change connectivity.
+            let curvature = from_device
+                .filter(|c| {
+                    c.iter().all(|v| {
+                        let n = (v / (2. * o.sag.max(1e-12))).sqrt();
+                        n < 0.5 || (n - n.round()).abs() > 1e-10 * n
+                    })
+                })
+                .unwrap_or_else(|| {
+                    let mut maximum = [0.0_f64; 2];
+                    batch::probes(s, |u, v| {
+                        let jet = s.jet(u, v);
+                        let twist = jet.duv.dot(jet.normal()).abs() * du * dv;
+                        maximum[0] = maximum[0].max(jet.duu.norm() * du * du + twist);
+                        maximum[1] = maximum[1].max(jet.dvv.norm() * dv * dv + twist);
+                    });
+                    maximum
+                });
+            for (axis, knots, lo, delta) in [(0, &s.ku, u0, du), (1, &s.kv, v0, dv)] {
+                let (a, z) = (sides[axis].0, sides[axis + 2].0);
+                linked[a].push(z);
+                linked[z].push(a);
+                // Include the cross derivative to resolve twisted bilinear faces.
+                let n = (curvature[axis] / (2. * o.sag.max(1e-12))).sqrt().ceil() as usize;
+                counts[a] = counts[a].max(n.min(o.max_segments_per_edge));
+                for &k in knots.iter().filter(|&&k| k > lo && k < lo + delta) {
+                    let t = (k - lo) / delta;
+                    breaks[a].extend([t, 1. - t]);
+                }
+            }
+        }
         let mut stations = vec![Vec::new(); counts.len()];
         for seed in 0..counts.len() {
             if !stations[seed].is_empty() {
@@ -122,7 +136,12 @@ impl Grid {
                 stations[e].clone_from(&ts);
             }
         }
-        Self { faces, stations }
+        let points = batch.points(faces.len(), &stations)?;
+        Ok(Self {
+            faces,
+            stations,
+            points,
+        })
     }
 
     pub fn tessellate(&self, face: usize, bl: &mut Builder<'_>) -> bool {
@@ -154,9 +173,15 @@ impl Grid {
                     edges[2][i]
                 } else {
                     let id = bl.mesh.positions.len() as u32;
-                    bl.mesh
-                        .positions
-                        .push(s.point(u0 + (u1 - u0) * u, v0 + (v1 - v0) * v));
+                    let point = self
+                        .points
+                        .as_ref()
+                        .and_then(|p| {
+                            p.offsets[face]
+                                .map(|start| p.values[start + (j - 1) * (us.len() - 2) + i - 1])
+                        })
+                        .unwrap_or_else(|| s.point(u0 + (u1 - u0) * u, v0 + (v1 - v0) * v));
+                    bl.mesh.positions.push(point);
                     id
                 };
                 row.push(id);

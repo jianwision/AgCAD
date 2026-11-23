@@ -33,6 +33,8 @@ pub trait ExactKernel: Send + Sync {
     fn boolean(&self, a: &Solid, b: &Solid, op: BoolOp2) -> Result<Solid, KernelError>;
     fn check(&self, s: &Solid) -> ValidityReport;
     fn tessellate(&self, s: &Solid, o: &TessOptions) -> Mesh;
+    fn try_tessellate(&self, s: &Solid, o: &TessOptions) -> agcad_driver::DriverResult<Mesh> { Ok(self.tessellate(s,o)) }
+    fn tessellate_for_measurement(&self, s: &Solid, o: &TessOptions) -> agcad_driver::DriverResult<crate::tessellate::PreparedMesh> { Ok(self.try_tessellate(s,o)?.into()) }
 }
 
 pub struct NativeKernel;
@@ -82,6 +84,8 @@ impl ExactKernel for NativeKernel {
 
     fn check(&self, s: &Solid) -> ValidityReport { s.brep().validate() }
 
+    fn try_tessellate(&self, s: &Solid, o: &TessOptions) -> agcad_driver::DriverResult<Mesh> { crate::tessellate::try_tessellate(&s.brep(),o) }
+    fn tessellate_for_measurement(&self, s: &Solid, o: &TessOptions) -> agcad_driver::DriverResult<crate::tessellate::PreparedMesh> { crate::tessellate::tessellate_for_measurement(&s.brep(),o) }
     fn tessellate(&self, s: &Solid, o: &TessOptions) -> Mesh { crate::tessellate::tessellate(&s.brep(), o) }
 }
 

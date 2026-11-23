@@ -10,8 +10,7 @@
 use crate::checker::{check, CheckResult, Verdict};
 use crate::requirements::{HardRequirement, Requirements};
 use agcad_driver::AgStatus;
-use agcad_geo::kernel::ExactKernel;
-use agcad_geo::tessellate::TessOptions;
+use agcad_geo::kernel::{ExactKernel, Solid};
 use agcad_runtime::document::PartState;
 use agcad_runtime::rebuild::{update, Product, Registry, UpdateResult};
 use agcad_runtime::sched::{class_histogram, topology_classes, TopologySignature};
@@ -63,6 +62,15 @@ pub struct ConfigResult {
     pub body: Option<u32>,
 }
 
+impl ConfigResult {
+    fn solid(&self) -> Option<&Solid> {
+        match self.update.products.get(&self.body?)? {
+            Product::Solid(solid) => Some(solid),
+            _ => None,
+        }
+    }
+}
+
 /// `study.update_configurations`: rebuild every configuration; group by topology signature.
 pub fn update_configurations(part: &PartState, registry: &Registry, kernel: &dyn ExactKernel, cfgs: &[Config]) -> Vec<ConfigResult> {
     cfgs.iter().map(|c| {
@@ -86,21 +94,35 @@ pub struct Evaluated {
 }
 
 /// `study.evaluate`: objective (minimize/maximize a field of an evaluation) + hard checks.
-pub fn evaluate(part: &PartState, registry: &Registry, kernel: &dyn ExactKernel, results: &[ConfigResult], objective: Option<(&str, &str, bool)>, hard: &[HardRequirement]) -> Vec<Evaluated> {
-    results.iter().enumerate().map(|(i, r)| {
+pub fn evaluate(part: &PartState, registry: &Registry, kernel: &dyn ExactKernel, results: &[ConfigResult], objective: Option<(&str, &str, bool)>, hard: &[HardRequirement]) -> Result<Vec<Evaluated>, String> {
+    let mut scores = vec![None; results.len()];
+    if let Some((measure, field, _)) = objective {
+        if let Some(op) = registry.get(measure) {
+            let (indices, solids): (Vec<_>, Vec<_>) = results.iter().enumerate()
+                .filter_map(|(i, result)| Some((i, result.solid()?))).unzip();
+            if let Some(values) = op.batch_objective(kernel, &solids, field).map_err(|e| e.to_string())? {
+                for (index, value) in indices.into_iter().zip(values) {
+                    scores[index] = Some(value);
+                }
+            }
+        }
+    }
+    Ok(results.iter().enumerate().map(|(i, r)| {
         let Some(body) = r.body else { return Evaluated { configuration: i, score: f64::INFINITY, checks: vec![], feasible: false } };
         let checks: Vec<CheckResult> = hard.iter().map(|h| check(h, part, kernel, registry, &r.update.products, body)).collect();
         let feasible = r.update.ok() && checks.iter().all(|c| c.verdict == Verdict::Pass);
         let score = match objective {
             Some((measure, field, maximize)) => {
-                let h = HardRequirement { id: "objective".into(), measure: measure.into(), field: field.into(), le: Some(f64::MAX), ge: None, eq: None, evidence: crate::requirements::Evidence::Unknown, args: BTreeMap::new() };
-                let v = check(&h, part, kernel, registry, &r.update.products, body).value.as_f64().unwrap_or(f64::NAN);
+                let v = scores[i].unwrap_or_else(|| {
+                    let h = HardRequirement { id: "objective".into(), measure: measure.into(), field: field.into(), le: Some(f64::MAX), ge: None, eq: None, evidence: crate::requirements::Evidence::Unknown, args: BTreeMap::new() };
+                    check(&h, part, kernel, registry, &r.update.products, body).value.as_f64().unwrap_or(f64::NAN)
+                });
                 if maximize { -v } else { v }
             }
             None => 0.0,
         };
         Evaluated { configuration: i, score, checks, feasible }
-    }).collect()
+    }).collect())
 }
 
 /// `study.rank`: stable top-k (ties by configuration id; infeasible/NaN last), identical
@@ -143,16 +165,19 @@ pub fn kendall_tau(a: &[f64], b: &[f64]) -> f64 {
 
 /// Proxy fidelity: proxy = coarse tessellation volume, exact = fine tessellation volume of
 /// the survivors (spec 05 § Proxy fidelity; recorded per study).
-pub fn proxy_fidelity(kernel: &dyn ExactKernel, results: &[ConfigResult], survivors: &[usize]) -> Value {
-    let vol = |i: usize, sag: f64| -> f64 {
-        match results[i].body.and_then(|b| results[i].update.products.get(&b)) {
-            Some(Product::Solid(s)) => kernel.tessellate(s, &TessOptions { sag, ..Default::default() }).mass_properties().0,
-            _ => f64::NAN,
+pub fn proxy_fidelity(kernel: &dyn ExactKernel, results: &[ConfigResult], survivors: &[usize]) -> Result<Value, String> {
+    let (slots, solids): (Vec<_>, Vec<_>) = survivors.iter().enumerate()
+        .filter_map(|(slot, &i)| Some((slot, results[i].solid()?))).unzip();
+    let volumes = |sag| -> Result<Vec<f64>, String> {
+        let mut values = vec![f64::NAN; survivors.len()];
+        for (&slot, (volume, _, _)) in slots.iter().zip(agcad_std::batch_mass(kernel, &solids, sag).map_err(|e| e.to_string())?) {
+            values[slot] = volume;
         }
+        Ok(values)
     };
-    let proxy: Vec<f64> = survivors.iter().map(|&i| vol(i, 0.5)).collect();
-    let exact: Vec<f64> = survivors.iter().map(|&i| vol(i, 1e-3)).collect();
-    json!({ "kendall_tau": kendall_tau(&proxy, &exact), "survivors": survivors.len(), "proxy": "tessellation sag 0.5 mm", "exact": "tessellation sag 0.001 mm" })
+    let proxy = volumes(0.5)?;
+    let exact = volumes(1e-3)?;
+    Ok(json!({ "kendall_tau": kendall_tau(&proxy, &exact), "survivors": survivors.len(), "proxy": "tessellation sag 0.5 mm", "exact": "tessellation sag 0.001 mm" }))
 }
 
 pub fn topology_report(results: &[ConfigResult]) -> Value {
@@ -251,9 +276,9 @@ pub fn infeasible_causes(results: &[ConfigResult], ev: &[Evaluated]) -> Vec<Valu
 pub fn run(part: &PartState, registry: &Registry, kernel: &dyn ExactKernel, req: &Requirements, spec: &Value, objective: Option<(&str, &str, bool)>, k: usize) -> Result<Value, String> {
     let cfgs = configurations(spec)?;
     let results = update_configurations(part, registry, kernel, &cfgs);
-    let ev = evaluate(part, registry, kernel, &results, objective, &req.hard);
+    let ev = evaluate(part, registry, kernel, &results, objective, &req.hard)?;
     let (top, fallbacks) = rank_with_fallback(part, registry, kernel, &results, &ev, k);
-    let fidelity = proxy_fidelity(kernel, &results, &top);
+    let fidelity = proxy_fidelity(kernel, &results, &top)?;
     Ok(json!({
         "configurations": cfgs.len(),
         "feasible": ev.iter().filter(|e| e.feasible).count(),

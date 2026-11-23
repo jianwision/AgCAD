@@ -66,7 +66,7 @@ pub fn voxelize(ctx: &BuildContext<'_>, p: &Product, h: f64) -> Result<Voxels, F
     let (bb, inside): (agcad_geo::math::Aabb, Box<dyn Fn(V3) -> bool>) = match p {
         Product::Implicit(i) => { let i = i.clone(); (i.bounds, Box::new(move |q| i.eval(q) < 0.0)) }
         Product::Solid(s) => {
-            let m = ctx.kernel.tessellate(s, &TessOptions { sag: h * 0.1, ..Default::default() });
+            let m = ctx.kernel.try_tessellate(s, &TessOptions { sag: h * 0.1, ..Default::default() })?;
             let bb = s.brep().bbox();
             (bb, Box::new(move |q: V3| {
                 // ray along +x with slight skew to avoid edge hits; count crossings

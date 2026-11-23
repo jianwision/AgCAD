@@ -27,8 +27,13 @@ pub struct CudaDevice {
     libraries: Mutex<Vec<LoadedLibrary>>,
 }
 
+static GEOMETRY_RESTART_REQUIRED: AtomicBool = AtomicBool::new(false);
+static GEOMETRY_DEVICE: Mutex<Option<Arc<CudaDevice>>> = Mutex::new(None);
+
 struct LoadedLibrary {
     name: &'static str,
+    source: Box<str>,
+    options: Vec<String>,
     module: sys::CUmodule,
     functions: Vec<(String, sys::CUfunction)>,
 }
@@ -135,6 +140,9 @@ fn attr(dev: sys::CUdevice, a: sys::CUdevice_attribute) -> i32 {
 impl CudaDevice {
     /// Open device `ordinal`; fill [`Caps`] from device attributes (A3-2).
     pub fn open(ordinal: usize) -> DriverResult<Arc<Self>> {
+        if !unsafe { sys::is_culib_present() } {
+            return Err(EnqueueError::Unsupported("CUDA driver library unavailable").into());
+        }
         let ctx = CudaContext::new(ordinal).map_err(fault::driver)?;
         ctx.bind_to_thread().map_err(fault::driver)?;
         let name = ctx.name().unwrap_or_else(|_| "CUDA device".into());
@@ -174,7 +182,11 @@ impl CudaDevice {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(EnqueueError::Poisoned);
         }
-        self.ctx.bind_to_thread().map_err(fault::enqueue)
+        self.enq(self.ctx.bind_to_thread())
+    }
+
+    pub fn note_error(&self, error: &DriverError) {
+        if error.requires_worker_restart() { self.poisoned.store(true, Ordering::Release); }
     }
 
     fn note_fault(&self, f: &DeviceFault) {
@@ -333,35 +345,102 @@ impl AgDevice for CudaDevice {
     }
 }
 
-impl KernelExt for CudaDevice {
-    fn load_library(&self, src: &LibrarySource) -> DriverResult<LibraryId> {
+impl CudaDevice {
+    /// The default primary device owns compiled modules for the process lifetime.
+    /// CUDA calls during Windows thread-local destruction run under the loader lock.
+    pub fn geometry_device() -> DriverResult<Arc<Self>> {
+        let mut slot = GEOMETRY_DEVICE.lock().expect("geometry device registry poisoned");
+        if GEOMETRY_RESTART_REQUIRED.load(Ordering::Acquire) { return Err(EnqueueError::Poisoned.into()); }
+        if let Some(device) = slot.as_ref() {
+            if device.state() == WorkerState::Poisoned { return Err(EnqueueError::Poisoned.into()); }
+            return Ok(device.clone());
+        }
+        let device = Self::open(0).inspect_err(|e| {
+            if e.requires_worker_restart() { GEOMETRY_RESTART_REQUIRED.store(true, Ordering::Release); }
+        })?;
+        *slot = Some(device.clone());
+        Ok(device)
+    }
+
+    /// Read worker health without creating a context. A sticky primary-context
+    /// fault requires retiring the process, even if all operation streams are gone.
+    pub fn geometry_worker_poisoned() -> bool {
+        GEOMETRY_RESTART_REQUIRED.load(Ordering::Acquire) || GEOMETRY_DEVICE.lock().expect("geometry device registry poisoned")
+            .as_ref().is_some_and(|d| d.state() == WorkerState::Poisoned)
+    }
+
+    pub fn note_geometry_error(error: &DriverError) {
+        if error.requires_worker_restart() {
+            GEOMETRY_RESTART_REQUIRED.store(true, Ordering::Release);
+            if let Some(device) = GEOMETRY_DEVICE.lock().expect("geometry device registry poisoned").as_ref() {
+                device.poisoned.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// Overlapping operations and their resident buffers on one worker share a stream.
+    /// The weak cache leaves destruction to the last operation outside thread teardown.
+    pub fn geometry_stream() -> DriverResult<(Arc<Self>, CuStream)> {
+        thread_local! {
+            static LANE: std::cell::RefCell<std::sync::Weak<StreamInner>> =
+                const { std::cell::RefCell::new(std::sync::Weak::new()) };
+        }
+        let device = Self::geometry_device()?;
+        let stream = LANE.with(|slot| -> DriverResult<CuStream> {
+            if let Some(inner) = slot.borrow().upgrade() { return Ok(CuStream { inner }); }
+            let stream = device.stream(Priority::Normal)?;
+            slot.replace(Arc::downgrade(&stream.inner));
+            Ok(stream)
+        })?;
+        Ok((device, stream))
+    }
+
+    pub fn load_cuda_source<'a>(&self, name: &'static str, source: &str, symbols: impl Iterator<Item=&'a str>, options: &[String]) -> DriverResult<LibraryId> {
         let mut libs = self.libraries.lock().expect("library registry poisoned");
-        if let Some(i) = libs.iter().position(|l| l.name == src.name) {
+        self.bind()?;
+        let symbols: Vec<_> = symbols.collect();
+        if let Some(i) = libs.iter().position(|l| l.name == name && l.source.as_ref() == source
+            && l.options == options && l.functions.iter().map(|(symbol, _)| symbol.as_str()).eq(symbols.iter().copied())) {
             return Ok(LibraryId(i as u32));
         }
-        let source = src.cuda_source.as_ref().ok_or_else(|| DriverError::NotFound(format!("library {} has no CUDA source", src.name)))?;
-        let ptx = nvrtc::compile(src.name, source, &self.arch, &src.options)?;
+        let symbols = symbols.into_iter().map(|s| CString::new(s)
+            .map_err(|_| DriverError::Compile("kernel symbol contains NUL".into())))
+            .collect::<DriverResult<Vec<_>>>()?;
+        let ptx = nvrtc::compile(name, source, &self.arch, options)?;
         self.bind()?;
         let image = CString::new(ptx).map_err(|_| DriverError::Compile("PTX contains NUL".into()))?;
         let mut module: sys::CUmodule = std::ptr::null_mut();
         unsafe {
-            fault::check(sys::cuModuleLoadData(&mut module, image.as_ptr() as *const c_void)).map_err(fault::driver)?;
+            fault::check(sys::cuModuleLoadData(&mut module, image.as_ptr() as *const c_void))
+                .map_err(fault::driver).inspect_err(|e| self.note_error(e))?;
         }
         let mut functions = Vec::new();
-        for (name, _) in src.cpu_kernels {
-            let cname = CString::new(*name).expect("kernel names are ASCII");
+        for cname in symbols {
+            let symbol = cname.to_str().expect("symbol originated from a Rust string");
             let mut f: sys::CUfunction = std::ptr::null_mut();
             let r = unsafe { sys::cuModuleGetFunction(&mut f, module, cname.as_ptr()) };
-            if r == sys::CUresult::CUDA_SUCCESS {
-                functions.push((name.to_string(), f));
-            } else {
-                return Err(DriverError::NotFound(format!("kernel {name} missing in CUDA library {}", src.name)));
+            if let Err(e) = fault::check(r) {
+                unsafe { let _ = sys::cuModuleUnload(module); }
+                if r == sys::CUresult::CUDA_ERROR_NOT_FOUND {
+                    return Err(DriverError::NotFound(format!("kernel {symbol} missing in CUDA library {name}")));
+                }
+                let error = fault::driver(e);
+                self.note_error(&error);
+                return Err(error);
             }
+            functions.push((symbol.to_owned(), f));
         }
-        libs.push(LoadedLibrary { name: src.name, module, functions });
+        libs.push(LoadedLibrary { name, source: source.into(), options: options.to_vec(), module, functions });
         Ok(LibraryId((libs.len() - 1) as u32))
     }
 
+}
+
+impl KernelExt for CudaDevice {
+    fn load_library(&self, src: &LibrarySource) -> DriverResult<LibraryId> {
+        let source = src.cuda_source.as_deref().ok_or_else(|| DriverError::NotFound(format!("library {} has no CUDA source", src.name)))?;
+        self.load_cuda_source(src.name, source, src.cpu_kernels.iter().map(|&(name,_)| name), &src.options)
+    }
     fn launch(&self, s: &CuStream, lib: LibraryId, kernel: &str, cfg: &LaunchConfig, params: &CuBuffer) -> Result<(), EnqueueError> {
         self.bind()?;
         let f = {

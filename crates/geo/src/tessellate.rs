@@ -35,19 +35,31 @@ pub struct Mesh {
 }
 
 impl Mesh {
+    pub fn indices_valid(&self) -> bool {
+        self.triangles.iter().flatten().all(|&i| (i as usize) < self.positions.len())
+    }
+
+    pub(crate) fn mass_origin(&self) -> V3 {
+        self.triangles.first().and_then(|t| self.positions.get(t[0] as usize)).copied().unwrap_or(V3::ZERO)
+    }
+
     /// Volume, area, centroid via the divergence theorem (closed meshes).
     pub fn mass_properties(&self) -> (f64, f64, V3) {
         let (mut vol, mut area) = (0.0, 0.0);
         let mut c = V3::ZERO;
+        let origin = self.mass_origin();
         for t in &self.triangles {
-            let (a, b, d) = (self.positions[t[0] as usize], self.positions[t[1] as usize], self.positions[t[2] as usize]);
+            let [Some(a), Some(b), Some(d)] = t.map(|i| self.positions.get(i as usize)) else {
+                return (f64::NAN, f64::NAN, V3::ZERO * f64::NAN);
+            };
+            let (a,b,d) = (*a-origin,*b-origin,*d-origin);
             let v6 = a.dot(b.cross(d));
             vol += v6;
             c = c + (a + b + d) * v6;
             area += 0.5 * (b - a).cross(d - a).norm();
         }
         let vol = vol / 6.0;
-        let c = if vol.abs() > 0.0 { c * (1.0 / (24.0 * vol)) } else { V3::ZERO };
+        let c = if vol.abs() > 0.0 { origin + c * (1.0 / (24.0 * vol)) } else { V3::ZERO };
         (vol, area, c)
     }
 
@@ -152,10 +164,61 @@ impl<'a> Builder<'a> {
 
 /// Tessellate a B-rep (closed bodies give watertight meshes).
 pub fn tessellate(b: &Brep, o: &TessOptions) -> Mesh {
-    let grid = patch::Grid::new(b,o);
+    try_tessellate(b, o).expect("CUDA worker failed during tessellation")
+}
+
+pub fn try_tessellate(b: &Brep, o: &TessOptions) -> agcad_driver::DriverResult<Mesh> {
+    Ok(tessellate_impl(b, o, false)?.mesh)
+}
+
+/// Immutable position ranges produced by this tessellation on the calling thread.
+pub struct PreparedMesh {
+    pub(crate) mesh: Mesh,
+    pub(crate) indices_valid: bool,
+    pub(crate) resident: Option<ResidentPoints>,
+}
+
+pub(crate) struct ResidentPoints {
+    // The buffer is allocated, consumed and freed on the same worker stream.
+    pub buffer: std::rc::Rc<agcad_driver_cuda::CuBuffer>,
+    pub ranges: Vec<PointRange>,
+}
+
+pub(crate) struct PointRange {
+    pub mesh_start: usize,
+    pub device_start: usize,
+    pub len: usize,
+}
+
+impl From<Mesh> for PreparedMesh {
+    fn from(mesh: Mesh) -> Self {
+        let indices_valid = mesh.indices_valid();
+        Self { mesh, indices_valid, resident: None }
+    }
+}
+
+pub fn tessellate_for_measurement(b: &Brep, o: &TessOptions) -> agcad_driver::DriverResult<PreparedMesh> {
+    tessellate_impl(b, o, crate::accelerator::cuda_mass_enabled())
+}
+
+fn tessellate_impl(b: &Brep, o: &TessOptions, retain:bool) -> agcad_driver::DriverResult<PreparedMesh> {
+    let grid = patch::Grid::new(b,o)?;
+    let mut ranges: Vec<PointRange> = Vec::new();
     let mut bl = Builder::new(b, &grid);
     for (fi, f) in b.faces.iter().enumerate() {
-        if grid.tessellate(fi,&mut bl) { continue; }
+        let start = bl.mesh.positions.len();
+        if grid.tessellate(fi,&mut bl) {
+            if retain && bl.mesh.positions.len() > start {
+                if let Some(src) = grid.points.as_ref().and_then(|points| points.offsets[fi]) {
+                    let len = bl.mesh.positions.len() - start;
+                    match ranges.last_mut() {
+                        Some(last) if last.mesh_start + last.len == start && last.device_start + last.len == src => last.len += len,
+                        _ => ranges.push(PointRange { mesh_start: start, device_start: src, len }),
+                    }
+                }
+            }
+            continue;
+        }
         let surf = &b.surfaces[f.surface as usize];
         if let Some(tris) = closed_periodic_grid(&mut bl, f, o) {
             for t in tris {
@@ -203,7 +266,8 @@ pub fn tessellate(b: &Brep, o: &TessOptions) -> Mesh {
         }
         let _ = o;
     }
-    bl.mesh
+    let resident = grid.points.filter(|_| !ranges.is_empty()).map(|p| ResidentPoints { buffer: std::rc::Rc::new(p.buffer), ranges });
+    Ok(PreparedMesh { mesh: bl.mesh, indices_valid: true, resident })
 }
 
 /// Structured grid for faces covering a whole sphere or torus (seam/pole loops). Seam

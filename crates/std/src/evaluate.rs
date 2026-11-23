@@ -12,29 +12,33 @@ use agcad_runtime::document::FeatureNode;
 use agcad_runtime::rebuild::{BuildContext, FeatureError, FeatureImpl, Product};
 use serde_json::json;
 
-fn mesh_of(ctx: &BuildContext<'_>, s: &Solid, sag: f64) -> Mesh { ctx.kernel.tessellate(s, &TessOptions { sag, ..Default::default() }) }
+fn mesh_of(ctx: &BuildContext<'_>, s: &Solid, sag: f64) -> agcad_driver::DriverResult<Mesh> { ctx.kernel.try_tessellate(s, &TessOptions { sag, ..Default::default() }) }
 
-/// Ray/triangle intersection (Möller–Trumbore); returns t > eps.
-fn ray_tri(o: V3, d: V3, a: V3, b: V3, c: V3) -> Option<f64> {
-    let (e1, e2) = (b - a, c - a);
-    let p = d.cross(e2);
-    let det = e1.dot(p);
-    if det.abs() < 1e-14 { return None; }
-    let inv = 1.0 / det;
-    let s = o - a;
-    let u = s.dot(p) * inv;
-    if !(0.0..=1.0).contains(&u) { return None; }
-    let q = s.cross(e1);
-    let v = d.dot(q) * inv;
-    if v < 0.0 || u + v > 1.0 { return None; }
-    let t = e2.dot(q) * inv;
-    if t > 1e-9 { Some(t) } else { None }
+const DEFAULT_DENSITY: f64 = 7.85e-6; // kg/mm3, steel
+const INERTIA_SAG: f64 = 1e-3;
+
+pub fn batch_mass(kernel: &dyn agcad_geo::kernel::ExactKernel, solids: &[&Solid], sag: f64) -> agcad_driver::DriverResult<Vec<agcad_geo::accelerator::MassProperties>> {
+    let options = TessOptions { sag, ..Default::default() };
+    let batch_size = if agcad_geo::accelerator::cuda_mass_enabled() { 16 } else { 1 };
+    let mut values = Vec::with_capacity(solids.len());
+    for chunk in solids.chunks(batch_size) {
+        let meshes = chunk.iter().map(|s| kernel.tessellate_for_measurement(s, &options))
+            .collect::<agcad_driver::DriverResult<Vec<_>>>()?;
+        values.extend(agcad_geo::accelerator::mass_properties(&meshes)?);
+    }
+    Ok(values)
 }
 
 pub struct EvalOp(pub &'static str);
 
 impl FeatureImpl for EvalOp {
     fn op(&self) -> &'static str { self.0 }
+    fn batch_objective(&self, kernel: &dyn agcad_geo::kernel::ExactKernel, solids: &[&Solid], field: &str) -> agcad_driver::DriverResult<Option<Vec<f64>>> {
+        if self.0 != "evaluate.measure_inertia" || !matches!(field, "volume" | "mass" | "area") { return Ok(None); }
+        Ok(Some(batch_mass(kernel, solids, INERTIA_SAG)?.into_iter().map(|(volume, area, _)| match field {
+            "area" => area, "mass" => volume * DEFAULT_DENSITY, _ => volume,
+        }).collect()))
+    }
     fn execute(&self, ctx: &mut BuildContext<'_>, n: &FeatureNode) -> Result<Product, FeatureError> {
         let first_solid = |ctx: &BuildContext<'_>| -> Result<Solid, FeatureError> {
             let v = arg(n, "items").or(arg(n, "body")).or(arg(n, "item")).ok_or_else(|| bad("no body input"))?;
@@ -43,9 +47,9 @@ impl FeatureImpl for EvalOp {
         match self.0 {
             "evaluate.measure_inertia" => {
                 let s = first_solid(ctx)?;
-                let density = num_or(ctx, n, "density", 7.85e-6)?; // kg/mm³ (steel) default
-                let m = mesh_of(ctx, &s, num_or(ctx, n, "sag", 1e-3)?);
-                let (vol, area, c) = m.mass_properties();
+                let density = num_or(ctx, n, "density", DEFAULT_DENSITY)?; // kg/mm³ (steel) default
+                let m = ctx.kernel.tessellate_for_measurement(&s, &TessOptions { sag: num_or(ctx, n, "sag", INERTIA_SAG)?, ..Default::default() })?;
+                let (vol, area, c) = agcad_geo::accelerator::mass_properties(&[m])?[0];
                 Ok(Product::Json(json!({ "volume": vol, "area": area, "mass": vol * density, "centroid": [c.x, c.y, c.z], "evidence": "bounded", "bound": "tessellation sag" })))
             }
             "evaluate.bounding_box" => {
@@ -65,24 +69,15 @@ impl FeatureImpl for EvalOp {
                 }
                 let s = first_solid(ctx)?;
                 let r = ctx.kernel.check(&s);
-                let m = mesh_of(ctx, &s, 0.01);
+                let m = mesh_of(ctx, &s, 0.01)?;
                 Ok(Product::Json(json!({ "valid": r.valid && m.is_watertight(), "topology_valid": r.valid, "watertight": m.is_watertight(), "euler": r.euler, "problems": r.problems, "evidence": "exact" })))
             }
             "evaluate.thickness_analysis" => {
                 // Inward rays from triangle centroids against the mesh; min hit distance.
                 let s = first_solid(ctx)?;
-                let m = mesh_of(ctx, &s, num_or(ctx, n, "sag", 0.05)?);
-                let mut tmin = f64::INFINITY;
-                let p = |i: u32| m.positions[i as usize];
+                let m = mesh_of(ctx, &s, num_or(ctx, n, "sag", 0.05)?)?;
                 let stride = (m.triangles.len() / 2000).max(1);
-                for t in m.triangles.iter().step_by(stride) {
-                    let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
-                    let nrm = (b - a).cross(c - a).normalized();
-                    let o = (a + b + c) * (1.0 / 3.0) - nrm * 1e-7;
-                    for u in &m.triangles {
-                        if let Some(d) = ray_tri(o, -nrm, p(u[0]), p(u[1]), p(u[2])) { tmin = tmin.min(d); }
-                    }
-                }
+                let tmin = agcad_geo::accelerator::wall_minimum(&m, stride)?;
                 let min_req = num_or(ctx, n, "min", 0.0)?;
                 Ok(Product::Json(json!({ "min": tmin, "passes": tmin >= min_req, "evidence": "sampled", "samples": m.triangles.len() / stride })))
             }
@@ -90,7 +85,7 @@ impl FeatureImpl for EvalOp {
                 let s = first_solid(ctx)?;
                 let build = vec3(ctx, req(n, "build_dir")?)?.normalized();
                 let max_angle = num(ctx, n, "max_angle")?;
-                let m = mesh_of(ctx, &s, 0.05);
+                let m = mesh_of(ctx, &s, 0.05)?;
                 let (mut area, mut total) = (0.0, 0.0);
                 let zmin = m.positions.iter().map(|q| q.dot(build)).fold(f64::INFINITY, f64::min);
                 for t in &m.triangles {
@@ -146,7 +141,7 @@ impl FeatureImpl for EvalOp {
                     let (a, b) = (items[i].brep().bbox(), items[j].brep().bbox());
                     if a.overlaps(&b, 0.0) {
                         let r = ctx.kernel.boolean(&items[i], &items[j], agcad_geo::region2d::BoolOp2::Intersection);
-                        let vol = match r { Ok(s) => mesh_of(ctx, &s, 0.05).mass_properties().0, Err(_) => f64::NAN };
+                        let vol = match r { Ok(s) => mesh_of(ctx, &s, 0.05)?.mass_properties().0, Err(_) => f64::NAN };
                         pairs.push(json!({ "a": i, "b": j, "volume": vol, "evidence": if vol.is_nan() { "unknown" } else { "bounded" } }));
                     }
                 }}

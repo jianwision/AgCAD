@@ -43,6 +43,12 @@ pub enum DriverError {
     Io(String),
 }
 
+impl DriverError {
+    pub fn requires_worker_restart(&self) -> bool {
+        matches!(self, Self::Enqueue(EnqueueError::Poisoned) | Self::Fault(DeviceFault { sticky: true, .. }))
+    }
+}
+
 pub type DriverResult<T> = Result<T, DriverError>;
 
 /// Worker health. A sticky fault moves a worker to `Poisoned`; the harness then kills the

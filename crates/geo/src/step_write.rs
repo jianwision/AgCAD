@@ -181,6 +181,10 @@ fn surface(w: &mut W, s: &Surface, opt: &StepOptions, report: &mut ExportReport)
 
 /// Encode one body as a complete STEP file.
 pub fn write_step(body: &Brep, opt: &StepOptions) -> (String, ExportReport) {
+    try_write_step(body, opt).expect("CUDA worker failed during STEP export")
+}
+
+pub fn try_write_step(body: &Brep, opt: &StepOptions) -> agcad_driver::DriverResult<(String, ExportReport)> {
     let mut report = ExportReport::default();
     let schema = match opt.schema { Schema::Ap242 => "AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF { 1 0 10303 442 1 1 4 }", Schema::Ap214 => "AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }" };
     let mut w = W { out: String::new(), n: 0 };
@@ -215,11 +219,13 @@ pub fn write_step(body: &Brep, opt: &StepOptions) -> (String, ExportReport) {
     let mut shell_v6 = vec![0.0f64; nshell];
     let mut shell_box = vec![crate::math::Aabb::EMPTY; nshell];
     if body.kind == BodyKind::Solid && body.shells.len() > 1 {
-        let m = crate::tessellate::tessellate(body, &Default::default());
+        let m = crate::tessellate::try_tessellate(body, &Default::default())?;
+        let mut origins = vec![None; nshell];
         for (t, &fi) in m.triangles.iter().zip(&m.face_of) {
             let si = body.faces[fi as usize].shell as usize;
             let (a, b, c) = (m.positions[t[0] as usize], m.positions[t[1] as usize], m.positions[t[2] as usize]);
-            shell_v6[si] += a.dot(b.cross(c));
+            let origin = *origins[si].get_or_insert(a);
+            shell_v6[si] += (a-origin).dot((b-origin).cross(c-origin));
             for q in [a, b, c] { shell_box[si].add(q); }
         }
     }
@@ -294,7 +300,7 @@ pub fn write_step(body: &Brep, opt: &StepOptions) -> (String, ExportReport) {
         "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('AgCAD export'),'2;1');\nFILE_NAME('{}.stp','{}',(''),(''),'AgCAD','AgCAD','');\nFILE_SCHEMA(('{}'));\nENDSEC;\nDATA;\n",
         esc(&opt.product_name), opt.timestamp, schema
     );
-    (format!("{header}{}ENDSEC;\nEND-ISO-10303-21;\n", w.out), report)
+    Ok((format!("{header}{}ENDSEC;\nEND-ISO-10303-21;\n", w.out), report))
 }
 
 #[cfg(test)]

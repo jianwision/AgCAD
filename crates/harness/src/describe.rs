@@ -8,7 +8,7 @@
 use agcad_geo::brep::Brep;
 use agcad_geo::math::V3;
 use agcad_geo::surface::Surface;
-use agcad_geo::tessellate::{tessellate, TessOptions};
+use agcad_geo::tessellate::{try_tessellate, TessOptions};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -22,8 +22,8 @@ fn canon(d: V3) -> V3 {
     if flip { d * -1.0 } else { d }
 }
 
-pub fn describe(b: &Brep, params: &BTreeMap<String, f64>) -> Value {
-    let m = tessellate(b, &TessOptions::default());
+pub fn describe(b: &Brep, params: &BTreeMap<String, f64>) -> agcad_driver::DriverResult<Value> {
+    let m = try_tessellate(b, &TessOptions::default())?;
     let (volume, area, centroid) = m.mass_properties();
     let bb = b.bbox();
     let v = b.validate();
@@ -64,7 +64,7 @@ pub fn describe(b: &Brep, params: &BTreeMap<String, f64>) -> Value {
         if concave { holes.push(d) } else { walls.push(d) }
     }
     let planes: Vec<Value> = planes.into_iter().map(|((nx, ny, nz, off), (n, names))| json!({ "normal": [nx as f64 / 1e4, ny as f64 / 1e4, nz as f64 / 1e4], "offset": off as f64 / 1e4, "faces": n, "names": names })).collect();
-    json!({
+    Ok(json!({
         "valid": v.valid, "problems": v.problems.iter().take(5).collect::<Vec<_>>(),
         "shells": b.shells.len(), "faces": b.faces.len(), "edges": b.edges.len(), "vertices": b.vertices.len(),
         "bounding_box": { "min": v6(bb.min), "max": v6(bb.max), "size": v6(bb.extent()) },
@@ -77,7 +77,7 @@ pub fn describe(b: &Brep, params: &BTreeMap<String, f64>) -> Value {
         } else { Some(v6(centroid)) }, "evidence": "bounded",
         "holes": holes, "cylindrical_walls": walls, "planar_faces": planes, "other_faces": other,
         "parameters": params,
-    })
+    }))
 }
 
 /// Semantic difference `after − before` of two descriptions.
@@ -111,7 +111,7 @@ mod tests {
         let mut p = Profile::circle(0.0, 0.0, 60.0);
         for k in 0..6 { let a = k as f64 * core::f64::consts::TAU / 6.0; p = p.with_hole(Profile::circle(40.0 * a.cos(), 40.0 * a.sin(), 4.5)); }
         let b = prism(&p, &Frame::WORLD, 12.0);
-        let d = describe(&b, &BTreeMap::new());
+        let d = describe(&b, &BTreeMap::new()).unwrap();
         let holes = d["holes"].as_array().unwrap();
         assert_eq!(holes.len(), 6, "{d:#}");
         assert!(holes.iter().all(|h| h["diameter"] == 9.0 && h["length"] == 12.0 && h["axis"] == json!([0.0, 0.0, 1.0])), "{d:#}");
@@ -119,7 +119,7 @@ mod tests {
         assert_eq!(d["cylindrical_walls"][0]["diameter"], 120.0);
         let mut p5 = Profile::circle(0.0, 0.0, 60.0);
         for k in 0..5 { let a = k as f64 * core::f64::consts::TAU / 6.0; p5 = p5.with_hole(Profile::circle(40.0 * a.cos(), 40.0 * a.sin(), 4.5)); }
-        let d5 = describe(&prism(&p5, &Frame::WORLD, 12.0), &BTreeMap::new());
+        let d5 = describe(&prism(&p5, &Frame::WORLD, 12.0), &BTreeMap::new()).unwrap();
         let df = diff(&d, &d5);
         assert_eq!(df["holes"]["removed"].as_array().unwrap().len(), 1, "{df:#}");
         assert!(df["volume_delta"].as_f64().unwrap() > 0.0);

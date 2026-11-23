@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::ops::{Add, Mul, Neg, Sub};
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Serialize, Deserialize, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct V3 {
     pub x: f64,
     pub y: f64,

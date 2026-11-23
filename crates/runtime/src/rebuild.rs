@@ -73,6 +73,15 @@ pub struct FeatureError {
     pub suggestion: Option<String>,
 }
 
+impl From<agcad_driver::DriverError> for FeatureError {
+    fn from(error: agcad_driver::DriverError) -> Self {
+        if error.requires_worker_restart() {
+            return Self::new(AgStatus::InvalidBaseline, format!("CUDA worker must be restarted: {error}"));
+        }
+        Self::new(AgStatus::InvalidParameter, error.to_string())
+    }
+}
+
 impl FeatureError {
     pub fn new(status: AgStatus, message: impl Into<String>) -> Self { FeatureError { status, message: message.into(), elements: vec![], suggestion: None } }
     pub fn with_elements(mut self, e: Vec<String>) -> Self { self.elements = e; self }
@@ -136,6 +145,8 @@ impl<'a> BuildContext<'a> {
 
 pub trait FeatureImpl: Send + Sync {
     fn op(&self) -> &'static str;
+    /// Optional default-argument numeric objective over a batch of study solids.
+    fn batch_objective(&self, _kernel: &dyn ExactKernel, _solids: &[&agcad_geo::kernel::Solid], _field: &str) -> agcad_driver::DriverResult<Option<Vec<f64>>> { Ok(None) }
     fn execute(&self, ctx: &mut BuildContext<'_>, node: &FeatureNode) -> Result<Product, FeatureError>;
 }
 

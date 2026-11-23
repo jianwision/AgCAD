@@ -50,9 +50,9 @@ pub fn evaluate_step(path: &std::path::Path) -> Result<Value, String> {
 
 /// Compare an AgCAD body against OCCT after STEP export (parity gate, spec 09/10).
 pub fn parity(body: &agcad_geo::Brep, rel_tol: f64) -> Result<Value, String> {
-    let m = agcad_geo::tessellate::tessellate(body, &agcad_geo::tessellate::TessOptions { sag: 1e-4, ..Default::default() });
+    let m = agcad_geo::tessellate::try_tessellate(body, &agcad_geo::tessellate::TessOptions { sag: 1e-4, ..Default::default() }).map_err(|e| e.to_string())?;
     let (v, a, _) = m.mass_properties();
-    let (txt, _) = agcad_geo::step_write::write_step(body, &Default::default());
+    let (txt, _) = agcad_geo::step_write::try_write_step(body, &Default::default()).map_err(|e| e.to_string())?;
     let path = std::env::temp_dir().join(format!("agcad-occt-{}.stp", std::process::id()));
     std::fs::write(&path, txt).map_err(|e| e.to_string())?;
     let o = evaluate_step(&path)?;
@@ -90,7 +90,7 @@ pub fn offset_volume(body: &agcad_geo::Brep, d: f64) -> Result<f64, String> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let script = dir.join("offset.py");
     std::fs::write(&script, OFFSET_PY).map_err(|e| e.to_string())?;
-    let (txt, _) = agcad_geo::step_write::write_step(body, &Default::default());
+    let (txt, _) = agcad_geo::step_write::try_write_step(body, &Default::default()).map_err(|e| e.to_string())?;
     let path = dir.join(format!("offset-{}-{}.stp", std::process::id(), d.to_bits()));
     std::fs::write(&path, txt).map_err(|e| e.to_string())?;
     let out = Command::new(python()).arg("-I").arg(&script).arg(&path).arg(format!("{d}")).output().map_err(|e| e.to_string())?;

@@ -213,17 +213,18 @@ impl NurbsSurface {
         let iv = find_span(self.nv - 1, self.dv, v, &self.kv);
         let bu = ders_basis(iu, u, self.du, 0, &self.ku);
         let bv = ders_basis(iv, v, self.dv, 0, &self.kv);
+        let origin = self.poles[0];
         let mut p = V3::ZERO;
         let mut weight = 0.;
         for (i, &a) in bu[0].iter().enumerate() {
             for (j, &b) in bv[0].iter().enumerate() {
                 let k = (iu - self.du + i) * self.nv + iv - self.dv + j;
                 let w = a * b * self.weights[k];
-                p = p + self.poles[k] * w;
+                p = p + (self.poles[k] - origin) * w;
                 weight += w;
             }
         }
-        p * (1. / weight)
+        origin + p * (1. / weight)
     }
     pub fn domain(&self) -> ((f64, f64), (f64, f64)) { ((self.ku[self.du], self.ku[self.nu]), (self.kv[self.dv], self.kv[self.nv])) }
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -239,6 +240,7 @@ impl NurbsSurface {
         let sv = find_span(self.nv - 1, q, v, &self.kv);
         let bu = ders_basis(su, u, p, 2, &self.ku);
         let bv = ders_basis(sv, v, q, 2, &self.kv);
+        let origin = self.poles[0];
         let mut aw = [[(V3::ZERO, 0.0); 3]; 3];
         for k in 0..=2.min(p) {
             for l in 0..=(2 - k).min(q) {
@@ -248,7 +250,7 @@ impl NurbsSurface {
                         let idx = (su - p + i) * self.nv + (sv - q + j);
                         let w = self.weights[idx];
                         let b = bu[k][i] * bv[l][j];
-                        acc.0 = acc.0 + self.poles[idx] * (b * w);
+                        acc.0 = acc.0 + (self.poles[idx] - origin) * (b * w);
                         acc.1 += b * w;
                     }
                 }
@@ -269,7 +271,7 @@ impl NurbsSurface {
                 s[k][l] = v2 * (1.0 / aw[0][0].1);
             }
         }
-        Jet { p: s[0][0], du: s[1][0], dv: s[0][1], duu: s[2][0], duv: s[1][1], dvv: s[0][2] }
+        Jet { p: origin + s[0][0], du: s[1][0], dv: s[0][1], duu: s[2][0], duv: s[1][1], dvv: s[0][2] }
     }
 }
 

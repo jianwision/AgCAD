@@ -271,7 +271,7 @@ pub fn parse_dfm(args: &Value, g: &Goal) -> Option<DfmSpec> {
 /// The survivor's surface mesh: its exact solid, or the certified implicit mesh.
 pub fn survivor_mesh(d: &agcad_dops::Design, goal: &Goal, prefer_cuda: bool) -> Result<agcad_geo::tessellate::Mesh, String> {
     match to_layered(d) {
-        Ok(s) => Ok(agcad_geo::tessellate::tessellate(&s.brep(), &Default::default())),
+        Ok(s) => Ok(agcad_geo::tessellate::try_tessellate(&s.brep(), &Default::default()).map_err(|e| e.to_string())?),
         Err(_) => Ok(deliver_implicit(d, goal, "dfm", prefer_cuda)?.mesh.mesh),
     }
 }
@@ -281,7 +281,7 @@ pub fn survivor_mesh(d: &agcad_dops::Design, goal: &Goal, prefer_cuda: bool) -> 
 pub fn render_design(d: &agcad_dops::Design, obs: &[f64], goal: &Goal, prefer_cuda: bool) -> Result<Vec<u8>, String> {
     use agcad_harness::render::{png, rasterize, Mode, View};
     let mesh = match to_layered(d) {
-        Ok(s) => agcad_geo::tessellate::tessellate(&s.brep(), &Default::default()),
+        Ok(s) => agcad_geo::tessellate::try_tessellate(&s.brep(), &Default::default()).map_err(|e| e.to_string())?,
         Err(reason) => { let _ = (obs, reason); deliver_implicit(d, goal, "render", prefer_cuda)?.mesh.mesh }
     };
     let (w, h) = (256, 256);
@@ -293,7 +293,7 @@ pub fn render_design(d: &agcad_dops::Design, obs: &[f64], goal: &Goal, prefer_cu
 /// Exact check of a survivor (escalation) without touching the document.
 pub fn exact_volume(d: &agcad_dops::Design) -> Result<f64, String> {
     let s = to_layered(d)?;
-    Ok(agcad_geo::tessellate::tessellate(&s.brep(), &Default::default()).mass_properties().0)
+    Ok(agcad_geo::tessellate::try_tessellate(&s.brep(), &Default::default()).map_err(|e| e.to_string())?.mass_properties().0)
 }
 
 pub use agcad_dops::lower::raise as raise_design;

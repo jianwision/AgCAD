@@ -444,9 +444,15 @@ fn check_rails(patches: &[NurbsSurface], heights: &[f64]) -> Result<(), FeatureE
         rails.push(c);
     }
     let d = rails[0].degree;
+    let spans = (rails[0].poles.len() - 1) / d;
+    let candidates = agcad_geo::accelerator::rail_candidates(&rails, TOL)?;
     for (i, a) in rails.iter().enumerate() {
         for (j, b) in rails[..i].iter().enumerate() {
             for start in (0..a.poles.len() - 1).step_by(d) {
+                let pair = i * (i - 1) / 2 + j;
+                if candidates.as_ref().is_some_and(|keep| keep[pair * spans + start / d] == 0) {
+                    continue;
+                }
                 // Multiply the rational difference by its two positive denominators.
                 // Dividing each Bernstein coefficient by the corresponding product
                 // weight gives a rational curve with the same convex-hull property.

@@ -73,7 +73,7 @@ fn geo(ctx: &BuildContext<'_>, v: &Value) -> Result<Geometry, FeatureError> {
     match ctx.product(v)? {
         Product::Other(o) => o.downcast_ref::<Geometry>().cloned().ok_or_else(|| bad("expected procedural geometry")),
         Product::Mesh(m) => Ok(Geometry::from_mesh(m)),
-        Product::Solid(s) => Ok(Geometry::from_mesh(&ctx.kernel.tessellate(s, &TessOptions::default()))),
+        Product::Solid(s) => Ok(Geometry::from_mesh(&ctx.kernel.try_tessellate(s, &TessOptions::default())?)),
         Product::Implicit(i) => Ok(Geometry::from_mesh(&agcad_std::mesh::implicit_to_mesh(i, (i.bounds.extent().norm() / 64.0).max(0.05))?)),
         other => Err(bad(format!("expected geometry, got {other:?}"))),
     }

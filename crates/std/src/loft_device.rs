@@ -92,7 +92,7 @@ fn dispatch(
     stride: usize,
 ) -> DriverResult<(Vec<f64>, &'static str)> {
     with_default(|s| match &s.device {
-        DeviceChoice::Cuda(d) => launch(&**d, input, count, name, stride).map(|p| (p, "cuda")),
+        DeviceChoice::Cuda(d) => launch(&**d, input, count, name, stride).inspect_err(|e| d.note_error(e)).map(|p| (p, "cuda")),
         DeviceChoice::CpuReference(d) => {
             launch(&**d, input, count, name, stride).map(|p| (p, "cpu-reference"))
         }

@@ -137,15 +137,15 @@ impl Server {
         Server { session: HarnessSession::new(requirements, part), branch: "main".into(), goal: None, load: None, dfm: None, rollouts: 0, implicit: Default::default(), candidates: Vec::new(), device_cache: Default::default() }
     }
 
-    fn current_mesh(&self) -> Option<agcad_geo::tessellate::Mesh> {
-        if let Some(im) = self.implicit.get(&self.branch) { return Some(im.mesh.mesh.clone()); }
-        let geometry = self.session.accepted_bodies.get(&self.branch)?;
-        if let Some(mesh) = &geometry.mesh { return Some(mesh.clone()); }
-        match geometry.exact.as_ref()? {
-            Product::Sheet(b) => Some(agcad_geo::tessellate::tessellate(b, &Default::default())),
-            Product::Solid(s) => Some(self.session.kernel.tessellate(s, &Default::default())),
-            _ => None,
-        }
+    fn current_mesh(&self) -> Result<Option<agcad_geo::tessellate::Mesh>, String> {
+        if let Some(im) = self.implicit.get(&self.branch) { return Ok(Some(im.mesh.mesh.clone())); }
+        let Some(geometry) = self.session.accepted_bodies.get(&self.branch) else { return Ok(None) };
+        if let Some(mesh) = &geometry.mesh { return Ok(Some(mesh.clone())); }
+        match geometry.exact.as_ref() {
+            Some(Product::Sheet(b)) => agcad_geo::tessellate::try_tessellate(b, &Default::default()),
+            Some(Product::Solid(s)) => self.session.kernel.try_tessellate(s, &Default::default()),
+            _ => return Ok(None),
+        }.map(Some).map_err(|e| e.to_string())
     }
 
     /// Escalate a survivor to a new branch of Part Design features: deep certification on its
@@ -180,6 +180,14 @@ impl Server {
     }
 
     pub fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value, String> {
+        agcad_geo::accelerator::ensure_worker_healthy().map_err(|e| e.to_string())?;
+        let (result, events) = agcad_geo::accelerator::capture(|| self.call_tool_inner(name,args));
+        self.session.trace_geometry(events);
+        agcad_geo::accelerator::ensure_worker_healthy().map_err(|e| e.to_string())?;
+        result
+    }
+
+    fn call_tool_inner(&mut self, name: &str, args: &Value) -> Result<Value, String> {
         let catalog = Catalog::global();
         Ok(match name {
             "get_feature_table" => {
@@ -236,14 +244,14 @@ impl Server {
             "describe" => {
                 let accepted = self.session.accepted_bodies.get(&self.branch).ok_or("no accepted geometry")?;
                 let body = accepted.exact.as_ref().and_then(Product::exact_body).ok_or("no accepted exact body")?;
-                let now = agcad_harness::describe::describe(&body, &accepted.parameters);
+                let now = agcad_harness::describe::describe(&body, &accepted.parameters).map_err(|e| e.to_string())?;
                 match args.get("against_version").and_then(Value::as_u64) {
                     None => now,
                     Some(vid) => {
                         let ver = self.session.doc.versions.get(vid as usize).ok_or(format!("no version {vid}"))?;
                         let old = agcad_runtime::rebuild::update(&ver.state, &self.session.registry, self.session.kernel.as_ref(), Default::default(), vec![]);
                         let before = match self.session.selected_body(&old).and_then(|(_,p)| p.exact_body()) {
-                            Some(b) => agcad_harness::describe::describe(&b, &agcad_harness::session::parameter_values(&ver.state, &old)),
+                            Some(b) => agcad_harness::describe::describe(&b, &agcad_harness::session::parameter_values(&ver.state, &old)).map_err(|e| e.to_string())?,
                             None => json!({}),
                         };
                         json!({ "current": now, "against_version": vid, "diff": agcad_harness::describe::diff(&before, &now) })
@@ -251,18 +259,18 @@ impl Server {
                 }
             }
             "dfm" => {
-                let m = self.current_mesh().ok_or("nothing to analyse")?;
+                let m = self.current_mesh()?.ok_or("nothing to analyse")?;
                 json!(dfm_report(&m, args)?)
             }
             "render" if args.get("mode").and_then(Value::as_str) == Some("raytraced") => {
-                let m = self.current_mesh().ok_or("nothing to render")?;
+                let m = self.current_mesh()?.ok_or("nothing to render")?;
                 let (t, why) = agcad_raytrace::best(&m);
                 let (w, h) = (512, 512);
                 let png = agcad_raytrace::analysis::render(&*t, &m, w, h)?;
                 json!({ "png_base64": b64(&png), "width": w, "height": h, "tracer": t.name(), "fallback_reason": why })
             }
             "render" => {
-                let m = self.current_mesh().ok_or("nothing to render")?;
+                let m = self.current_mesh()?.ok_or("nothing to render")?;
                 let view = match args.get("view").and_then(Value::as_str) { Some("top") => View::Top, Some("front") => View::Front, Some("right") => View::Right, _ => View::Iso };
                 let mode = if args.get("mode").and_then(Value::as_str) == Some("face_ids") { Mode::FaceIds } else { Mode::Shaded };
                 let (w, h) = (512, 512);
@@ -270,7 +278,7 @@ impl Server {
             }
             "export" => {
                 let fmt = args.get("format").and_then(Value::as_str).unwrap_or("step_ap242");
-                let mesh = || self.current_mesh().ok_or("nothing to export");
+                let mesh = || self.current_mesh()?.ok_or_else(|| "nothing to export".to_owned());
                 let _ = std::fs::create_dir_all(&self.session.out_dir);
                 let path = self.session.out_dir.join(match fmt { "stl" => "part.stl", "3mf" => "part.3mf", _ => "part.stp" });
                 let bytes = match fmt {
@@ -282,7 +290,7 @@ impl Server {
                         }
                         let body = self.session.accepted_bodies.get(&self.branch).and_then(|a| a.exact.as_ref())
                             .and_then(Product::exact_body).ok_or("no accepted exact body to export")?;
-                        agcad_geo::step_write::write_step(&body, &Default::default()).0.into_bytes()
+                        agcad_geo::step_write::try_write_step(&body, &Default::default()).map_err(|e| e.to_string())?.0.into_bytes()
                     }
                 };
                 std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
@@ -485,6 +493,7 @@ impl Server {
                 Err(e) => Some(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": e.to_string() } })),
             };
             if let Some(r) = resp { writeln!(out, "{r}")?; out.flush()?; }
+            agcad_geo::accelerator::ensure_worker_healthy().map_err(std::io::Error::other)?;
         }
         Ok(())
     }

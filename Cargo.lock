@@ -115,6 +115,7 @@ name = "agcad-geo"
 version = "0.1.0"
 dependencies = [
  "agcad-driver",
+ "agcad-driver-cuda",
  "agcad-ir",
  "agcad-kernels",
  "agcad-kernels-cuda",

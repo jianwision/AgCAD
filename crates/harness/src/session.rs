@@ -87,6 +87,24 @@ impl HarnessSession {
 
     /// Run a program on `branch` (AG-06-001: requirements revision must match).
     pub fn run_program(&mut self, branch: &str, p: &Program, catalog: &Catalog) -> Result<ProgramOutcome, (AgStatus, String)> {
+        Self::check_worker()?;
+        let (out, events) = agcad_geo::accelerator::capture(|| self.run_program_inner(branch, p, catalog));
+        self.trace_geometry(events);
+        Self::check_worker()?;
+        out
+    }
+
+    fn check_worker() -> Result<(), (AgStatus, String)> {
+        agcad_geo::accelerator::ensure_worker_healthy().map_err(|e| (AgStatus::InvalidBaseline, e.to_string()))
+    }
+
+    pub fn trace_geometry(&mut self, events: Vec<agcad_geo::accelerator::Dispatch>) {
+        for event in events {
+            self.trace.push(TraceEvent::GeometryWork { operation: event.operation.into(), backend: event.backend.into(), work: event.work, fallback: event.error });
+        }
+    }
+
+    fn run_program_inner(&mut self, branch: &str, p: &Program, catalog: &Catalog) -> Result<ProgramOutcome, (AgStatus, String)> {
         self.requirements.check_rev(p.requirements_rev).map_err(|s| (s, format!("program targets requirements rev {}, current is {}", p.requirements_rev, self.requirements.rev)))?;
         let diags = agcad_ir::verify::verify(p, catalog);
         if let Some(d) = diags.first() { return Err((d.status, format!("{}: {}", d.stmt, d.message))); }
@@ -145,6 +163,7 @@ impl HarnessSession {
                 Err(e) => report.study = Some(json!({ "error": e })),
             }
         }
+        Self::check_worker()?;
         if want_save {
             if let Err((st, msg)) = self.save_version(branch, &save_label) {
                 self.trace.push(TraceEvent::Note { text: format!("save_version rejected: {st} {msg}") });
@@ -243,7 +262,8 @@ impl HarnessSession {
         self.last_update = Some(res);
         let checks = self.run_checks(branch, phase);
         let passed = checks.iter().all(|c| c.verdict == Verdict::Pass);
-        let accepted = ok && passed;
+        let healthy = Self::check_worker().is_ok();
+        let accepted = healthy && ok && passed;
         self.last_attempt = Some((branch.to_owned(), revision, accepted));
         if accepted {
             let u = self.last_update.as_ref().unwrap();
@@ -262,7 +282,7 @@ impl HarnessSession {
             self.trace.push(TraceEvent::Check { requirement: c.requirement.clone(), verdict: format!("{:?}", c.verdict), value: c.value.as_f64().unwrap_or(f64::NAN), bound: f64::NAN, evidence: format!("{:?}", c.evidence), checker_version: c.checker_version });
         }
         let _ = self.meter.charge_time(&self.requirements.budget, 0.0, t0.elapsed().as_secs_f64() * 1000.0);
-        let status = if !ok { "FEATURE_FAILED" } else if !passed { AgStatus::RequirementFailed.name() } else { AgStatus::Accepted.name() };
+        let status = if !healthy { AgStatus::InvalidBaseline.name() } else if !ok { "FEATURE_FAILED" } else if !passed { AgStatus::RequirementFailed.name() } else { AgStatus::Accepted.name() };
         UpdateReport {
             status: status.into(), revision, requirements_rev: self.requirements.rev, workspace_state: if accepted { "valid".into() } else { "invalid".into() },
             features, checks, budget: self.meter.remaining(&self.requirements.budget), unsupported, topology_classes: None, proxy_fidelity: None, study: None,
@@ -279,11 +299,13 @@ impl HarnessSession {
 
     /// `document.save_version`: save-phase checks must pass; otherwise the workspace is kept.
     pub fn save_version(&mut self, branch: &str, label: &str) -> Result<u32, (AgStatus, String)> {
+        Self::check_worker()?;
         if !self.current_attempt(branch) {
             let status = if self.last_update.as_ref().is_some_and(|u| !u.ok()) { AgStatus::TopologyFailed } else { AgStatus::RequirementFailed };
             return Err((status, "workspace has a rejected update".into()));
         }
         let checks = self.run_checks(branch, Phase::Save);
+        Self::check_worker()?;
         if let Some(f) = checks.iter().find(|c| c.verdict != Verdict::Pass) {
             return Err((AgStatus::RequirementFailed, format!("{} {:?} (value {}); workspace kept for repair", f.requirement, f.verdict, f.value)));
         }
@@ -299,7 +321,7 @@ impl HarnessSession {
     pub fn finish(&mut self, branch: &str) -> DeliveryReport {
         let accepted = self.current_attempt(branch);
         let checks = self.run_checks(branch, Phase::Finish);
-        let passed = accepted && checks.iter().all(|c| c.verdict == Verdict::Pass);
+        let passed = accepted && Self::check_worker().is_ok() && checks.iter().all(|c| c.verdict == Verdict::Pass);
         let mut files = Vec::new();
         let mut delivered = true;
         if let Some(u) = self.last_update.as_ref().filter(|_| passed) {

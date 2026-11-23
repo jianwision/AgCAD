@@ -98,8 +98,8 @@ impl FeatureImpl for MeshOp {
                 let item = list(req(n, "items")?).first().ok_or_else(|| bad("no items"))?;
                 let o = TessOptions { sag: num_or(ctx, n, "sag", 0.01)?, angle: num_or(ctx, n, "angle", 0.2)?, ..Default::default() };
                 let mesh = match ctx.product(item)? {
-                    Product::Sheet(b) => agcad_geo::tessellate::tessellate(b, &o),
-                    Product::Solid(s) => ctx.kernel.tessellate(s, &o),
+                    Product::Sheet(b) => agcad_geo::tessellate::try_tessellate(b, &o)?,
+                    Product::Solid(s) => ctx.kernel.try_tessellate(s, &o)?,
                     _ => return Err(bad("tessellation requires a solid or sheet")),
                 };
                 Ok(Product::Mesh(mesh))

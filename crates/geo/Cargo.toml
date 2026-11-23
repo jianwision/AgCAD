@@ -8,6 +8,7 @@ description = "Exact geometry kernel (GPU-native): curves, surfaces, B-rep, SSI,
 
 [dependencies]
 agcad-driver = { workspace = true }
+agcad-driver-cuda = { workspace = true }
 agcad-ir = { workspace = true }
 agcad-kernels = { workspace = true }
 agcad-kernels-cuda = { workspace = true }

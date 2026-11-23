@@ -238,3 +238,267 @@ fn sheet_inspection_mesh_and_open_blend_chaining() {
     assert!(description["volume"].is_null());
     assert!(description["area"].as_f64().unwrap() > 0.);
 }
+
+/// Run each backend in a fresh process so other tests and CUDA sessions keep their policy.
+fn translated_patch(t: f64) -> agcad_geo::brep::Brep {
+    use agcad_geo::{
+        brep::BodyKind,
+        curve::Curve,
+        math::v3,
+        nurbs::{NurbsCurve, NurbsSurface},
+        surface::Surface,
+    };
+    let k = vec![0., 0., 0., 0., 1., 2., 3., 4., 5., 6., 6., 6., 6.];
+    let mut s = NurbsSurface {
+        du: 3,
+        dv: 3,
+        nu: 9,
+        nv: 9,
+        ku: k.clone(),
+        kv: k.clone(),
+        poles: vec![],
+        weights: vec![1.; 81],
+    };
+    for i in 0..9 {
+        for j in 0..9 {
+            if i > 0 && j > 0 && i < 8 && j < 8 {
+                s.weights[9 * i + j] = 0.65 + ((i * 7 + j * 5) % 7) as f64 * 0.23;
+            }
+            let h = if i * j == 0 || i == 8 || j == 8 {
+                0.
+            } else {
+                ((3 * i + j) as f64).sin() * 1.7
+            };
+            s.poles
+                .push(v3(t + i as f64 * 2., -2. * t + j as f64, 3. * t + h));
+        }
+    }
+    let mut b = agcad_geo::brep::Brep::new(BodyKind::Sheet);
+    let sh = b.add_shell(false);
+    let pts = [0, 72, 80, 8].map(|idx| b.add_vertex(s.poles[idx]));
+    let mut edges = vec![];
+    for side in 0..4 {
+        let ids: Vec<usize> = (0..9)
+            .map(|i| match side {
+                0 => 9 * i,
+                1 => 72 + i,
+                2 => (8 - i) * 9 + 8,
+                _ => 8 - i,
+            })
+            .collect();
+        let c = NurbsCurve {
+            degree: 3,
+            knots: k.clone(),
+            poles: ids.iter().map(|&i| s.poles[i]).collect(),
+            weights: vec![1.; 9],
+        };
+        let x = b.add_curve(Curve::Nurbs(c));
+        edges.push((
+            b.add_edge(
+                x,
+                pts[side],
+                pts[(side + 1) % 4],
+                0.,
+                6.,
+                format!("e{side}"),
+            ),
+            true,
+        ));
+    }
+    let id = b.add_surface(Surface::Nurbs(s));
+    b.add_face(id, true, sh, &edges, &[], "patch", [0., 6., 0., 6.]);
+    b
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn geometry_batches_match_host() {
+    use agcad_geo::{accelerator, math::V3, tessellate::Mesh};
+    use agcad_runtime::rebuild::Product;
+    use std::{fs, process::Command};
+    if let Some(output) = std::env::var_os("AGCAD_PARITY_OUTPUT") {
+        let backend = std::env::var("AGCAD_GEOMETRY_BACKEND").unwrap();
+        let mut s = server("SolidBody", None);
+        let mut ops = circles(
+            "part.multi_sections_solid",
+            "loft",
+            &[(0., 3.), (5., 7.), (10., 3.)],
+        );
+        ops.push(feature(
+            "inertia",
+            "evaluate.measure_inertia",
+            json!({"items":["%loft"]}),
+        ));
+        ops.push(feature(
+            "wall",
+            "evaluate.thickness_analysis",
+            json!({"body":"%loft","min":"0.5 mm"}),
+        ));
+        assert_eq!(run(&mut s, ops)["report"]["status"], "ACCEPTED");
+        let events = &s.session.trace.events;
+        for operation in [
+            "loft_rail_pairs",
+            "nurbs_curvature",
+            "nurbs_interior_points",
+            "mesh_mass_properties",
+            "wall_thickness",
+        ] {
+            assert!(events.iter().any(|e| matches!(e, agcad_trace::TraceEvent::GeometryWork {operation: op,backend: b, fallback:None,..} if op==operation && (backend=="auto" || b==&backend))), "{operation}: {events:?}");
+        }
+        let products = &s.session.last_update.as_ref().unwrap().products;
+        let report = |id: &str| match &products[&s.session.ids["main"][id]] {
+            Product::Json(v) => v.clone(),
+            _ => panic!("missing measure"),
+        };
+        let body = s.session.accepted_bodies["main"]
+            .exact
+            .as_ref()
+            .unwrap()
+            .exact_body()
+            .unwrap();
+        let mesh = tessellate(
+            &body,
+            &TessOptions {
+                sag: 0.03,
+                ..Default::default()
+            },
+        );
+        assert!(mesh.is_watertight());
+        let mut inverted = mesh.clone();
+        for tri in &mut inverted.triangles {
+            tri.swap(0, 1);
+        }
+        let properties = accelerator::mass_properties(&[
+            mesh.clone().into(),
+            Mesh::default().into(),
+            inverted.into(),
+        ])
+        .unwrap();
+        assert_eq!(properties[1], (0., 0., V3::ZERO));
+        assert!((properties[0].0 + properties[2].0).abs() < 1e-8);
+        assert!(properties[0].2.dist(properties[2].2) < 1e-10);
+        // Parallel faces far from the origin exercise the FP64 ray bias and a no-hit ray.
+        let origin = agcad_geo::math::v3(100_000., -200_000., 30_000.);
+        let lower = [origin, origin + V3::X, origin + V3::Y];
+        let mut plate = Mesh::default();
+        plate.positions.extend(lower);
+        plate
+            .positions
+            .extend(lower.map(|point| point + V3::Z * 0.125));
+        plate.triangles.extend([[0, 2, 1], [3, 4, 5]]);
+        assert!((accelerator::wall_minimum(&plate, 1).unwrap() - (0.125 - 1e-7)).abs() < 5e-12);
+        plate.triangles.pop();
+        assert!(accelerator::wall_minimum(&plate, 1).unwrap().is_infinite());
+        if backend == "cuda" {
+            let rail = |x| {
+                agcad_geo::nurbs::NurbsCurve::bezier(vec![
+                    agcad_geo::math::v3(x, 0., 0.),
+                    agcad_geo::math::v3(x, 0., 1.),
+                ])
+            };
+            let tol = 1e-6;
+            let flags = accelerator::rail_candidates(&[rail(0.), rail(1.), rail(tol)], tol)
+                .unwrap()
+                .unwrap();
+            assert_eq!(flags, [0, 1, 0]);
+        }
+        let options = TessOptions {
+            sag: 1.0959940203,
+            ..Default::default()
+        };
+        let patch = translated_patch(10_000_000.);
+        let (translated, dispatch) = accelerator::capture(|| tessellate(&patch, &options));
+        assert!(dispatch.iter().all(|event| event.error.is_none()));
+        if backend != "auto" {
+            assert!(
+                dispatch
+                    .iter()
+                    .any(|e| e.operation == "nurbs_curvature" && e.backend == backend)
+            );
+        }
+        let mut cube = tessellate(
+            &agcad_geo::builders::block(V3::ZERO, V3::X + V3::Y + V3::Z),
+            &Default::default(),
+        );
+        let shift = agcad_geo::math::v3(1e8, -2e8, 3e8);
+        for point in &mut cube.positions {
+            *point = *point + shift;
+        }
+        let (batch, dispatch) = accelerator::capture(|| {
+            accelerator::mass_properties(&[Mesh::default().into(), cube.clone().into()]).unwrap()
+        });
+        assert!(
+            dispatch
+                .iter()
+                .any(|e| e.operation == "mesh_mass_properties"
+                    && e.error.is_none()
+                    && (backend == "auto" || e.backend == backend))
+        );
+        assert_eq!(batch[1], (1., 6., shift + (V3::X + V3::Y + V3::Z) * 0.5));
+        assert_eq!(batch[1], cube.mass_properties());
+        cube.triangles[0][0] = u32::MAX;
+        assert!(accelerator::wall_minimum(&cube, 1).is_err());
+        assert!(accelerator::mass_properties(&[cube.into()]).is_err());
+        let result = json!({"patch_triangles":translated.triangles, "mesh":mesh,"inertia":report("inertia"),"wall":report("wall"),"batch":properties});
+        fs::write(output, serde_json::to_vec(&result).unwrap()).unwrap();
+        return;
+    }
+    let reference = |backend| {
+        let path = std::env::temp_dir().join(format!(
+            "agcad-geometry-{}-{backend}.json",
+            std::process::id()
+        ));
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "geometry_batches_match_host", "--ignored"])
+            .env("AGCAD_GEOMETRY_BACKEND", backend)
+            .env("AGCAD_PARITY_OUTPUT", &path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let result: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        fs::remove_file(path).unwrap();
+        result
+    };
+    let host = reference("host");
+    let cuda = reference("cuda");
+    let auto = reference("auto");
+    for result in [&cuda, &auto] {
+        assert_eq!(host["patch_triangles"], result["patch_triangles"]);
+        let masses = |v: &Value| {
+            serde_json::from_value::<Vec<accelerator::MassProperties>>(v["batch"].clone()).unwrap()
+        };
+        for ((hv, ha, hc), (v, a, c)) in masses(&host).into_iter().zip(masses(result)) {
+            assert!((hv - v).abs() < 1e-8 && (ha - a).abs() < 1e-8 && hc.dist(c) < 1e-10);
+        }
+    }
+    let as_mesh = |v: &Value| serde_json::from_value::<Mesh>(v["mesh"].clone()).unwrap();
+    let (a, b) = (as_mesh(&host), as_mesh(&cuda));
+    assert_eq!(a.triangles, b.triangles);
+    assert_eq!(a.face_of, b.face_of);
+    assert_eq!(a.positions.len(), b.positions.len());
+    assert!(
+        a.positions
+            .iter()
+            .zip(b.positions)
+            .all(|(p, q)| p.dist(q) < 1e-10)
+    );
+    for (op, field) in [
+        ("wall", "min"),
+        ("inertia", "area"),
+        ("inertia", "volume"),
+        ("inertia", "mass"),
+    ] {
+        let value = host[op][field].as_f64().unwrap();
+        assert!((value - cuda[op][field].as_f64().unwrap()).abs() < 1e-10 * value.abs().max(1.));
+    }
+    assert_eq!(host["wall"]["samples"], cuda["wall"]["samples"]);
+    assert_eq!(host["wall"]["passes"], cuda["wall"]["passes"]);
+    for k in 0..3 {
+        assert!(
+            (host["inertia"]["centroid"][k].as_f64().unwrap()
+                - cuda["inertia"]["centroid"][k].as_f64().unwrap())
+            .abs()
+                < 1e-10
+        );
+    }
+}

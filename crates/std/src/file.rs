@@ -4,7 +4,7 @@
 
 use crate::util::*;
 use agcad_driver::AgStatus;
-use agcad_geo::step_write::{write_step, ReceiverProfile, Schema, StepOptions};
+use agcad_geo::step_write::{try_write_step, ReceiverProfile, Schema, StepOptions};
 use agcad_geo::tessellate::{Mesh, TessOptions};
 use agcad_geo::threemf::{write_3mf, ThreeMfObject};
 use agcad_runtime::document::FeatureNode;
@@ -34,8 +34,8 @@ pub fn stl_binary(m: &Mesh, name: &str) -> Vec<u8> {
 fn mesh_from(ctx: &BuildContext<'_>, v: &agcad_ir::Value, res: f64) -> Result<Mesh, FeatureError> {
     match ctx.product(v)? {
         Product::Mesh(m) => Ok(m.clone()),
-        Product::Sheet(b) => Ok(agcad_geo::tessellate::tessellate(b, &TessOptions { sag: res, ..Default::default() })),
-        Product::Solid(s) => Ok(ctx.kernel.tessellate(s, &TessOptions { sag: res, ..Default::default() })),
+        Product::Sheet(b) => Ok(agcad_geo::tessellate::try_tessellate(b, &TessOptions { sag: res, ..Default::default() })?),
+        Product::Solid(s) => Ok(ctx.kernel.try_tessellate(s, &TessOptions { sag: res, ..Default::default() })?),
         Product::Implicit(i) => crate::mesh::implicit_to_mesh(i, res),
         other => Err(bad(format!("cannot export {other:?} as a mesh"))),
     }
@@ -63,9 +63,9 @@ impl FeatureImpl for FileOp {
                             let normal = (p[1] - p[0]).cross(p[2] - p[0]).normalized();
                             (p[3] - p[0]).dot(normal).abs() > agcad_geo::brep::DEFAULT_LINEAR_TOL
                         });
-                        let validation = (!warped).then(|| ctx.kernel.tessellate(s, &TessOptions {
+                        let validation = (!warped).then(|| ctx.kernel.try_tessellate(s, &TessOptions {
                             sag: 1e-3, ..Default::default()
-                        }).mass_properties());
+                        }).map(|m| m.mass_properties())).transpose()?;
                         (body, validation)
                     }
                     other => return Err(bad(format!("cannot export {other:?} to STEP"))),
@@ -77,7 +77,7 @@ impl FeatureImpl for FileOp {
                     validation,
                     ..Default::default()
                 };
-                let (txt, rep) = write_step(&b, &opt);
+                let (txt, rep) = try_write_step(&b, &opt)?;
                 let mut warnings = rep.warnings;
                 if opt.profile == ReceiverProfile::SolidWorks { warnings.push("solidworks profile is experimental until verified on a SolidWorks CI runner (AG-18-007)".into()); }
                 FileBytes { path, bytes: txt.into_bytes(), warnings }

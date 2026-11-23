@@ -31,18 +31,19 @@ pub struct Session {
 
 impl Session {
     pub fn open(ordinal: usize) -> Result<Session, DriverError> {
+        Self::from_device(if ordinal == 0 { CudaDevice::geometry_device() } else { CudaDevice::open(ordinal) })
+    }
+    fn from_device(opened: Result<Arc<CudaDevice>, DriverError>) -> Result<Session, DriverError> {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let device = match CudaDevice::open(ordinal) {
+        let device = match opened {
             Ok(d) => DeviceChoice::Cuda(d),
+            Err(e) if e.requires_worker_restart() => return Err(e),
             Err(e) => {
                 if std::env::var("AGCAD_ALLOW_CPU_REFERENCE").as_deref() == Ok("1") {
                     DeviceChoice::CpuReference(CpuDevice::new())
                 } else {
-                    return Err(match e {
-                        DriverError::Enqueue(x) => DriverError::Enqueue(x),
-                        other => DriverError::Enqueue(EnqueueError::Unsupported(Box::leak(format!("no CUDA device available ({other}); set AGCAD_ALLOW_CPU_REFERENCE=1 for reference/testing only").into_boxed_str()))),
-                    });
+                    return Err(e);
                 }
             }
         };
@@ -61,9 +62,10 @@ thread_local! {
 
 /// Run `f` with the thread's default session (created on first use, device 0).
 pub fn with_default<R>(f: impl FnOnce(&mut Session) -> R) -> Result<R, DriverError> {
+    if CudaDevice::geometry_worker_poisoned() { return Err(EnqueueError::Poisoned.into()); }
     DEFAULT.with(|cell| {
         let mut slot = cell.borrow_mut();
-        if slot.is_none() { *slot = Some(Session::open(0)?); }
+        if slot.is_none() { *slot = Some(Session::from_device(CudaDevice::geometry_device())?); }
         Ok(f(slot.as_mut().unwrap()))
     })
 }

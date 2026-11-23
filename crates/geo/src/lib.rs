@@ -35,3 +35,4 @@ pub mod zip;
 pub use brep::Brep;
 pub use kernel::{ExactKernel, NativeKernel, Solid};
 pub use math::{v3, Frame, V3};
+pub mod accelerator;

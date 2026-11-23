@@ -10,6 +10,7 @@
 pub mod assembly;
 pub mod boolean;
 pub mod evaluate;
+pub use evaluate::batch_mass;
 pub mod file;
 pub mod knowledge;
 mod loft;

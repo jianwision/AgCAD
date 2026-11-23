@@ -10,7 +10,7 @@ use agcad_dops::lower::to_layered;
 use agcad_dops::{Studio, StudioConfig};
 use std::time::Instant;
 
-fn cfg(configs: u32, rounds: u32) -> StudioConfig { StudioConfig { configs, records: 4, max_rounds: rounds, coarse: 8, levels: 5, cap: 4096, nodes: 8, budget: 64, tighten: 0, max_cells: 0, policy: 0, island: 16 } }
+fn cfg(configs: u32, rounds: u32) -> StudioConfig { StudioConfig { configs, records: 4, max_rounds: rounds, coarse: 8, levels: 5, cap: 4096, nodes: 8, budget: 64, tighten: 0, max_cells: 0, policy: 0, island: 16, aniso: true } }
 
 #[test]
 #[ignore = "requires NVIDIA GPU"]
@@ -51,7 +51,7 @@ fn graph_while_rollout_equals_host_loop_without_round_trips() {
 fn rollout_4096_configurations_throughput_and_soundness() {
     let (base, goal) = (cpu::flange(60.0, 12.0, 6.0), cpu::goal(60_000.0, 66_000.0));
     let cuda = agcad_driver_cuda::CudaDevice::open(0).unwrap();
-    let c = StudioConfig { configs: 4096, records: 4, max_rounds: 24, coarse: 8, levels: 6, cap: 8192, nodes: 8, budget: 64, tighten: 0, max_cells: 0, policy: 0, island: 16 };
+    let c = StudioConfig { configs: 4096, records: 4, max_rounds: 24, coarse: 8, levels: 6, cap: 8192, nodes: 8, budget: 64, tighten: 0, max_cells: 0, policy: 0, island: 16, aniso: true };
     let st = Studio::new(cuda, &base, &goal, c).unwrap();
     let t0 = Instant::now();
     st.run_graph().unwrap();
@@ -207,7 +207,7 @@ fn implicit_mesh_bitwise() {
 fn large_cap_under_global_budget() {
     let (base, goal) = (cpu::flange(60.0, 12.0, 6.0), cpu::goal(60_000.0, 66_000.0));
     let cuda = agcad_driver_cuda::CudaDevice::open(0).unwrap();
-    let c = StudioConfig { configs: 4096, records: 4, max_rounds: 8, coarse: 8, levels: 7, cap: 65536, nodes: 8, budget: 64, tighten: 0, max_cells: 1 << 25, policy: 0, island: 16 };
+    let c = StudioConfig { configs: 4096, records: 4, max_rounds: 8, coarse: 8, levels: 7, cap: 65536, nodes: 8, budget: 64, tighten: 0, max_cells: 1 << 25, policy: 0, island: 16, aniso: true };
     let st = Studio::new(cuda, &base, &goal, c).unwrap();
     let t0 = Instant::now();
     st.run_graph().unwrap();
@@ -239,7 +239,7 @@ fn cmaes_bitwise_graph_and_scale() {
     gr.run_graph().unwrap();
     assert!(gr.state_bytes().unwrap() == a.state_bytes().unwrap(), "graph ≠ host loop");
     for pol in [policy::MOCK, policy::CMAES] {
-        let c = StudioConfig { configs: 4096, records: 4, max_rounds: 24, coarse: 8, levels: 6, cap: 8192, nodes: 8, budget: 96, tighten: 0, max_cells: 0, policy: pol, island: 16 };
+        let c = StudioConfig { configs: 4096, records: 4, max_rounds: 24, coarse: 8, levels: 6, cap: 8192, nodes: 8, budget: 96, tighten: 0, max_cells: 0, policy: pol, island: 16, aniso: true };
         let st = Studio::new(cuda.clone(), &base, &g, c).unwrap();
         let t0 = Instant::now();
         st.run_graph().unwrap();

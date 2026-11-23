@@ -80,7 +80,7 @@ fn main() {
         Some("bench-device") => {
             let num = |k: &str, d: u32| flag(&args, k).and_then(|s| s.parse().ok()).unwrap_or(d);
             let cfg = agcad_dops::StudioConfig { configs: num("--configs", 4096), records: 4, max_rounds: num("--rounds", 16), coarse: 8, levels: num("--levels", 5), cap: num("--cap", 4096), nodes: 8, budget: 64, tighten: 0, max_cells: 0,
-                policy: if flag(&args, "--policy").as_deref() == Some("cmaes") { agcad_dops::abi::policy::CMAES } else { agcad_dops::abi::policy::MOCK }, island: num("--island", 16) };
+                policy: if flag(&args, "--policy").as_deref() == Some("cmaes") { agcad_dops::abi::policy::CMAES } else { agcad_dops::abi::policy::MOCK }, island: num("--island", 16), aniso: !args.iter().any(|a| a == "--no-aniso") };
             let base = agcad_dops::examples::flange(60.0, 12.0, 6.0);
             let mut goal = agcad_dops::examples::goal(60_000.0, 66_000.0);
             if cfg.policy == agcad_dops::abi::policy::CMAES { goal.hole_r = 0.0; } // parameters only

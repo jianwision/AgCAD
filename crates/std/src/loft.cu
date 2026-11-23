@@ -38,3 +38,59 @@ extern "C" __global__ void ag_surface_rows(const LoftParams *params) {
     for (int k=0;k<3;++k) out[k] = h[k]/h[3];
     out[3] = h[3];
 }
+
+// Batched tensor-product rational NURBS evaluation: S(u,v) = (B_u * P_h * B_v^T) / W, plus
+// first partial derivatives (S_u, S_v) in world coordinates.
+// Packed input layout (all f64):
+//   [nu, nv, su, sv, bu(su*nu), dbu(su*nu), bv(sv*nv), dbv(sv*nv), poles(nu*nv*4: x,y,z,w)]
+// Output layout: su*sv*9 f64 (px,py,pz, dux,duy,duz, dvx,dvy,dvz).
+extern "C" __global__ void ag_nurbs_eval_grid(const LoftParams *params) {
+    const unsigned long long idx = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    if (idx >= params->edges) return;
+    const double *in = params->sections;
+    const unsigned long long nu = (unsigned long long)in[0];
+    const unsigned long long nv = (unsigned long long)in[1];
+    const unsigned long long su = (unsigned long long)in[2];
+    const unsigned long long sv = (unsigned long long)in[3];
+    const unsigned long long iu = idx / sv;
+    const unsigned long long iv = idx % sv;
+    const double *bu  = in + 4;
+    const double *dbu = bu + su * nu;
+    const double *bv  = dbu + su * nu;
+    const double *dbv = bv + sv * nv;
+    const double *poles = dbv + sv * nv;
+    const double *bu_row  = bu  + iu * nu;
+    const double *dbu_row = dbu + iu * nu;
+    const double *bv_row  = bv  + iv * nv;
+    const double *dbv_row = dbv + iv * nv;
+    double h[4] = {}, hu[4] = {}, hv[4] = {};
+    for (unsigned long long i = 0; i < nu; ++i) {
+        const double bi = bu_row[i], dbi = dbu_row[i];
+        if (bi == 0.0 && dbi == 0.0) continue;
+        for (unsigned long long j = 0; j < nv; ++j) {
+            const double bj = bv_row[j], dbj = dbv_row[j];
+            if (bj == 0.0 && dbj == 0.0) continue;
+            const double *pt = poles + 4 * (i * nv + j);
+            const double w = pt[3];
+            const double w0 = bi * bj * w;
+            const double wu = dbi * bj * w;
+            const double wv = bi * dbj * w;
+            for (int k = 0; k < 3; ++k) {
+                h[k]  += w0 * pt[k];
+                hu[k] += wu * pt[k];
+                hv[k] += wv * pt[k];
+            }
+            h[3]  += w0;
+            hu[3] += wu;
+            hv[3] += wv;
+        }
+    }
+    double *out = params->poles + 9 * idx;
+    const double invw = (h[3] != 0.0) ? (1.0 / h[3]) : 0.0;
+    for (int k = 0; k < 3; ++k) {
+        const double p = h[k] * invw;
+        out[k]     = p;
+        out[3 + k] = (hu[k] - hu[3] * p) * invw;
+        out[6 + k] = (hv[k] - hv[3] * p) * invw;
+    }
+}

@@ -30,6 +30,7 @@ pub mod step_write;
 pub mod surface;
 pub mod tessellate;
 pub mod threemf;
+pub mod vdb;
 pub mod zip;
 
 pub use brep::Brep;

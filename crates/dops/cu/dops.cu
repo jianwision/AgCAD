@@ -26,7 +26,8 @@ extern "C" __device__ __attribute__((cudart_builtin)) void cudaGraphSetCondition
 #define C_AREA 14
 #define C_V6 15
 #define MARCH_STEPS 160u
-#define MAX_PARAMS 8
+#define MAX_PARAMS 32
+#define SH_MAX_NODES 16u
 #define MAX_PATTERN 64u
 #define NO_PARAM 0xFFFFFFFFu
 #define LAST 0xFFFFFFFFu
@@ -81,11 +82,14 @@ struct OpTable { u32 update, parameter, pad, pocket, hole, circular_pattern, dea
 struct DopsArgs {
     u64 goal, cur_nodes, cur_count, cur_params, tr_nodes, tr_count, tr_params, rev, budget, done,
         cmds, arena, status, counts, domain_hit, bbox, obs, score, trace, round, active, compiled, tables,
-        wl0, wl1, cls, flag, offs, crank, start, lvl, term, toffs, tlist, tcount, opt, samp, tscore, pool, cond_handle;
-    u32 configs, nodes, params, records, coarse, levels, eval_trial, max_rounds, level, capacity, cap, cfg_offset, tighten, policy, island, general_ok;
+        wl0, wl1, cls, flag, offs, crank, start, lvl, term, toffs, tlist, tcount, opt, samp, tscore, pool, cond_handle,
+        obs_f32, policy_out;
+    u32 configs, nodes, params, records, coarse, levels, eval_trial, max_rounds, level, capacity, cap, cfg_offset, tighten, policy, island, general_ok, aniso, policy_n_out;
     OpTable ops;
 };
 #define POLICY_CMAES 1u
+#define POLICY_CUMODEL 2u
+#define POLICY_HYBRID 3u
 #define MAX_ISLAND 64u
 struct OptState { double mean[MAX_PARAMS], diag[MAX_PARAMS], sigma, best; u32 restarts, generation, pending, structs, stall, _pad; };
 struct CommandRecord { unsigned short opcode, flags; u32 configuration, dst, args[6], expected_revision, configuration_mask_slot, reserved; double imm[2]; };
@@ -663,11 +667,19 @@ __device__ void cma_sample(const DopsArgs* a, const Goal& g, u32 cfg, u32 gcfg, 
         FeatureArgs* arena = ag_ptr<FeatureArgs>(a->arena) + (u64)cfg * a->records;
         slot = struct_move(a, g, cfg, gcfg / lam, st.structs, st.pending == 1u, cmds, arena);
     }
+    const float* pout = (a->policy == POLICY_HYBRID && a->policy_out != 0ull && a->policy_n_out > 0u) ? ag_ptr<const float>(a->policy_out) : 0;
     for (u32 j = 0; j < MAX_PARAMS; ++j) {
         double u = 0.0;
         if (param_active(g, st, j, kn)) {
             double z = normal12(g.seed, gcfg, round * 16u + j);
-            u = st.mean[j] + st.sigma * sqrt(st.diag[j]) * z;
+            double bias = 0.0;
+            if (pout && round > 0u && j < a->policy_n_out) {
+                double y = (double)pout[(u64)cfg * a->policy_n_out + j];
+                if (y < -1.0) y = -1.0;
+                if (y > 1.0) y = 1.0;
+                bias = 0.25 * y * st.sigma;
+            }
+            u = st.mean[j] + bias + st.sigma * sqrt(st.diag[j]) * z;
             if (u < 0.0) u = 0.0;
             if (u > 1.0) u = 1.0;
             if (slot < a->records) {
@@ -682,7 +694,7 @@ __device__ void cma_sample(const DopsArgs* a, const Goal& g, u32 cfg, u32 gcfg, 
 }
 
 AG_KERNEL void ag_opt_init(const DopsArgs* a) {
-    if (AG_TID != 0 || a->policy != POLICY_CMAES) return;
+    if (AG_TID != 0 || (a->policy != POLICY_CMAES && a->policy != POLICY_HYBRID)) return;
     u32 cn = a->configs, kn = a->params, lam = a->island;
     const Goal g = *ag_ptr<const Goal>(a->goal);
     const double* pr = ag_ptr<const double>(a->cur_params);
@@ -764,7 +776,7 @@ __device__ void island_update(OptState& st, const double* samp, const double* fs
 }
 
 AG_KERNEL void ag_opt_update(const DopsArgs* a) {
-    if (a->policy != POLICY_CMAES) return;
+    if (a->policy != POLICY_CMAES && a->policy != POLICY_HYBRID) return;
     u32 cn = a->configs, lam = a->island;
     const Goal g = *ag_ptr<const Goal>(a->goal);
     u32 round = ag_ptr<const u32>(a->round)[0];
@@ -780,7 +792,34 @@ AG_KERNEL void ag_opt_update(const DopsArgs* a) {
     island_update(opt[i], samp + (u64)m0 * MAX_PARAMS, ts + m0, ag_ptr<const double>(a->obs) + (u64)m0 * OBS, m, g, a->params, a->cfg_offset / lam + i, round);
 }
 
-// ---- policy (mock GPU model) ----
+AG_KERNEL void ag_dop_pack_obs(const DopsArgs* a) {
+    u32 cfg = AG_TID;
+    if (a->obs_f32 == 0ull || cfg >= a->configs) return;
+    const Goal g = *ag_ptr<const Goal>(a->goal);
+    const double* o = ag_ptr<const double>(a->obs) + (u64)cfg * OBS;
+    const double* pr = ag_ptr<const double>(a->cur_params) + (u64)cfg * a->params;
+    float* dst = ag_ptr<float>(a->obs_f32) + (u64)cfg * OBS;
+    for (int i = 0; i < OBS; ++i) dst[i] = 0.0f;
+    double v_ref = (g.obj_scale > 0.0) ? g.obj_scale : ((g.vol_hi > g.vol_lo) ? 0.5 * (g.vol_lo + g.vol_hi) : 1.0);
+    double err = o[11]; if (err < -10.0) err = -10.0; if (err > 10.0) err = 10.0;
+    dst[0] = (float)err;
+    dst[1] = (float)(o[12] / v_ref);
+    for (int k = 0; k < 3; ++k) {
+        double ds = g.domain_hi[k] - g.domain_lo[k]; if (ds < 1.0) ds = 1.0;
+        dst[2 + k] = (float)(o[5 + k] / ds);
+    }
+    dst[5] = (float)o[8];
+    dst[6] = (float)o[10];
+    double ar = (o[19] > 1.0) ? o[19] : 1.0;
+    dst[7] = (float)(o[25] / ar);
+    u32 np = g.n_params; if (np > a->params) np = a->params; if (np > MAX_PARAMS) np = MAX_PARAMS; if (np > (u32)(OBS - 8)) np = (u32)(OBS - 8);
+    for (u32 j = 0; j < np; ++j) {
+        double span = g.param_hi[j] - g.param_lo[j];
+        dst[8 + j] = (span > 0.0) ? (float)((pr[j] - g.param_lo[j]) / span) : 0.0f;
+    }
+}
+
+// ---- policy (mock / CMA-ES / CuModel / hybrid) ----
 AG_KERNEL void ag_dop_policy(const DopsArgs* a) {
     u32 cfg = AG_TID;
     if (cfg >= a->configs) return;
@@ -801,11 +840,40 @@ AG_KERNEL void ag_dop_policy(const DopsArgs* a) {
         for (int j = 0; j < NVALS; ++j) { f.pref[j] = 0u; f.val[j] = 0.0; }
         arena[base + s] = f;
     }
-    if (a->policy == POLICY_CMAES) { cma_sample(a, g, cfg, gcfg, ag_ptr<const u32>(a->round)[0], cmds + base); return; }
+    if (a->policy == POLICY_CMAES || a->policy == POLICY_HYBRID) { cma_sample(a, g, cfg, gcfg, ag_ptr<const u32>(a->round)[0], cmds + base); return; }
     if (ag_ptr<const u32>(a->done)[cfg] != 0u || ag_ptr<const u32>(a->budget)[cfg] == 0u) return;
     u32 np = g.n_params; if (np > kn) np = kn; if (np > MAX_PARAMS) np = MAX_PARAMS;
     if (np == 0u) return;
     u32 round = ag_ptr<const u32>(a->round)[0];
+    if (a->policy == POLICY_CUMODEL) {
+        if (round == 0u && gcfg != 0u) {
+            u32 m = (np < rn) ? np : rn;
+            for (u32 j = 0; j < m; ++j) {
+                double v = g.param_lo[j] + unit01(hash3(g.seed, gcfg, j)) * (g.param_hi[j] - g.param_lo[j]);
+                CommandRecord& c = cmds[base + j];
+                c.opcode = (unsigned short)a->ops.parameter; c.args[0] = j; c.args[1] = 0u; c.imm[0] = v;
+            }
+            return;
+        }
+        if (a->policy_out != 0ull && a->policy_n_out > 0u) {
+            const float* pout = ag_ptr<const float>(a->policy_out) + (u64)cfg * a->policy_n_out;
+            const double* pr = ag_ptr<const double>(a->cur_params) + (u64)cfg * kn;
+            u32 lim = (np < a->policy_n_out) ? np : a->policy_n_out;
+            u32 slot = 0u;
+            for (u32 j = 0; j < lim && slot < rn; ++j) {
+                double lo = g.param_lo[j], hi = g.param_hi[j];
+                if (!(hi > lo)) continue;
+                double y = (double)pout[j]; if (y < -1.0) y = -1.0; if (y > 1.0) y = 1.0;
+                double nv = pr[j] + y * g.gain * (hi - lo);
+                if (nv < lo) nv = lo;
+                if (nv > hi) nv = hi;
+                CommandRecord& c = cmds[base + slot];
+                c.opcode = (unsigned short)a->ops.parameter; c.args[0] = j; c.args[1] = 0u; c.imm[0] = nv;
+                slot += 1u;
+            }
+        }
+        return;
+    }
     if (round == 0u) {
         if (gcfg != 0u) {
             u32 m = (np < rn) ? np : rn;
@@ -1370,10 +1438,10 @@ __device__ Grid make_grid(const Goal& goal, u32 r0, u32 levels) {
     return gr;
 }
 
-__device__ void cell_box(const Grid& gr, u32 level, u32 ix, u32 iy, u32 iz, Iv* b) {
-    u32 idx[3] = {ix, iy, iz};
+__device__ void cell_box_s(const Grid& gr, const u32* s, const u32* idx, Iv* b) {
     for (int k = 0; k < 3; ++k) {
-        double w = gr.size[k] / (double)(gr.r[k] << level);
+        u32 lvl = gr.levels - 1u - s[k];
+        double w = gr.size[k] / (double)(gr.r[k] << lvl);
         b[k] = mkiv((float)(gr.lo[k] + (double)idx[k] * w), (float)(gr.lo[k] + (double)(idx[k] + 1u) * w));
     }
 }
@@ -1514,11 +1582,15 @@ template <bool M> __device__ void tighten_cell(const CNode* nodes, u32 cnt, cons
 
 
 
-__device__ __forceinline__ u64 enc(u32 cfg, u32 ix, u32 iy, u32 iz) { return ((u64)cfg << 32) | ((u64)ix << 20) | ((u64)iy << 10) | (u64)iz; }
+__device__ __forceinline__ u64 enc(u32 cfg, u32 mask, u32 sx, u32 sy, u32 sz, u32 ix, u32 iy, u32 iz) {
+    return ((u64)cfg << 45) | ((u64)(mask & 7u) << 42) | ((u64)(sx & 15u) << 38) | ((u64)(sy & 15u) << 34) | ((u64)(sz & 15u) << 30) | ((u64)(ix & 1023u) << 20) | ((u64)(iy & 1023u) << 10) | (u64)(iz & 1023u);
+}
+__device__ __forceinline__ u64 with_mask(u64 en, u32 mask) { return (en & ~(7ull << 42)) | ((u64)(mask & 7u) << 42); }
+__device__ __forceinline__ u32 pop3(u32 m) { return (m & 1u) + ((m >> 1) & 1u) + ((m >> 2) & 1u); }
 
-template <bool M> __device__ bool border_hit(const Grid& gr, const CNode* nodes, u32 cnt, const float* tabs, u32 level, const u32* idx, const Iv* b, bool inside) {
+template <bool M> __device__ bool border_hit(const Grid& gr, const CNode* nodes, u32 cnt, const float* tabs, const u32* s, const u32* idx, const Iv* b, bool inside) {
     for (int ax = 0; ax < 3; ++ax) {
-        u32 res = gr.r[ax] << level;
+        u32 res = gr.r[ax] << (gr.levels - 1u - s[ax]);
         for (u32 side = 0; side < 2u; ++side) {
             if ((side == 0u && idx[ax] != 0u) || (side == 1u && idx[ax] != res - 1u)) continue;
             if (inside) return true;
@@ -1545,10 +1617,10 @@ __device__ __forceinline__ void contrib_init(Contrib& c) {
     c.dom = 0u;
     c.has = false;
 }
-__device__ __forceinline__ void contrib_bbox(Contrib& c, const u32* lo, u32 n, bool inside) {
+__device__ __forceinline__ void contrib_bbox(Contrib& c, const u32* lo, const u32* span, bool inside) {
     for (int k = 0; k < 3; ++k) {
-        if (inside) { c.bb[k] = min(c.bb[k], lo[k]); c.bb[3 + k] = max(c.bb[3 + k], lo[k] + n); }
-        c.bb[6 + k] = min(c.bb[6 + k], lo[k]); c.bb[9 + k] = max(c.bb[9 + k], lo[k] + n);
+        if (inside) { c.bb[k] = min(c.bb[k], lo[k]); c.bb[3 + k] = max(c.bb[3 + k], lo[k] + span[k]); }
+        c.bb[6 + k] = min(c.bb[6 + k], lo[k]); c.bb[9 + k] = max(c.bb[9 + k], lo[k] + span[k]);
     }
 }
 __device__ __forceinline__ bool is_min_slot(int j) { return j == C_MIN_WALL || j == C_MIN_GAP; }
@@ -1589,13 +1661,12 @@ __device__ void contrib_flush(const DopsArgs* a, u32 cfg, Contrib& c) {
     if (c.dom != 0u) atomicExch(ag_ptr<u32>(a->domain_hit) + cfg, 1u);
 }
 
-__device__ void contrib_moments(Contrib& ct, u32 ix, u32 iy, u32 iz, u32 sh, u64 q20) {
-    u64 w = 1ull << (3u * sh);
+__device__ void contrib_moments(Contrib& ct, const u32* idx, const u32* s, u64 q20) {
+    u64 w = 1ull << (s[0] + s[1] + s[2]);
     u64 q6 = q20 >> 14;
-    u64 ss = 4ull << (2u * sh);
-    u32 idx[3] = {ix, iy, iz};
     for (int k = 0; k < 3; ++k) {
-        u64 c2 = ((u64)(2u * idx[k] + 1u)) << sh;
+        u64 c2 = ((u64)(2u * idx[k] + 1u)) << s[k];
+        u64 ss = 4ull << (2u * s[k]);
         ct.v[C_M1 + k] += q20 * w * c2;
         ct.v[C_M2 + k] += q6 * w * (12ull * c2 * c2 + ss);
     }
@@ -1620,14 +1691,18 @@ AG_KERNEL void ag_ad_seed(const DopsArgs* a) {
     u32 per = gr.r[0] * gr.r[1] * gr.r[2];
     u64 n = (u64)a->configs * per;
     u64* wl = ag_ptr<u64>(a->wl0);
+    u32 sh0 = a->levels - 1u;
     GRID_STRIDE(i, n) {
         u32 cfg = (u32)(i / per), cell = (u32)(i % per);
-        wl[i] = enc(cfg, cell % gr.r[0], (cell / gr.r[0]) % gr.r[1], cell / (gr.r[0] * gr.r[1]));
+        wl[i] = enc(cfg, 0u, sh0, sh0, sh0, cell % gr.r[0], (cell / gr.r[0]) % gr.r[1], cell / (gr.r[0] * gr.r[1]));
     }
     if (blockIdx.x == 0 && threadIdx.x == 0) ag_ptr<u32>(a->lvl)[0] = (u32)n;
 }
 
 AG_KERNEL __launch_bounds__(256, 3) void ag_ad_classify(const DopsArgs* a) {
+    __shared__ CNode s_tape[SH_MAX_NODES];
+    __shared__ u32 s_cfg;
+    __shared__ u32 s_ok;
     u32 nn = a->nodes;
     const u32* cnt = ag_ptr<const u32>(a->eval_trial ? a->tr_count : a->cur_count);
     const CNode* cnodes = ag_ptr<const CNode>(a->compiled);
@@ -1637,40 +1712,87 @@ AG_KERNEL __launch_bounds__(256, 3) void ag_ad_classify(const DopsArgs* a) {
     Grid gr = make_grid(goal, a->coarse, a->levels);
     u32 l = a->level;
     u32 n = ag_ptr<const u32>(a->lvl)[l];
-    const u64* wl = ag_ptr<const u64>((l % 2u == 0u) ? a->wl0 : a->wl1);
+    u64* wl = ag_ptr<u64>((l % 2u == 0u) ? a->wl0 : a->wl1);
     u32* cls = ag_ptr<u32>(a->cls);
-    u32 sh = a->levels - 1u - l;
     float e = (float)gr.eps;
     GRID_STRIDE(j, a->capacity) { if (j >= (u64)n) cls[j] = 0u; }
-    GRID_STRIDE(i, n) {
-        u64 en = wl[i];
-        u32 cfg = (u32)(en >> 32), ix = (u32)((en >> 20) & 1023u), iy = (u32)((en >> 10) & 1023u), iz = (u32)(en & 1023u);
-        cls[i] = 0u;
-        Contrib ct;
-        contrib_init(ct);
-        if (!(a->eval_trial != 0u && done[cfg] != 0u)) {
-            const CNode* tape = cnodes + (u64)cfg * nn;
-            const float* tb = tabs + (u64)cfg * nn * TABLE;
-            u32 c = cnt[cfg];
-            Iv b[3];
-            cell_box(gr, l, ix, iy, iz, b);
-            bool mir = tape_general(tape, c);
-            Iv r = mir ? T_iv<true>(tape, c, tb, b[0], b[1], b[2]) : T_iv<false>(tape, c, tb, b[0], b[1], b[2]);
-            if (!(r.lo - e > 0.0f)) {
-                if (r.hi + e < 0.0f) {
-                    ct.has = true;
-                    ct.v[C_INSIDE] = 1ull << (3u * sh);
-                    contrib_moments(ct, ix, iy, iz, sh, 1ull << 20);
-                    u32 lo[3] = {ix << sh, iy << sh, iz << sh};
-                    contrib_bbox(ct, lo, 1u << sh, true);
-                    u32 idx[3] = {ix, iy, iz};
-                    if (mir ? border_hit<true>(gr, tape, c, tb, l, idx, b, true) : border_hit<false>(gr, tape, c, tb, l, idx, b, true)) ct.dom = 1u;
-                } else {
-                    cls[i] = 1u;
+    u64 n_pad = (((u64)n + (u64)blockDim.x - 1ull) / (u64)blockDim.x) * (u64)blockDim.x;
+    for (u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x; i < n_pad; i += (u64)gridDim.x * blockDim.x) {
+        bool valid = (i < (u64)n);
+        u64 en = valid ? wl[i] : 0ull;
+        u32 cfg = valid ? (u32)(en >> 45) : 0xFFFFFFFFu;
+        if (threadIdx.x == 0) { s_cfg = cfg; s_ok = (valid && cnt[cfg] <= SH_MAX_NODES) ? 1u : 0u; }
+        __syncthreads();
+        if (valid && cfg != s_cfg) atomicExch(&s_ok, 0u);
+        __syncthreads();
+        if (s_ok != 0u) {
+            u32 c0 = cnt[s_cfg];
+            if (threadIdx.x < c0) s_tape[threadIdx.x] = cnodes[(u64)s_cfg * nn + threadIdx.x];
+        }
+        __syncthreads();
+        if (valid) {
+            u32 s[3] = {(u32)((en >> 38) & 15u), (u32)((en >> 34) & 15u), (u32)((en >> 30) & 15u)};
+            u32 idx[3] = {(u32)((en >> 20) & 1023u), (u32)((en >> 10) & 1023u), (u32)(en & 1023u)};
+            cls[i] = 0u;
+            Contrib ct;
+            contrib_init(ct);
+            if (!(a->eval_trial != 0u && done[cfg] != 0u)) {
+                const CNode* tape = (s_ok != 0u) ? s_tape : (cnodes + (u64)cfg * nn);
+                const float* tb = tabs + (u64)cfg * nn * TABLE;
+                u32 c = cnt[cfg];
+                Iv b[3];
+                cell_box_s(gr, s, idx, b);
+                bool mir = tape_general(tape, c);
+                Iv r = mir ? T_iv<true>(tape, c, tb, b[0], b[1], b[2]) : T_iv<false>(tape, c, tb, b[0], b[1], b[2]);
+                if (!(r.lo - e > 0.0f)) {
+                    if (r.hi + e < 0.0f) {
+                        ct.has = true;
+                        ct.v[C_INSIDE] = 1ull << (s[0] + s[1] + s[2]);
+                        contrib_moments(ct, idx, s, 1ull << 20);
+                        u32 lo[3] = {idx[0] << s[0], idx[1] << s[1], idx[2] << s[2]};
+                        u32 sp[3] = {1u << s[0], 1u << s[1], 1u << s[2]};
+                        contrib_bbox(ct, lo, sp, true);
+                        if (mir ? border_hit<true>(gr, tape, c, tb, s, idx, b, true) : border_hit<false>(gr, tape, c, tb, s, idx, b, true)) ct.dom = 1u;
+                    } else {
+                        u32 avail = ((s[0] > 0u) ? 1u : 0u) | ((s[1] > 0u) ? 2u : 0u) | ((s[2] > 0u) ? 4u : 0u);
+                        u32 mask = 0u;
+                        if (avail != 0u && l + 1u < a->levels) {
+                            if (a->aniso == 0u) {
+                                mask = avail;
+                            } else {
+                                float w_all = r.hi - r.lo;
+                                float imp[3] = {0.0f, 0.0f, 0.0f};
+                                for (int k = 0; k < 3; ++k) {
+                                    if (s[k] == 0u) continue;
+                                    Iv b0[3] = {b[0], b[1], b[2]};
+                                    b0[k] = mkiv(b[k].lo, b[k].lo);
+                                    Iv r0 = mir ? T_iv<true>(tape, c, tb, b0[0], b0[1], b0[2]) : T_iv<false>(tape, c, tb, b0[0], b0[1], b0[2]);
+                                    Iv b1[3] = {b[0], b[1], b[2]};
+                                    b1[k] = mkiv(b[k].hi, b[k].hi);
+                                    Iv r1 = mir ? T_iv<true>(tape, c, tb, b1[0], b1[1], b1[2]) : T_iv<false>(tape, c, tb, b1[0], b1[1], b1[2]);
+                                    float d0 = w_all - (r0.hi - r0.lo); if (d0 < 0.0f) d0 = 0.0f;
+                                    float d1 = w_all - (r1.hi - r1.lo); if (d1 < 0.0f) d1 = 0.0f;
+                                    float sh = fabsf(r0.lo - r1.lo) + fabsf(r0.hi - r1.hi);
+                                    imp[k] = fmaxf(fmaxf(d0, d1), sh);
+                                }
+                                float imax = fmaxf(imp[0], fmaxf(imp[1], imp[2]));
+                                float ref_w = (w_all > 1.0f) ? w_all : 1.0f;
+                                if (imax <= 1e-6f * ref_w) {
+                                    mask = avail;
+                                } else {
+                                    for (int k = 0; k < 3; ++k) if (s[k] > 0u && imp[k] > 0.0f) mask |= (1u << k);
+                                    if (mask == 0u) mask = avail;
+                                }
+                            }
+                        }
+                        wl[i] = with_mask(en, mask);
+                        cls[i] = (mask == 0u) ? 1u : (1u << pop3(mask));
+                    }
                 }
             }
+            contrib_flush(a, cfg, ct);
         }
-        contrib_flush(a, cfg, ct);
+        __syncthreads();
     }
 }
 
@@ -1685,10 +1807,13 @@ AG_KERNEL void ag_ad_resolve(const DopsArgs* a) {
     const u32* start = ag_ptr<const u32>(a->start);
     GRID_STRIDE(i, a->capacity) {
         u32 f = 0u, t = 0u;
-        if (i < (u64)n && cls[i] == 1u) {
-            u32 cfg = (u32)(wl[i] >> 32);
+        if (i < (u64)n && cls[i] != 0u) {
+            u64 en = wl[i];
+            u32 cfg = (u32)(en >> 45);
+            u32 mask = (u32)((en >> 42) & 7u);
+            u32 nc = cls[i];
             u32 rank = crank[i] - crank[start[cfg]];
-            if (l + 1u < a->levels && ((u64)rank + 1ull) * 8ull <= (u64)a->cap) f = 1u; else t = 1u;
+            if (l + 1u < a->levels && mask != 0u && (u64)rank + (u64)nc <= (u64)a->cap) f = nc; else t = 1u;
         }
         flag[i] = f;
         term[i] = t;
@@ -1700,11 +1825,16 @@ AG_KERNEL void ag_ad_clip(const DopsArgs* a) {
     u32* flag = ag_ptr<u32>(a->flag);
     u32* term = ag_ptr<u32>(a->term);
     const u32* offs = ag_ptr<const u32>(a->offs);
-    u32 keep = cap / 8u;
     GRID_STRIDE(i, cap) {
         u32 f = flag[i];
-        if (i == (u64)cap - 1ull) { u32 total = offs[i] + f; ag_ptr<u32>(a->lvl)[a->level + 1u] = ((total < keep) ? total : keep) * 8u; }
-        if (f != 0u && offs[i] >= keep) { flag[i] = 0u; term[i] = 1u; }
+        u32 o = offs[i];
+        if (f != 0u && o + f > cap) {
+            if (o <= cap) ag_ptr<u32>(a->lvl)[a->level + 1u] = o;
+            flag[i] = 0u;
+            term[i] = 1u;
+        } else if (i == (u64)cap - 1ull) {
+            ag_ptr<u32>(a->lvl)[a->level + 1u] = o + f;
+        }
     }
 }
 
@@ -1720,7 +1850,7 @@ AG_KERNEL void ag_ad_compact(const DopsArgs* a) {
 }
 
 // One terminal boundary cell (body of ag_ad_fill), compiled with (M) or without mirror support.
-template <bool M> __device__ __forceinline__ void fill_cell(const DopsArgs* a, const Goal& goal, const Grid& gr, const CNode* tape, u32 c, const float* tb, u32 l, u32 sh, u32 ix, u32 iy, u32 iz, const Iv* b, u64 w, const float* d, const float* cxyz, Contrib& ct) {
+template <bool M> __device__ __forceinline__ void fill_cell(const DopsArgs* a, const Goal& goal, const Grid& gr, const CNode* tape, u32 c, const float* tb, const u32* s, const u32* idx, const Iv* b, u64 w, const float* d, const float* cxyz, Contrib& ct) {
     Prune pru;
     (void)T_iv_prune<M>(tape, c, tb, b[0], b[1], b[2], (float)gr.eps, pru);
     Surface sf = surface_p<M>(tape, c, tb, pru, cxyz[0], cxyz[1], cxyz[2], d);
@@ -1732,16 +1862,19 @@ template <bool M> __device__ __forceinline__ void fill_cell(const DopsArgs* a, c
     if (fq < (tlo >> 4)) fq = tlo >> 4;
     if (fq > ((thi + 15ull) >> 4)) fq = (thi + 15ull) >> 4;
     ct.v[C_FILL] = fq * w;
-    contrib_moments(ct, ix, iy, iz, sh, fq);
+    contrib_moments(ct, idx, s, fq);
     Probe pr = probe<M>(tape, c, tb, goal, sf, cxyz, d);
     contrib_probe(ct, pr);
-    u32 lo[3] = {ix << sh, iy << sh, iz << sh};
-    contrib_bbox(ct, lo, 1u << sh, false);
-    u32 idx[3] = {ix, iy, iz};
-    if (border_hit<M>(gr, tape, c, tb, l, idx, b, false)) ct.dom = 1u;
+    u32 lo[3] = {idx[0] << s[0], idx[1] << s[1], idx[2] << s[2]};
+    u32 sp[3] = {1u << s[0], 1u << s[1], 1u << s[2]};
+    contrib_bbox(ct, lo, sp, false);
+    if (border_hit<M>(gr, tape, c, tb, s, idx, b, false)) ct.dom = 1u;
 }
 
 template <bool MIR> __device__ __forceinline__ void fill_kernel(const DopsArgs* a) {
+    __shared__ CNode s_tape[SH_MAX_NODES];
+    __shared__ u32 s_cfg;
+    __shared__ u32 s_ok;
     u32 nn = a->nodes;
     const u32* cnt = ag_ptr<const u32>(a->eval_trial ? a->tr_count : a->cur_count);
     const CNode* cnodes = ag_ptr<const CNode>(a->compiled);
@@ -1749,34 +1882,44 @@ template <bool MIR> __device__ __forceinline__ void fill_kernel(const DopsArgs* 
     const Goal goal = *ag_ptr<const Goal>(a->goal);
     Grid gr = make_grid(goal, a->coarse, a->levels);
     u32 l = a->level;
-    u32 n = ag_ptr<const u32>(a->lvl)[l];
     const u64* wl = ag_ptr<const u64>((l % 2u == 0u) ? a->wl0 : a->wl1);
     const u32* tlist = ag_ptr<const u32>(a->tlist);
     u32 tn = ag_ptr<const u32>(a->tcount)[0];
-    u32 sh = a->levels - 1u - l;
-    (void)n;
-    GRID_STRIDE(j, tn) {
-        u64 en = wl[tlist[j]];
-        u32 cfg = (u32)(en >> 32), ix = (u32)((en >> 20) & 1023u), iy = (u32)((en >> 10) & 1023u), iz = (u32)(en & 1023u);
-        Contrib ct;
-        contrib_init(ct);
-        if (tape_general(cnodes + (u64)cfg * nn, cnt[cfg]) != MIR) continue; // the other launch
-        {
-            {
-                const CNode* tape = cnodes + (u64)cfg * nn;
+    u64 tn_pad = (((u64)tn + (u64)blockDim.x - 1ull) / (u64)blockDim.x) * (u64)blockDim.x;
+    for (u64 j = (u64)blockIdx.x * blockDim.x + threadIdx.x; j < tn_pad; j += (u64)gridDim.x * blockDim.x) {
+        bool valid = (j < (u64)tn);
+        u64 en = valid ? wl[tlist[j]] : 0ull;
+        u32 cfg = valid ? (u32)(en >> 45) : 0xFFFFFFFFu;
+        if (threadIdx.x == 0) { s_cfg = cfg; s_ok = (valid && cnt[cfg] <= SH_MAX_NODES) ? 1u : 0u; }
+        __syncthreads();
+        if (valid && cfg != s_cfg) atomicExch(&s_ok, 0u);
+        __syncthreads();
+        if (s_ok != 0u) {
+            u32 c0 = cnt[s_cfg];
+            if (threadIdx.x < c0) s_tape[threadIdx.x] = cnodes[(u64)s_cfg * nn + threadIdx.x];
+        }
+        __syncthreads();
+        if (valid) {
+            const CNode* tape = (s_ok != 0u) ? s_tape : (cnodes + (u64)cfg * nn);
+            u32 c = cnt[cfg];
+            if (tape_general(tape, c) == MIR) {
+                u32 s[3] = {(u32)((en >> 38) & 15u), (u32)((en >> 34) & 15u), (u32)((en >> 30) & 15u)};
+                u32 idx[3] = {(u32)((en >> 20) & 1023u), (u32)((en >> 10) & 1023u), (u32)(en & 1023u)};
+                Contrib ct;
+                contrib_init(ct);
                 const float* tb = tabs + (u64)cfg * nn * TABLE;
-                u32 c = cnt[cfg];
                 Iv b[3];
-                cell_box(gr, l, ix, iy, iz, b);
-                u64 w = 1ull << (3u * sh);
+                cell_box_s(gr, s, idx, b);
+                u64 w = 1ull << (s[0] + s[1] + s[2]);
                 ct.has = true;
                 ct.v[C_BOUNDARY] = w;
                 float d[3] = {b[0].hi - b[0].lo, b[1].hi - b[1].lo, b[2].hi - b[2].lo};
                 float cxyz[3] = {0.5f * (b[0].lo + b[0].hi), 0.5f * (b[1].lo + b[1].hi), 0.5f * (b[2].lo + b[2].hi)};
-                fill_cell<MIR>(a, goal, gr, tape, c, tb, l, sh, ix, iy, iz, b, w, d, cxyz, ct);
+                fill_cell<MIR>(a, goal, gr, tape, c, tb, s, idx, b, w, d, cxyz, ct);
+                contrib_flush(a, cfg, ct);
             }
         }
-        contrib_flush(a, cfg, ct);
+        __syncthreads();
     }
 }
 
@@ -1791,8 +1934,8 @@ AG_KERNEL void ag_ad_start(const DopsArgs* a) {
     const u64* wl = ag_ptr<const u64>((l % 2u == 0u) ? a->wl0 : a->wl1);
     u32* start = ag_ptr<u32>(a->start);
     GRID_STRIDE(i, n) {
-        u32 c = (u32)(wl[i] >> 32);
-        if (i == 0 || (u32)(wl[i - 1] >> 32) != c) start[c] = (u32)i;
+        u32 c = (u32)(wl[i] >> 45);
+        if (i == 0 || (u32)(wl[i - 1] >> 45) != c) start[c] = (u32)i;
     }
 }
 
@@ -1807,16 +1950,33 @@ AG_KERNEL void ag_ad_emit(const DopsArgs* a) {
     GRID_STRIDE(i, m) {
         if (flag[i] == 0u) continue;
         u64 en = wl[i];
-        u32 cfg = (u32)(en >> 32), ix = (u32)((en >> 20) & 1023u), iy = (u32)((en >> 10) & 1023u), iz = (u32)(en & 1023u);
-        u64 base = (u64)offs[i] * 8ull;
-        for (u32 k = 0; k < 8u; ++k) out[base + k] = enc(cfg, 2u * ix + (k & 1u), 2u * iy + ((k >> 1) & 1u), 2u * iz + (k >> 2));
+        u32 cfg = (u32)(en >> 45);
+        u32 mask = (u32)((en >> 42) & 7u);
+        u32 sx = (u32)((en >> 38) & 15u), sy = (u32)((en >> 34) & 15u), sz = (u32)((en >> 30) & 15u);
+        u32 ix = (u32)((en >> 20) & 1023u), iy = (u32)((en >> 10) & 1023u), iz = (u32)(en & 1023u);
+        u32 sxb = mask & 1u, syb = (mask >> 1) & 1u, szb = (mask >> 2) & 1u;
+        u32 nsx = sx - sxb, nsy = sy - syb, nsz = sz - szb;
+        u32 dx = 1u + sxb, dy = 1u + syb, dz = 1u + szb;
+        u64 base = (u64)offs[i];
+        u32 k = 0u;
+        for (u32 oz = 0u; oz < dz; ++oz) {
+            for (u32 oy = 0u; oy < dy; ++oy) {
+                for (u32 ox = 0u; ox < dx; ++ox) {
+                    u32 nix = sxb ? (2u * ix + ox) : ix;
+                    u32 niy = syb ? (2u * iy + oy) : iy;
+                    u32 niz = szb ? (2u * iz + oz) : iz;
+                    out[base + k] = enc(cfg, 0u, nsx, nsy, nsz, nix, niy, niz);
+                    k += 1u;
+                }
+            }
+        }
     }
 }
 
 AG_KERNEL void ag_ad_total(const DopsArgs* a) {
     if (AG_TID != 0) return;
     u32 cap = a->capacity;
-    ag_ptr<u32>(a->lvl)[a->level + 1u] = (ag_ptr<const u32>(a->offs)[cap - 1u] + ag_ptr<const u32>(a->flag)[cap - 1u]) * 8u;
+    ag_ptr<u32>(a->lvl)[a->level + 1u] = ag_ptr<const u32>(a->offs)[cap - 1u] + ag_ptr<const u32>(a->flag)[cap - 1u];
 }
 
 // ---- engineering metrics (twin of reference.rs engineering) ----

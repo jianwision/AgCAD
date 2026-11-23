@@ -12,6 +12,69 @@ use crate::error::{DeviceFault, DriverResult, EnqueueError, WorkerState};
 use crate::layout::Dim3;
 use bytemuck::Pod;
 use core::marker::PhantomData;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Classification of host↔device byte transfers for enforcing the host-interaction budget
+/// (spec 05 § Host-interaction budget; AG-05-005: `geometry` bytes MUST be 0).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TransferKind {
+    Control,
+    Report,
+    Export,
+    Geometry,
+}
+
+/// Snapshot of host↔device transfer bytes recorded by a device.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TransferStats {
+    pub control_bytes: u64,
+    pub report_bytes: u64,
+    pub export_bytes: u64,
+    pub geometry_bytes: u64,
+}
+
+impl TransferStats {
+    pub fn total(&self) -> u64 {
+        self.control_bytes + self.report_bytes + self.export_bytes + self.geometry_bytes
+    }
+}
+
+/// Lock-free atomic transfer counters embedded in device implementations.
+#[derive(Default)]
+pub struct TransferCounters {
+    control: AtomicU64,
+    report: AtomicU64,
+    export: AtomicU64,
+    geometry: AtomicU64,
+}
+
+impl TransferCounters {
+    pub fn record(&self, kind: TransferKind, bytes: usize) {
+        let b = bytes as u64;
+        match kind {
+            TransferKind::Control => self.control.fetch_add(b, Ordering::Relaxed),
+            TransferKind::Report => self.report.fetch_add(b, Ordering::Relaxed),
+            TransferKind::Export => self.export.fetch_add(b, Ordering::Relaxed),
+            TransferKind::Geometry => self.geometry.fetch_add(b, Ordering::Relaxed),
+        };
+    }
+
+    pub fn snapshot(&self) -> TransferStats {
+        TransferStats {
+            control_bytes: self.control.load(Ordering::Relaxed),
+            report_bytes: self.report.load(Ordering::Relaxed),
+            export_bytes: self.export.load(Ordering::Relaxed),
+            geometry_bytes: self.geometry.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn reset(&self) {
+        self.control.store(0, Ordering::Relaxed);
+        self.report.store(0, Ordering::Relaxed);
+        self.export.store(0, Ordering::Relaxed);
+        self.geometry.store(0, Ordering::Relaxed);
+    }
+}
 
 /// Stream priority (harness high, proxy mid, exact/rebuild low; spec 05 § Overlap).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -94,7 +157,24 @@ pub trait AgDevice: Send + Sync + 'static {
     fn sync(&self, s: &Self::Stream) -> Result<(), DeviceFault>;
     fn elapsed_ms(&self, a: &Self::Event, b: &Self::Event) -> Result<f32, DeviceFault>;
 
+    /// Host↔device transfer telemetry (AG-05-005).
+    fn transfer_stats(&self) -> TransferStats { TransferStats::default() }
+    fn reset_transfer_stats(&self) {}
+    fn record_transfer(&self, _kind: TransferKind, _bytes: usize) {}
+
     // ---- provided ----
+
+    /// Upload tagged with transfer class (tracks host-interaction budget).
+    fn upload_tagged_async(&self, s: &Self::Stream, kind: TransferKind, src: &[u8], dst: &Self::Buffer, dst_off: usize) -> Result<(), EnqueueError> {
+        self.record_transfer(kind, src.len());
+        self.upload_from_host_async(s, src, dst, dst_off)
+    }
+
+    /// Download tagged with transfer class (tracks host-interaction budget).
+    fn download_tagged_async(&self, s: &Self::Stream, kind: TransferKind, src: &Self::Buffer, src_off: usize, dst: &mut Self::Pinned, dst_off: usize, bytes: usize) -> Result<(), EnqueueError> {
+        self.record_transfer(kind, bytes);
+        self.download_async(s, src, src_off, dst, dst_off, bytes)
+    }
 
     fn alloc<T: Pod>(&self, s: &Self::Stream, n: usize) -> Result<DeviceSlice<T, Self::Buffer>, EnqueueError> {
         let bytes = n.checked_mul(core::mem::size_of::<T>()).ok_or(EnqueueError::OutOfMemory { requested: u64::MAX })?;

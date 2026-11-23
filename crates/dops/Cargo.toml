@@ -13,6 +13,7 @@ agcad-kernels = { workspace = true }
 agcad-kernels-cuda = { workspace = true }
 agcad-harness = { workspace = true }
 agcad-geo = { workspace = true }
+agcad-model = { workspace = true }
 agcad-runtime = { workspace = true }
 bytemuck = { workspace = true }
 serde = { workspace = true }

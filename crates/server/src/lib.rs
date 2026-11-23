@@ -85,8 +85,13 @@ impl Dfm {
 
 /// Tool access for `sets` (3ax excludes the fixture face), wall thickness and clearance.
 pub fn dfm_analyse(m: &agcad_geo::tessellate::Mesh, sets: &[String]) -> Result<Dfm, String> {
+    dfm_analyse_on(None, m, sets)
+}
+
+/// Like [`dfm_analyse`], reusing the session's shared `CudaDevice` for OptiX.
+pub fn dfm_analyse_on(cuda: Option<std::sync::Arc<agcad_driver_cuda::CudaDevice>>, m: &agcad_geo::tessellate::Mesh, sets: &[String]) -> Result<Dfm, String> {
     use agcad_raytrace::analysis::{access, along_normal, directions, samples};
-    let (t, why) = agcad_raytrace::best(m);
+    let (t, why) = agcad_raytrace::best_on(cuda, m);
     let t0 = std::time::Instant::now();
     // the fixture face: downward-facing samples on the part's lowest plane (held by the vise)
     let s = samples(m);
@@ -117,8 +122,12 @@ pub fn dfm_json(d: &Dfm, min_wall: Option<f64>, min_clearance: Option<f64>) -> V
 
 /// DFM report of a body's tessellation (see the `dfm` tool).
 pub fn dfm_report(m: &agcad_geo::tessellate::Mesh, args: &Value) -> Result<Value, String> {
+    dfm_report_on(None, m, args)
+}
+
+pub fn dfm_report_on(cuda: Option<std::sync::Arc<agcad_driver_cuda::CudaDevice>>, m: &agcad_geo::tessellate::Mesh, args: &Value) -> Result<Value, String> {
     let sets: Vec<String> = match args.get("sets").and_then(Value::as_array) { Some(a) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(), None => vec!["3ax".into(), "3+2".into(), "5ax".into()] };
-    let d = dfm_analyse(m, &sets)?;
+    let d = dfm_analyse_on(cuda, m, &sets)?;
     Ok(dfm_json(&d, args.get("min_wall").and_then(Value::as_f64), args.get("min_clearance").and_then(Value::as_f64)))
 }
 
@@ -148,12 +157,16 @@ impl Server {
         }
     }
 
-    /// Escalate a survivor to a new branch of Part Design features: deep certification on its
-    /// own (low-priority) stream overlapped with the exact solid; device-only ops get the exact
-    /// part in the document plus a certified implicit body.
+    /// Escalate a survivor to a new branch of Part Design features: deep certification on the
+    /// shared GPU low-priority stream overlapped with exact volume check; device-only ops get
+    /// the exact part in the document plus a certified implicit body.
     fn apply_survivor(&mut self, best: &agcad_dops::Survivor, g: &agcad_dops::abi::Goal, prefer_cuda: bool, catalog: &Catalog) -> Result<Value, String> {
+        let cuda = prefer_cuda.then(|| self.device_cache.cuda_device()).flatten();
         let (exact, cert) = std::thread::scope(|sc| {
-            let h = sc.spawn(|| agcad_dops::studio::certify(agcad_driver_cpu::CpuDevice::new(), &best.design, g, 7, 1 << 18).ok());
+            let h = sc.spawn(move || match cuda {
+                Some(dev) => agcad_dops::studio::certify(dev, &best.design, g, 7, 1 << 18).ok(),
+                None => agcad_dops::studio::certify(agcad_driver_cpu::CpuDevice::new(), &best.design, g, 7, 1 << 18).ok(),
+            });
             let exact = device::exact_volume(&best.design);
             (exact, h.join().ok().flatten())
         });
@@ -161,7 +174,7 @@ impl Server {
         let branch = format!("device-{}", self.rollouts);
         self.session.doc.branch(0, std::slice::from_ref(&branch));
         let implicit = match &exact {
-            Err(e) => Some(device::deliver_implicit(&best.design, g, e, prefer_cuda)?),
+            Err(e) => Some(device::deliver_implicit(&mut self.device_cache, &best.design, g, e, prefer_cuda)?),
             Ok(_) => None,
         };
         let doc_design = if implicit.is_some() { device::exact_part(&best.design) } else { best.design.clone() };
@@ -252,11 +265,12 @@ impl Server {
             }
             "dfm" => {
                 let m = self.current_mesh().ok_or("nothing to analyse")?;
-                json!(dfm_report(&m, args)?)
+                let cuda = self.device_cache.cuda_device();
+                json!(dfm_report_on(cuda, &m, args)?)
             }
             "render" if args.get("mode").and_then(Value::as_str) == Some("raytraced") => {
                 let m = self.current_mesh().ok_or("nothing to render")?;
-                let (t, why) = agcad_raytrace::best(&m);
+                let (t, why) = agcad_raytrace::best_on(self.device_cache.cuda_device(), &m);
                 let (w, h) = (512, 512);
                 let png = agcad_raytrace::analysis::render(&*t, &m, w, h)?;
                 json!({ "png_base64": b64(&png), "width": w, "height": h, "tracer": t.name(), "fallback_reason": why })
@@ -266,7 +280,14 @@ impl Server {
                 let view = match args.get("view").and_then(Value::as_str) { Some("top") => View::Top, Some("front") => View::Front, Some("right") => View::Right, _ => View::Iso };
                 let mode = if args.get("mode").and_then(Value::as_str) == Some("face_ids") { Mode::FaceIds } else { Mode::Shaded };
                 let (w, h) = (512, 512);
-                json!({ "png_base64": b64(&png(&rasterize(&m, view, mode, w, h), w, h)), "width": w, "height": h })
+                let rgb = if let Some(dev) = self.device_cache.cuda_device() {
+                    agcad_driver::AgDevice::stream(&*dev, agcad_driver::Priority::Low)
+                        .and_then(|s| agcad_harness::render::rasterize_device(&*dev, &s, &m, view, mode, w, h))
+                        .unwrap_or_else(|_| rasterize(&m, view, mode, w, h))
+                } else {
+                    rasterize(&m, view, mode, w, h)
+                };
+                json!({ "png_base64": b64(&png(&rgb, w, h)), "width": w, "height": h })
             }
             "export" => {
                 let fmt = args.get("format").and_then(Value::as_str).unwrap_or("step_ap242");
@@ -326,15 +347,20 @@ impl Server {
                 // policy: CMA-ES islands over the free parameters unless structural moves are wanted
                 let free = (0..g.n_params as usize).filter(|&j| g.param_hi[j] > g.param_lo[j]).count();
                 let pol = match args.get("policy").and_then(Value::as_str) {
-                    Some("mock") => 0,
-                    Some("cmaes") => 1,
-                    Some(o) => return Err(format!("policy: \"cmaes\" | \"mock\" (got {o})")),
-                    None => if free > 0 && g.hole_r <= 0.0 { 1 } else { 0 },
+                    Some("mock") => agcad_dops::abi::policy::MOCK,
+                    Some("cmaes") => agcad_dops::abi::policy::CMAES,
+                    Some("cumodel") => agcad_dops::abi::policy::CUMODEL,
+                    Some("hybrid") => agcad_dops::abi::policy::HYBRID,
+                    Some(o) => return Err(format!("policy: \"cmaes\" | \"mock\" | \"cumodel\" | \"hybrid\" (got {o})")),
+                    None => if free > 0 && g.hole_r <= 0.0 { agcad_dops::abi::policy::CMAES } else { agcad_dops::abi::policy::MOCK },
                 };
                 let island = args.get("island").and_then(Value::as_u64).unwrap_or(16).clamp(2, 64) as u32;
+                let aniso = args.get("aniso").and_then(Value::as_bool).unwrap_or(true);
                 // parameters (+ structural slots) + up to 2 structural records
-                let records = if pol == 1 && g.hole_r > 0.0 { 2 + agcad_dops::abi::MAX_PARAMS as u32 } else { (g.n_params + 2).max(4) };
-                let cfg = agcad_dops::StudioConfig { configs, records, max_rounds: rounds, coarse: 8, levels, cap: 4096, nodes: (design.nodes.len() as u32 + 8).max(8), budget: records * rounds, tighten: 0, max_cells: 0, policy: pol, island };
+                let is_cma = pol == agcad_dops::abi::policy::CMAES || pol == agcad_dops::abi::policy::HYBRID;
+                let struct_target = if g.n_params <= 3 { 8 } else { (g.n_params as usize + 6).min(agcad_dops::abi::MAX_PARAMS) } as u32;
+                let records = if is_cma && g.hole_r > 0.0 { 2 + struct_target } else { (g.n_params + 2).max(4) };
+                let cfg = agcad_dops::StudioConfig { configs, records, max_rounds: rounds, coarse: 8, levels, cap: 4096, nodes: (design.nodes.len() as u32 + 8).max(8), budget: records * rounds, tighten: 0, max_cells: 0, policy: pol, island, aniso };
                 let prefer_cuda = match args.get("device").and_then(Value::as_str) { Some("cpu") => false, Some(_) => true, None => std::env::var("AGCAD_DEVICE").map(|v| v != "cpu").unwrap_or(true) };
                 // a trade-off set needs a spread population: explore instead of stopping at the
                 // first design that satisfies the goal
@@ -342,7 +368,7 @@ impl Server {
                 if pareto.is_some() && g.objective == 0 { g.objective = 3; }
                 let run = device::run(&mut self.device_cache, &design, &g, cfg, read_k, prefer_cuda)?;
                 let mut out = device::summarize(&device::RolloutRun { summary: agcad_dops::RolloutSummary { top: run.summary.top.iter().take(top_k).cloned().collect(), ..run.summary.clone() }, ..run }, &run.summary.top.first().map(|s| s.design.names.clone()).unwrap_or(names.clone()));
-                out["policy"] = json!(if pol == 1 { "cmaes" } else { "mock" });
+                out["policy"] = json!(match pol { 1 => "cmaes", 2 => "cumodel", 3 => "hybrid", _ => "mock" });
                 out["objective"] = json!(["satisfy", "min_volume", "max_volume", "explore"][g.objective as usize]);
                 out["raise_warnings"] = json!(warnings);
                 // stiffness escalation on the survivors (voxel PCG on the device)
@@ -351,7 +377,7 @@ impl Server {
                 if let Some(spec) = self.load {
                     for (i, sv) in run.summary.top.iter().enumerate() {
                         if i >= top_k && !wants_compliance { break; }
-                        let v = match device::stiffness(&sv.design, &sv.obs, &spec, prefer_cuda) {
+                        let v = match device::stiffness(&mut self.device_cache, &sv.design, &sv.obs, &spec, prefer_cuda) {
                             Ok((r, h)) => {
                                 stiff_ok[i] = r.converged && spec.max_compliance.is_none_or(|m| r.compliance <= m);
                                 compliance[i] = r.converged.then_some(r.compliance);
@@ -374,7 +400,8 @@ impl Server {
                     for i in 0..n_check {
                         let sv = &run.summary.top[i];
                         if !(stiff_ok[i] && sv.obs[ob::MET] == 1.0) { continue; }
-                        let r = device::survivor_mesh(&sv.design, &g, prefer_cuda).and_then(|m| dfm_analyse(&m, &sets));
+                        let cuda = prefer_cuda.then(|| self.device_cache.cuda_device()).flatten();
+                        let r = device::survivor_mesh(&mut self.device_cache, &sv.design, &g, prefer_cuda).and_then(|m| dfm_analyse_on(cuda, &m, &sets));
                         let v = match r {
                             Ok(d) => {
                                 // facets of curved walls: 0.01 mm tolerance on distances
@@ -410,7 +437,7 @@ impl Server {
                     let mut list = Vec::new();
                     for (ci, &pi) in pick.iter().enumerate() {
                         let sv = &run.summary.top[feas[uniq[pi]]];
-                        let render = device::render_design(&sv.design, &sv.obs, &g, prefer_cuda).map(|png| {
+                        let render = device::render_design(&mut self.device_cache, &sv.design, &sv.obs, &g, prefer_cuda).map(|png| {
                             let _ = std::fs::create_dir_all(&self.session.out_dir);
                             let path = self.session.out_dir.join(format!("pareto-{}-{ci}.png", self.rollouts));
                             let _ = std::fs::write(&path, &png);

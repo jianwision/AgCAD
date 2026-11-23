@@ -27,9 +27,38 @@ fn nop(cfg: u32, rev: u32, update: u32) -> CommandRecord {
     c
 }
 
-/// Mock GPU model: a deterministic goal-seeking controller that writes command records and
-/// arg-arena payloads straight into the device ring (stand-in for a learned policy; same
-/// inputs and outputs). One thread per configuration.
+/// Pack normalized per-configuration observations into `[configs × OBS]` f32 for `ResidentMlp`
+/// (zero host transfer; runs directly inside the rollout loop before `ag_mlp_layer`).
+pub unsafe fn ag_dop_pack_obs(params: *const u8, _: &LaunchConfig) {
+    let a = unsafe { args(params) };
+    if a.obs_f32 == 0 { return; }
+    let (cn, kn) = (a.configs as usize, a.params as usize);
+    let g: Goal = unsafe { sl::<Goal>(a.goal, 1)[0] };
+    let obs = unsafe { sl::<f64>(a.obs, cn * OBS) };
+    let pr = unsafe { sl::<f64>(a.cur_params, cn * kn) };
+    let out = unsafe { slm::<f32>(a.obs_f32, cn * OBS) };
+    let v_ref = if g.obj_scale > 0.0 { g.obj_scale } else if g.vol_hi > g.vol_lo { 0.5 * (g.vol_lo + g.vol_hi) } else { 1.0 };
+    let dsz = [0, 1, 2].map(|k| (g.domain_hi[k] - g.domain_lo[k]).max(1.0));
+    let np = (g.n_params as usize).min(kn).min(MAX_PARAMS).min(OBS - 8);
+    for cfg in 0..cn {
+        let o = &obs[cfg * OBS..cfg * OBS + OBS];
+        let dst = &mut out[cfg * OBS..cfg * OBS + OBS];
+        dst.fill(0.0);
+        dst[0] = o[ob::ERR].clamp(-10.0, 10.0) as f32;
+        dst[1] = (o[ob::VOL_EST] / v_ref) as f32;
+        for k in 0..3 { dst[2 + k] = (o[5 + k] / dsz[k]) as f32; }
+        dst[5] = o[8] as f32;
+        dst[6] = o[ob::MET] as f32;
+        dst[7] = (o[ob::VIOLATION] / o[ob::AREA].max(1.0)) as f32;
+        for j in 0..np {
+            let span = g.param_hi[j] - g.param_lo[j];
+            dst[8 + j] = if span > 0.0 { ((pr[cfg * kn + j] - g.param_lo[j]) / span) as f32 } else { 0.0 };
+        }
+    }
+}
+
+/// GPU model policy: dispatches `MOCK`, `CMAES`, `CUMODEL` (`ResidentMlp`), or `HYBRID`
+/// (`ResidentMlp` + CMA-ES islands), writing command records into the device ring.
 pub unsafe fn ag_dop_policy(params: *const u8, _: &LaunchConfig) {
     let a = unsafe { args(params) };
     let (cn, rn, kn) = (a.configs as usize, a.records as usize, a.params as usize);
@@ -50,10 +79,45 @@ pub unsafe fn ag_dop_policy(params: *const u8, _: &LaunchConfig) {
             cmds[base + s] = nop(cfg as u32, rev[cfg], a.ops.update);
             arena[base + s] = FeatureArgs::zeroed();
         }
-        if a.policy == policy::CMAES { unsafe { cma_sample(&a, &g, cfg, gcfg, round, &mut cmds[base..base + rn]) }; continue; }
+        if a.policy == policy::CMAES || a.policy == policy::HYBRID {
+            unsafe { cma_sample(&a, &g, cfg, gcfg, round, &mut cmds[base..base + rn]) };
+            continue;
+        }
         if done[cfg] != 0 || budget[cfg] == 0 { continue; }
         let np = (g.n_params as usize).min(kn).min(MAX_PARAMS);
         if np == 0 { continue; }
+        if a.policy == policy::CUMODEL {
+            if round == 0 && gcfg != 0 {
+                for j in 0..np.min(rn) {
+                    let v = g.param_lo[j] + unit(hash3(g.seed, gcfg, j as u32)) * (g.param_hi[j] - g.param_lo[j]);
+                    let c = &mut cmds[base + j];
+                    c.opcode = a.ops.parameter as u16;
+                    c.args[0] = j as u32;
+                    c.args[1] = rec::PARAM_SET;
+                    c.imm[0] = v;
+                }
+                continue;
+            }
+            if a.policy_out != 0 && a.policy_n_out > 0 {
+                let nout = a.policy_n_out as usize;
+                let pout = unsafe { sl::<f32>(a.policy_out, cn * nout) };
+                let mut slot = 0usize;
+                for j in 0..np.min(nout) {
+                    if slot >= rn { break; }
+                    let (lo, hi) = (g.param_lo[j], g.param_hi[j]);
+                    if !(hi > lo) { continue; }
+                    let y = (pout[cfg * nout + j] as f64).clamp(-1.0, 1.0);
+                    let nv = (pr[cfg * kn + j] + y * g.gain * (hi - lo)).clamp(lo, hi);
+                    let c = &mut cmds[base + slot];
+                    c.opcode = a.ops.parameter as u16;
+                    c.args[0] = j as u32;
+                    c.args[1] = rec::PARAM_SET;
+                    c.imm[0] = nv;
+                    slot += 1;
+                }
+            }
+            continue;
+        }
         if round == 0 {
             // exploration: configuration 0 keeps the base design, the others sample the box
             if gcfg != 0 {
@@ -203,11 +267,18 @@ unsafe fn cma_sample(a: &DopsArgs, g: &Goal, cfg: usize, gcfg: u32, round: u32, 
         let base = cfg * a.records as usize;
         slot = unsafe { struct_move(a, g, cfg, gi, st.structs, st.pending == 1, cmds, &mut arena[base..base + a.records as usize]) };
     }
+    let pout = if a.policy == policy::HYBRID && a.policy_out != 0 && a.policy_n_out > 0 {
+        Some(unsafe { sl::<f32>(a.policy_out, cn * a.policy_n_out as usize) })
+    } else { None };
     for j in 0..MAX_PARAMS {
         let mut u = 0.0;
         if active(g, &st, j, kn) {
             let z = normal12(g.seed, gcfg, round.wrapping_mul(16).wrapping_add(j as u32));
-            u = st.mean[j] + st.sigma * st.diag[j].sqrt() * z;
+            let bias = match pout {
+                Some(po) if round > 0 && j < a.policy_n_out as usize => 0.25 * (po[cfg * a.policy_n_out as usize + j] as f64).clamp(-1.0, 1.0) * st.sigma,
+                _ => 0.0,
+            };
+            u = st.mean[j] + bias + st.sigma * st.diag[j].sqrt() * z;
             if u < 0.0 { u = 0.0; }
             if u > 1.0 { u = 1.0; }
             if slot < cmds.len() {
@@ -290,7 +361,7 @@ unsafe fn struct_move(a: &DopsArgs, g: &Goal, cfg: usize, gi: u32, k: u32, remov
 /// design, the others at hashed points of the box; σ₀ = 0.3, diag = 1.
 pub unsafe fn ag_opt_init(params: *const u8, _: &LaunchConfig) {
     let a = unsafe { args(params) };
-    if a.policy != policy::CMAES { return; }
+    if a.policy != policy::CMAES && a.policy != policy::HYBRID { return; }
     let (cn, kn) = (a.configs as usize, a.params as usize);
     let lam = a.island as usize;
     let g: Goal = unsafe { sl::<Goal>(a.goal, 1)[0] };
@@ -317,7 +388,7 @@ pub unsafe fn ag_opt_init(params: *const u8, _: &LaunchConfig) {
 /// size; restart a stalled infeasible island at a hashed point.
 pub unsafe fn ag_opt_update(params: *const u8, _: &LaunchConfig) {
     let a = unsafe { args(params) };
-    if a.policy != policy::CMAES { return; }
+    if a.policy != policy::CMAES && a.policy != policy::HYBRID { return; }
     let cn = a.configs as usize;
     let lam = a.island as usize;
     let g: Goal = unsafe { sl::<Goal>(a.goal, 1)[0] };
@@ -586,15 +657,21 @@ pub fn grid(goal: &Goal, r0: u32, levels: u32) -> Grid {
     Grid { lo: goal.domain_lo, size, fine, eps, r, levels }
 }
 
-/// Cell box at `level` as f32 intervals (corners computed in f64, then rounded).
-pub fn cell_box(gr: &Grid, level: u32, ix: u32, iy: u32, iz: u32) -> [Iv; 3] {
-    let idx = [ix, iy, iz];
+/// Cell box for per-axis shift exponents `s` (`0` = finest, `levels - 1` = root).
+pub fn cell_box_s(gr: &Grid, s: [u32; 3], idx: [u32; 3]) -> [Iv; 3] {
     let mut b = [iv(0.0, 0.0); 3];
     for k in 0..3 {
-        let w = gr.size[k] / (gr.r[k] << level) as f64;
+        let lvl = gr.levels - 1 - s[k];
+        let w = gr.size[k] / (gr.r[k] << lvl) as f64;
         b[k] = iv((gr.lo[k] + idx[k] as f64 * w) as f32, (gr.lo[k] + (idx[k] + 1) as f64 * w) as f32);
     }
     b
+}
+
+/// Cell box at uniform `level` as f32 intervals (corners computed in f64, then rounded).
+pub fn cell_box(gr: &Grid, level: u32, ix: u32, iy: u32, iz: u32) -> [Iv; 3] {
+    let sh = gr.levels - 1 - level;
+    cell_box_s(gr, [sh, sh, sh], [ix, iy, iz])
 }
 
 /// SDF value, central-difference gradient and gradient width at a boundary cell centre.
@@ -751,20 +828,37 @@ pub fn probe(nodes: &[CNode], tabs: &[f32], goal: &Goal, s: &Surface, c: [f32; 3
     pr
 }
 
-fn decode(e: u64) -> (usize, u32, u32, u32) { ((e >> 32) as usize, ((e >> 20) & 1023) as u32, ((e >> 10) & 1023) as u32, (e & 1023) as u32) }
-fn encode(cfg: u32, ix: u32, iy: u32, iz: u32) -> u64 { ((cfg as u64) << 32) | ((ix as u64) << 20) | ((iy as u64) << 10) | iz as u64 }
+fn decode(e: u64) -> (usize, u32, [u32; 3], [u32; 3]) {
+    (
+        (e >> 45) as usize,
+        ((e >> 42) & 7) as u32,
+        [((e >> 38) & 15) as u32, ((e >> 34) & 15) as u32, ((e >> 30) & 15) as u32],
+        [((e >> 20) & 1023) as u32, ((e >> 10) & 1023) as u32, (e & 1023) as u32],
+    )
+}
+fn encode(cfg: u32, mask: u32, s: [u32; 3], idx: [u32; 3]) -> u64 {
+    ((cfg as u64) << 45)
+        | (((mask & 7) as u64) << 42)
+        | (((s[0] & 15) as u64) << 38)
+        | (((s[1] & 15) as u64) << 34)
+        | (((s[2] & 15) as u64) << 30)
+        | (((idx[0] & 1023) as u64) << 20)
+        | (((idx[1] & 1023) as u64) << 10)
+        | (idx[2] & 1023) as u64
+}
+fn with_mask(e: u64, mask: u32) -> u64 { (e & !(7u64 << 42)) | (((mask & 7) as u64) << 42) }
 
 struct Acc<'a> { counts: &'a mut [u64], dom: &'a mut [u32], bb: &'a mut [u32] }
 
 impl Acc<'_> {
-    /// Mass moments of a counted cell (q20 fill weight; integer, order-independent).
-    fn moments(&mut self, cfg: usize, idx: [u32; 3], sh: u32, q20: u64) {
-        let w = 1u64 << (3 * sh);
+    /// Mass moments of a counted cell (q20 fill weight; integer, order-independent, anisotropic).
+    fn moments(&mut self, cfg: usize, idx: [u32; 3], s: [u32; 3], q20: u64) {
+        let w = 1u64 << (s[0] + s[1] + s[2]);
         let q6 = q20 >> 14;
-        let ss = 4u64 << (2 * sh); // (doubled side)²
         let o = CS * cfg;
         for k in 0..3 {
-            let c2 = ((2 * idx[k] + 1) as u64) << sh;
+            let c2 = ((2 * idx[k] + 1) as u64) << s[k];
+            let ss = 4u64 << (2 * s[k]); // (doubled side)²
             self.counts[o + cnt::M1 + k] += q20 * w * c2;
             self.counts[o + cnt::M2 + k] += q6 * w * (12 * c2 * c2 + ss);
         }
@@ -780,20 +874,19 @@ impl Acc<'_> {
         if p.wall < FAR32 { self.counts[o + cnt::MIN_WALL] = self.counts[o + cnt::MIN_WALL].min(p.wall.to_bits() as u64); }
         if p.gap < FAR32 { self.counts[o + cnt::MIN_GAP] = self.counts[o + cnt::MIN_GAP].min(p.gap.to_bits() as u64); }
     }
-    fn bbox(&mut self, cfg: usize, lo: [u32; 3], n: u32, inside: bool) {
+    fn bbox(&mut self, cfg: usize, lo: [u32; 3], span: [u32; 3], inside: bool) {
         for k in 0..3 {
-            if inside { self.bb[12 * cfg + k] = self.bb[12 * cfg + k].min(lo[k]); self.bb[12 * cfg + 3 + k] = self.bb[12 * cfg + 3 + k].max(lo[k] + n); }
+            if inside { self.bb[12 * cfg + k] = self.bb[12 * cfg + k].min(lo[k]); self.bb[12 * cfg + 3 + k] = self.bb[12 * cfg + 3 + k].max(lo[k] + span[k]); }
             self.bb[12 * cfg + 6 + k] = self.bb[12 * cfg + 6 + k].min(lo[k]);
-            self.bb[12 * cfg + 9 + k] = self.bb[12 * cfg + 9 + k].max(lo[k] + n);
+            self.bb[12 * cfg + 9 + k] = self.bb[12 * cfg + 9 + k].max(lo[k] + span[k]);
         }
     }
 }
 
-/// Does the solid reach the domain face(s) that cell (level, idx) lies on? Inside cells at the
-/// border always do; boundary cells test the interval over each border face patch.
-fn border_hit(gr: &Grid, nodes: &[CNode], tabs: &[f32], level: u32, idx: [u32; 3], b: &[Iv; 3], inside: bool) -> bool {
+/// Does the solid reach the domain face(s) that cell `(s, idx)` lies on?
+fn border_hit(gr: &Grid, nodes: &[CNode], tabs: &[f32], s: [u32; 3], idx: [u32; 3], b: &[Iv; 3], inside: bool) -> bool {
     for ax in 0..3 {
-        let res = gr.r[ax] << level;
+        let res = gr.r[ax] << (gr.levels - 1 - s[ax]);
         for side in 0..2u32 {
             if (side == 0 && idx[ax] != 0) || (side == 1 && idx[ax] != res - 1) { continue; }
             if inside { return true; }
@@ -815,14 +908,16 @@ pub unsafe fn ag_ad_seed(params: *const u8, _: &LaunchConfig) {
     let per = (r[0] * r[1] * r[2]) as usize;
     let n = a.configs as usize * per;
     let wl = unsafe { slm::<u64>(a.wl0, n) };
+    let sh0 = a.levels - 1;
     for (i, e) in wl.iter_mut().enumerate() {
         let (cfg, cell) = ((i / per) as u32, (i % per) as u32);
-        *e = encode(cfg, cell % r[0], (cell / r[0]) % r[1], cell / (r[0] * r[1]));
+        *e = encode(cfg, 0, [sh0, sh0, sh0], [cell % r[0], (cell / r[0]) % r[1], cell / (r[0] * r[1])]);
     }
     unsafe { slm::<u32>(a.lvl, a.levels as usize + 1)[0] = n as u32; }
 }
 
-/// CLASSIFY (level l): interval over each cell → outside / inside (counted) / ambiguous.
+/// CLASSIFY (level l): interval over each cell → outside / inside (counted) / ambiguous
+/// (with orientation-aware anisotropic split mask packed into `wl[i]` and child count in `cls[i]`).
 pub unsafe fn ag_ad_classify(params: *const u8, _: &LaunchConfig) {
     let a = unsafe { args(params) };
     let (cn, nn) = (a.configs as usize, a.nodes as usize);
@@ -834,34 +929,68 @@ pub unsafe fn ag_ad_classify(params: *const u8, _: &LaunchConfig) {
     let gr = grid(&goal, a.coarse, a.levels);
     let l = a.level;
     let n = unsafe { sl::<u32>(a.lvl, a.levels as usize + 1)[l as usize] } as usize;
-    let wl = unsafe { sl::<u64>(if l % 2 == 0 { a.wl0 } else { a.wl1 }, n) };
+    let wl = unsafe { slm::<u64>(if l % 2 == 0 { a.wl0 } else { a.wl1 }, n) };
     let cls = unsafe { slm::<u32>(a.cls, a.capacity as usize) };
     for x in cls[n..].iter_mut() { *x = 0; }
     let mut acc = Acc { counts: unsafe { slm::<u64>(a.counts, CS * cn) }, dom: unsafe { slm::<u32>(a.domain_hit, cn) }, bb: unsafe { slm::<u32>(a.bbox, 12 * cn) } };
-    let sh = a.levels - 1 - l;
     let e = gr.eps as f32;
     for i in 0..n {
-        let (cfg, ix, iy, iz) = decode(wl[i]);
+        let (cfg, _, s, idx) = decode(wl[i]);
         cls[i] = 0;
         if a.eval_trial != 0 && done[cfg] != 0 { continue; }
         let tape = &cnodes[cfg * nn..cfg * nn + cnt[cfg] as usize];
         let tb = &tabs[cfg * nn * TABLE..(cfg * nn + cnt[cfg] as usize) * TABLE];
-        let b = cell_box(&gr, l, ix, iy, iz);
+        let b = cell_box_s(&gr, s, idx);
         let r = tape_iv(tape, tb, b[0], b[1], b[2]);
         if r.lo - e > 0.0 { continue; }
         if r.hi + e < 0.0 {
-            acc.counts[CS * cfg] += 1u64 << (3 * sh);
-            acc.moments(cfg, [ix, iy, iz], sh, 1 << 20);
-            acc.bbox(cfg, [ix << sh, iy << sh, iz << sh], 1 << sh, true);
-            if border_hit(&gr, tape, tb, l, [ix, iy, iz], &b, true) { acc.dom[cfg] = 1; }
+            acc.counts[CS * cfg] += 1u64 << (s[0] + s[1] + s[2]);
+            acc.moments(cfg, idx, s, 1 << 20);
+            acc.bbox(cfg, [idx[0] << s[0], idx[1] << s[1], idx[2] << s[2]], [1 << s[0], 1 << s[1], 1 << s[2]], true);
+            if border_hit(&gr, tape, tb, s, idx, &b, true) { acc.dom[cfg] = 1; }
             continue;
         }
-        cls[i] = 1;
+        let avail = ((s[0] > 0) as u32) | (((s[1] > 0) as u32) << 1) | (((s[2] > 0) as u32) << 2);
+        let mask = if avail == 0 || l + 1 >= a.levels {
+            0u32
+        } else if a.aniso == 0 {
+            avail
+        } else {
+            // Interval sensitivity per axis: evaluate the two opposite faces lo/hi of axis k.
+            // On a tangent axis of a planar face or vertical wall both faces match `r` exactly;
+            // if a hole, pocket, rim or corner enters anywhere in the cell (even dead-center),
+            // at least one face shrinks the interval strictly.
+            let w_all = r.hi - r.lo;
+            let mut imp = [0.0f32; 3];
+            for k in 0..3 {
+                if s[k] == 0 { continue; }
+                let mut b0 = b;
+                b0[k] = iv(b[k].lo, b[k].lo);
+                let r0 = tape_iv(tape, tb, b0[0], b0[1], b0[2]);
+                let mut b1 = b;
+                b1[k] = iv(b[k].hi, b[k].hi);
+                let r1 = tape_iv(tape, tb, b1[0], b1[1], b1[2]);
+                let d0 = (w_all - (r0.hi - r0.lo)).max(0.0);
+                let d1 = (w_all - (r1.hi - r1.lo)).max(0.0);
+                let sh = (r0.lo - r1.lo).abs() + (r0.hi - r1.hi).abs();
+                imp[k] = d0.max(d1).max(sh);
+            }
+            let imax = imp[0].max(imp[1]).max(imp[2]);
+            if imax <= 1e-6f32 * w_all.max(1.0) {
+                avail
+            } else {
+                let mut m = 0u32;
+                for k in 0..3 { if s[k] > 0 && imp[k] > 0.0f32 { m |= 1 << k; } }
+                if m == 0 { avail } else { m }
+            }
+        };
+        wl[i] = with_mask(wl[i], mask);
+        cls[i] = if mask == 0 { 1 } else { 1u32 << mask.count_ones() };
     }
 }
 
-/// RESOLVE (level l): refine ambiguous cells while the configuration is within its cap and
-/// levels remain; otherwise count them as boundary (with fill estimate and border test).
+/// RESOLVE (level l): refine ambiguous cells while the configuration's child budget fits
+/// within `cap` and levels remain; otherwise mark them terminal boundary cells.
 pub unsafe fn ag_ad_resolve(params: *const u8, _: &LaunchConfig) {
     let a = unsafe { args(params) };
     let cn = a.configs as usize;
@@ -877,26 +1006,33 @@ pub unsafe fn ag_ad_resolve(params: *const u8, _: &LaunchConfig) {
     for i in 0..cap {
         flag[i] = 0;
         term[i] = 0;
-        if i >= n || cls[i] != 1 { continue; }
-        let (cfg, _, _, _) = decode(wl[i]);
+        if i >= n || cls[i] == 0 { continue; }
+        let (cfg, mask, _, _) = decode(wl[i]);
+        let nc = cls[i];
         let rank = crank[i] - crank[start[cfg] as usize];
-        if l + 1 < a.levels && (rank as u64 + 1) * 8 <= a.cap as u64 { flag[i] = 1; } else { term[i] = 1; }
+        if l + 1 < a.levels && mask != 0 && (rank as u64 + nc as u64) <= a.cap as u64 { flag[i] = nc; } else { term[i] = 1; }
     }
 }
 
 /// CLIP: refinements whose children would not fit in the global cell budget become terminal
-/// (a suffix in entry order, i.e. in configuration order: deterministic, and sound — such
-/// cells are counted as boundary). Also sets the next level's entry count.
+/// (deterministic suffix in configuration order). Sets the next level's exact child count.
 pub unsafe fn ag_ad_clip(params: *const u8, _: &LaunchConfig) {
     let a = unsafe { args(params) };
     let cap = a.capacity as usize;
     let flag = unsafe { slm::<u32>(a.flag, cap) };
     let term = unsafe { slm::<u32>(a.term, cap) };
     let offs = unsafe { sl::<u32>(a.offs, cap) };
-    let keep = (a.capacity / 8) as u32;
-    let total = offs[cap - 1] + flag[cap - 1];
-    for i in 0..cap { if flag[i] != 0 && offs[i] >= keep { flag[i] = 0; term[i] = 1; } }
-    unsafe { slm::<u32>(a.lvl, a.levels as usize + 1)[a.level as usize + 1] = total.min(keep) * 8; }
+    let cap32 = a.capacity;
+    let mut next_n = offs[cap - 1] + flag[cap - 1];
+    for i in 0..cap {
+        let f = flag[i];
+        if f != 0 && offs[i] + f > cap32 {
+            if offs[i] <= cap32 { next_n = offs[i]; }
+            flag[i] = 0;
+            term[i] = 1;
+        }
+    }
+    unsafe { slm::<u32>(a.lvl, a.levels as usize + 1)[a.level as usize + 1] = next_n; }
 }
 
 /// COMPACT: terminal entries → dense list (ascending entry index, so sorted by configuration).
@@ -929,34 +1065,31 @@ pub unsafe fn ag_ad_fill(params: *const u8, _: &LaunchConfig) {
     let tn = unsafe { sl::<u32>(a.tcount, 1)[0] } as usize;
     let tlist = unsafe { sl::<u32>(a.tlist, tn) };
     let mut acc = Acc { counts: unsafe { slm::<u64>(a.counts, CS * cn) }, dom: unsafe { slm::<u32>(a.domain_hit, cn) }, bb: unsafe { slm::<u32>(a.bbox, 12 * cn) } };
-    let sh = a.levels - 1 - l;
     let e = gr.eps as f32;
     for &ti in tlist {
-        let (cfg, ix, iy, iz) = decode(wl[ti as usize]);
+        let (cfg, _, s, idx) = decode(wl[ti as usize]);
         let tape = &cnodes[cfg * nn..cfg * nn + cnt[cfg] as usize];
         let tb = &tabs[cfg * nn * TABLE..(cfg * nn + cnt[cfg] as usize) * TABLE];
-        let b = cell_box(&gr, l, ix, iy, iz);
-        let w = 1u64 << (3 * sh);
+        let b = cell_box_s(&gr, s, idx);
+        let w = 1u64 << (s[0] + s[1] + s[2]);
         acc.counts[CS * cfg + cnt::BOUNDARY] += w;
         let d = [b[0].hi - b[0].lo, b[1].hi - b[1].lo, b[2].hi - b[2].lo];
         let c = [0.5f32 * (b[0].lo + b[0].hi), 0.5f32 * (b[1].lo + b[1].hi), 0.5f32 * (b[2].lo + b[2].hi)];
-        // pruned tape for this cell (bit-identical point values inside it)
         let mut pru = Prune::NONE;
         let _ = tape_iv_prune(tape, tb, b[0], b[1], b[2], e, &mut pru);
         let sf = surface_p(tape, tb, &pru, c, d);
         let (tlo, thi) = tighten(tape, tb, &pru, &b, sf.g, e, a.tighten);
         acc.counts[CS * cfg + cnt::BLO] += tlo * w;
         acc.counts[CS * cfg + cnt::BHI] += thi * w;
-        // sampled fill, kept inside the certified fraction interval
         let mut fq = fill_of(&sf);
         if fq < tlo >> 4 { fq = tlo >> 4; }
         if fq > (thi + 15) >> 4 { fq = (thi + 15) >> 4; }
         acc.counts[CS * cfg + cnt::FILL] += fq * w;
-        acc.moments(cfg, [ix, iy, iz], sh, fq);
+        acc.moments(cfg, idx, s, fq);
         let pr = probe(tape, tb, &goal, &sf, c, d);
         acc.probe(cfg, &pr);
-        acc.bbox(cfg, [ix << sh, iy << sh, iz << sh], 1 << sh, false);
-        if border_hit(&gr, tape, tb, l, [ix, iy, iz], &b, false) { acc.dom[cfg] = 1; }
+        acc.bbox(cfg, [idx[0] << s[0], idx[1] << s[1], idx[2] << s[2]], [1 << s[0], 1 << s[1], 1 << s[2]], false);
+        if border_hit(&gr, tape, tb, s, idx, &b, false) { acc.dom[cfg] = 1; }
     }
 }
 
@@ -968,12 +1101,12 @@ pub unsafe fn ag_ad_start(params: *const u8, _: &LaunchConfig) {
     let wl = unsafe { sl::<u64>(if l % 2 == 0 { a.wl0 } else { a.wl1 }, n) };
     let start = unsafe { slm::<u32>(a.start, a.configs as usize) };
     for i in 0..n {
-        let c = (wl[i] >> 32) as usize;
-        if i == 0 || (wl[i - 1] >> 32) as usize != c { start[c] = i as u32; }
+        let c = (wl[i] >> 45) as usize;
+        if i == 0 || (wl[i - 1] >> 45) as usize != c { start[c] = i as u32; }
     }
 }
 
-/// EMIT (level l): write the 8 children of every refined cell at its scan offset.
+/// EMIT (level l): write the 2/4/8 anisotropic children of every refined cell at its scan offset.
 pub unsafe fn ag_ad_emit(params: *const u8, _: &LaunchConfig) {
     let a = unsafe { args(params) };
     let l = a.level;
@@ -985,9 +1118,25 @@ pub unsafe fn ag_ad_emit(params: *const u8, _: &LaunchConfig) {
     let offs = unsafe { sl::<u32>(a.offs, cap) };
     for i in 0..n.min(cap) {
         if flag[i] == 0 { continue; }
-        let (cfg, ix, iy, iz) = decode(wl[i]);
-        let base = offs[i] as usize * 8;
-        for k in 0..8u32 { out[base + k as usize] = encode(cfg as u32, 2 * ix + (k & 1), 2 * iy + ((k >> 1) & 1), 2 * iz + (k >> 2)); }
+        let (cfg, mask, s, idx) = decode(wl[i]);
+        let (sx_b, sy_b, sz_b) = (mask & 1, (mask >> 1) & 1, (mask >> 2) & 1);
+        let ns = [s[0] - sx_b, s[1] - sy_b, s[2] - sz_b];
+        let (dx, dy, dz) = (1 + sx_b, 1 + sy_b, 1 + sz_b);
+        let base = offs[i] as usize;
+        let mut k = 0usize;
+        for oz in 0..dz {
+            for oy in 0..dy {
+                for ox in 0..dx {
+                    let nidx = [
+                        if sx_b != 0 { 2 * idx[0] + ox } else { idx[0] },
+                        if sy_b != 0 { 2 * idx[1] + oy } else { idx[1] },
+                        if sz_b != 0 { 2 * idx[2] + oz } else { idx[2] },
+                    ];
+                    out[base + k] = encode(cfg as u32, 0, ns, nidx);
+                    k += 1;
+                }
+            }
+        }
     }
 }
 
@@ -998,7 +1147,7 @@ pub unsafe fn ag_ad_total(params: *const u8, _: &LaunchConfig) {
     let flag = unsafe { sl::<u32>(a.flag, cap) };
     let offs = unsafe { sl::<u32>(a.offs, cap) };
     let lvl = unsafe { slm::<u32>(a.lvl, a.levels as usize + 1) };
-    lvl[a.level as usize + 1] = (offs[cap - 1] + flag[cap - 1]) * 8;
+    lvl[a.level as usize + 1] = offs[cap - 1] + flag[cap - 1];
 }
 
 /// Bounds of one configuration from its accumulators: (vol_lo, vol_hi, vol_est, ext_lo,
@@ -1197,6 +1346,7 @@ pub unsafe fn ag_dop_stamp(params: *const u8, _: &LaunchConfig) {
 
 pub const DOPS_CPU: &[(&str, CpuKernelFn)] = &[
     ("ag_dop_stamp", ag_dop_stamp),
+    ("ag_dop_pack_obs", ag_dop_pack_obs),
     ("ag_dop_policy", ag_dop_policy),
     ("ag_dop_apply", ag_dop_apply),
     ("ag_dop_compile", ag_dop_compile),

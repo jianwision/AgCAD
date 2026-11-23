@@ -1,10 +1,28 @@
-//! NVRTC compilation with an on-disk cache keyed by (source hash, arch, flags, catalog
-//! version) (spec 08 § Kernel authoring; review F7). nvJitLink/LTO-IR linking is added once
-//! the build pass confirms cudarc's nvJitLink coverage; until then PTX per library.
+//! NVRTC compilation with an on-disk cache keyed by (source hash, arch, flags, mode, catalog
+//! version) (spec 08 § Kernel authoring; review F7). Supports both PTX and LTO-IR (`-dlto`)
+//! output modes for incremental stdlib + UDF linking.
 
 use agcad_driver::DriverError;
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CompileMode {
+    Ptx,
+    LtoIr,
+}
+
+fn intern_arch(arch: &str) -> &'static str {
+    static INTERNED: OnceLock<Mutex<Vec<&'static str>>> = OnceLock::new();
+    let mut table = INTERNED.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap();
+    if let Some(&s) = table.iter().find(|&&s| s == arch) {
+        return s;
+    }
+    let leaked: &'static str = Box::leak(arch.to_string().into_boxed_str());
+    table.push(leaked);
+    leaked
+}
 
 pub fn cache_dir() -> PathBuf {
     if let Ok(d) = std::env::var("AGCAD_CACHE") {
@@ -27,18 +45,27 @@ fn fnv1a64(parts: &[&str]) -> u64 {
 
 /// Compile (or fetch from cache) PTX for `source`.
 pub fn compile(name: &str, source: &str, arch: &str, options: &[String]) -> Result<String, DriverError> {
+    compile_with_mode(name, source, arch, options, CompileMode::Ptx)
+}
+
+/// Compile (or fetch from cache) in PTX or LTO-IR (`-dlto`) mode.
+pub fn compile_with_mode(name: &str, source: &str, arch: &str, options: &[String], mode: CompileMode) -> Result<String, DriverError> {
     let opts_joined = options.join(" ");
-    let key = fnv1a64(&[source, arch, &opts_joined, env!("CARGO_PKG_VERSION")]);
-    let path = cache_dir().join(format!("{name}-{key:016x}.ptx"));
+    let (tag, ext) = match mode { CompileMode::Ptx => ("ptx", "ptx"), CompileMode::LtoIr => ("lto", "ltoir") };
+    let key = fnv1a64(&[source, arch, &opts_joined, tag, env!("CARGO_PKG_VERSION")]);
+    let path = cache_dir().join(format!("{name}-{key:016x}.{ext}"));
     if let Ok(ptx) = std::fs::read_to_string(&path) {
         return Ok(ptx);
     }
     let mut all = options.to_vec();
     all.push("--std=c++17".into());
+    if mode == CompileMode::LtoIr && !all.iter().any(|o| o == "-dlto") {
+        all.push("-dlto".into());
+    }
     let compiled = compile_ptx_with_opts(
         source,
         CompileOptions {
-            arch: Some(Box::leak(arch.to_string().into_boxed_str())),
+            arch: Some(intern_arch(arch)),
             fmad: Some(false), // determinism: no contraction differences vs CPU reference
             name: Some(format!("{name}.cu")),
             options: all,

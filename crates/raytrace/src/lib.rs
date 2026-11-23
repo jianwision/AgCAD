@@ -31,7 +31,17 @@ pub trait Tracer {
 /// The best tracer available: OptiX on an RTX GPU when built with feature `optix`, else the
 /// CPU reference. Returns the reason when it falls back.
 pub fn best(mesh: &Mesh) -> (Box<dyn Tracer>, Option<String>) {
-    match OptixTracer::new(mesh) {
+    best_on(None, mesh)
+}
+
+/// Like [`best`], reusing an existing session [`agcad_driver_cuda::CudaDevice`] when provided
+/// instead of opening a second CUDA context.
+pub fn best_on(cuda: Option<std::sync::Arc<agcad_driver_cuda::CudaDevice>>, mesh: &Mesh) -> (Box<dyn Tracer>, Option<String>) {
+    let res = match cuda {
+        Some(dev) => OptixTracer::new_on(dev, mesh),
+        None => OptixTracer::new(mesh),
+    };
+    match res {
         Ok(t) => (Box::new(t), None),
         Err(e) => (Box::new(CpuTracer::new(mesh)), Some(e)),
     }
@@ -86,11 +96,34 @@ impl OptixTracer {
         {
             if mesh.triangles.is_empty() { return Err("empty mesh".into()); }
             let dev = agcad_driver_cuda::CudaDevice::open(0).map_err(|e| format!("no CUDA device: {e}"))?;
+            return Self::new_on(dev, mesh);
+        }
+        #[cfg(not(feature = "optix"))]
+        { let _ = mesh; Err("built without the `optix` feature".into()) }
+    }
+
+    /// Build a resident OptiX GAS on an existing shared session [`agcad_driver_cuda::CudaDevice`]
+    /// (zero extra CUDA contexts).
+    pub fn new_on(dev: std::sync::Arc<agcad_driver_cuda::CudaDevice>, mesh: &Mesh) -> Result<OptixTracer, String> {
+        #[cfg(feature = "optix")]
+        {
+            if mesh.triangles.is_empty() { return Err("empty mesh".into()); }
             let inner = optix::build(&dev, mesh)?;
             return Ok(OptixTracer { dev, inner });
         }
         #[cfg(not(feature = "optix"))]
-        { let _ = mesh; Err("built without the `optix` feature".into()) }
+        { let _ = (dev, mesh); Err("built without the `optix` feature".into()) }
+    }
+
+    /// Trace device-resident rays directly into a device-resident hit buffer on `stream`
+    /// with zero host transfers (AG-05-005).
+    pub fn trace_device(&self, rays_ptr: u64, hits_ptr: u64, count: u32, stream: &<agcad_driver_cuda::CudaDevice as agcad_driver::AgDevice>::Stream) -> Result<(), String> {
+        #[cfg(feature = "optix")]
+        {
+            self.inner.ctx.trace(self.inner.gas, rays_ptr, hits_ptr, count, stream.raw() as *mut core::ffi::c_void).map_err(|e| format!("OptiX trace: {e:?}"))
+        }
+        #[cfg(not(feature = "optix"))]
+        { let _ = (rays_ptr, hits_ptr, count, stream); Err("built without the `optix` feature".into()) }
     }
 }
 

@@ -432,6 +432,76 @@ impl LayeredSolid {
         let core = LayeredSolid { frame: self.frame, layers: vec![Layer { z0: layer.z0 + t, z1: layer.z1 - t, regions: core }] };
         Ok(self.boolean(&core, BoolOp2::Difference))
     }
+
+    /// Open shell of a single-slab solid with optional removal of top (`remove_top`) and/or
+    /// bottom (`remove_bottom`) caps (wall & remaining-cap thickness `t`).
+    pub fn shell_open(&self, t: f64, remove_top: bool, remove_bottom: bool) -> Result<LayeredSolid, String> {
+        if !(t > 0.0) { return Err("shell thickness must be > 0".into()); }
+        let [layer] = self.layers.as_slice() else {
+            return self.shell_multi_slab(t, remove_top, remove_bottom);
+        };
+        let z0 = if remove_bottom { layer.z0 - 1.0 } else { layer.z0 + t };
+        let z1 = if remove_top { layer.z1 + 1.0 } else { layer.z1 - t };
+        if z1 <= z0 { return Ok(self.clone()); }
+        let mut core = Vec::new();
+        for r in &layer.regions { core.extend(region2d::offset_inward(r, t)?); }
+        if core.is_empty() { return Ok(self.clone()); }
+        let core = LayeredSolid { frame: self.frame, layers: vec![Layer { z0, z1, regions: core }] };
+        Ok(self.boolean(&core, BoolOp2::Difference))
+    }
+
+    /// Exact multi-slab layered shell (Phase 2 general offset path): computes the exact
+    /// cavity as the union of per-slab 2D inward-offset cores whose z-intervals keep thickness
+    /// `t` from every exposed horizontal cap/step (or open through `z_min`/`z_max` when
+    /// `remove_bottom`/`remove_top` is set).
+    pub fn shell_multi_slab(&self, t: f64, remove_top: bool, remove_bottom: bool) -> Result<LayeredSolid, String> {
+        if !(t > 0.0) { return Err("shell thickness must be > 0".into()); }
+        if self.layers.is_empty() { return Err("cannot shell empty solid".into()); }
+        let z_min = self.layers.first().unwrap().z0;
+        let z_max = self.layers.last().unwrap().z1;
+        // For each slab i, erode its 2D profile by t; keep z-margin t wherever the slab is NOT
+        // backed by material of at least the same offset footprint above/below.
+        let mut cavity: Option<LayeredSolid> = None;
+        let offsets: Vec<Vec<Profile>> = self.layers.iter().map(|l| {
+            let mut core = Vec::new();
+            for r in &l.regions { core.extend(region2d::offset_inward(r, t)?); }
+            Ok(core)
+        }).collect::<Result<_, String>>()?;
+
+        for (i, l) in self.layers.iter().enumerate() {
+            if offsets[i].is_empty() { continue; }
+            let at_bottom = (l.z0 - z_min).abs() < 1e-9;
+            let at_top = (l.z1 - z_max).abs() < 1e-9;
+            let below_contiguous = i > 0 && (self.layers[i - 1].z1 - l.z0).abs() < 1e-9 && !offsets[i - 1].is_empty();
+            let above_contiguous = i + 1 < self.layers.len() && (self.layers[i + 1].z0 - l.z1).abs() < 1e-9 && !offsets[i + 1].is_empty();
+
+            // Regions inside slab i that are open to the step face below/above must keep z-margin t,
+            // while the intersection with the neighbor's offset core passes continuously across the seam.
+            let z0_full = if at_bottom && remove_bottom { l.z0 - 1.0 } else { l.z0 + t };
+            let z1_full = if at_top && remove_top { l.z1 + 1.0 } else { l.z1 - t };
+            if z1_full > z0_full {
+                let piece = LayeredSolid { frame: self.frame, layers: vec![Layer { z0: z0_full, z1: z1_full, regions: offsets[i].clone() }] };
+                cavity = Some(match cavity { Some(c) => c.boolean(&piece, BoolOp2::Union), None => piece });
+            }
+            // Bridge the vertical transition across adjacent slabs along the shared eroded overlap
+            if below_contiguous {
+                let shared = region_op(&offsets[i], &offsets[i - 1], BoolOp2::Intersection);
+                if !shared.is_empty() {
+                    let bz0 = (l.z0 - t).max(if i == 1 && remove_bottom { z_min - 1.0 } else { self.layers[i - 1].z0 + t });
+                    let bz1 = (l.z0 + t).min(if at_top && remove_top { z_max + 1.0 } else { l.z1 - t });
+                    if bz1 > bz0 {
+                        let bridge = LayeredSolid { frame: self.frame, layers: vec![Layer { z0: bz0, z1: bz1, regions: shared }] };
+                        cavity = Some(match cavity { Some(c) => c.boolean(&bridge, BoolOp2::Union), None => bridge });
+                    }
+                }
+            }
+            let _ = above_contiguous;
+        }
+        match cavity {
+            Some(c) => Ok(self.boolean(&c, BoolOp2::Difference)),
+            None => Ok(self.clone()),
+        }
+    }
 }
 
 impl LayeredSolid {

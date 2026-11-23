@@ -112,8 +112,8 @@ pub fn parse_load(args: &Value) -> Result<Option<LoadSpec>, String> {
     Ok(Some(LoadSpec { support_axis, force, voxel, e: l.get("E").and_then(num).unwrap_or(210_000.0), nu: l.get("nu").and_then(num).unwrap_or(0.3), max_compliance: args.get("max_compliance").and_then(num) }))
 }
 
-/// Stiffness of a survivor on its outer box (CUDA when preferred and present).
-pub fn stiffness(design: &agcad_dops::Design, obs: &[f64], spec: &LoadSpec, prefer_cuda: bool) -> Result<(agcad_dops::fea::FeaReport, f64), String> {
+/// Stiffness of a survivor on its outer box (reuses the session's shared `CudaDevice`).
+pub fn stiffness(cache: &mut DeviceCache, design: &agcad_dops::Design, obs: &[f64], spec: &LoadSpec, prefer_cuda: bool) -> Result<(agcad_dops::fea::FeaReport, f64), String> {
     use agcad_dops::abi::ob;
     let lo = [obs[ob::BOX_LO], obs[ob::BOX_LO + 1], obs[ob::BOX_LO + 2]];
     let hi = [lo[0] + obs[5], lo[1] + obs[6], lo[2] + obs[7]];
@@ -123,12 +123,11 @@ pub fn stiffness(design: &agcad_dops::Design, obs: &[f64], spec: &LoadSpec, pref
     lc.force = spec.force;
     lc.e = spec.e;
     lc.nu = spec.nu;
-    let r = if prefer_cuda {
-        match agcad_driver_cuda::CudaDevice::open(0) {
-            Ok(dev) => agcad_dops::fea::stiffness(dev, design, &lc),
-            Err(_) => agcad_dops::fea::stiffness(agcad_driver_cpu::CpuDevice::new(), design, &lc),
-        }
-    } else { agcad_dops::fea::stiffness(agcad_driver_cpu::CpuDevice::new(), design, &lc) };
+    let r = if let Some(dev) = prefer_cuda.then(|| cache.cuda_device()).flatten() {
+        agcad_dops::fea::stiffness(dev, design, &lc)
+    } else {
+        agcad_dops::fea::stiffness(agcad_driver_cpu::CpuDevice::new(), design, &lc)
+    };
     r.map(|r| (r, h)).map_err(|e| e.to_string())
 }
 
@@ -146,31 +145,47 @@ pub struct RolloutRun {
     pub wall_ms: f64,
 }
 
-/// Instantiated CUDA rollout graphs kept between `device_rollout` calls, keyed by shape:
-/// a repeat rollout with a new goal or base design only rewrites device buffers.
+/// Shared session CUDA device + instantiated rollout graphs kept between calls:
+/// a repeat rollout with a new goal or base design only rewrites device buffers, and
+/// certification / FEA / OptiX / mesh extraction all share one CUDA context (no extra opens).
 #[derive(Default)]
 pub struct DeviceCache {
+    dev: Option<Option<std::sync::Arc<agcad_driver_cuda::CudaDevice>>>,
     cuda: Option<((u32, u32, u32, u32, u32, u32, usize, u32, u32), agcad_dops::GraphRollout<agcad_driver_cuda::CudaDevice>)>,
+}
+
+impl DeviceCache {
+    /// Lazily open and cache device 0 once per server session.
+    pub fn cuda_device(&mut self) -> Option<std::sync::Arc<agcad_driver_cuda::CudaDevice>> {
+        self.dev.get_or_insert_with(|| agcad_driver_cuda::CudaDevice::open(0).ok()).clone()
+    }
+}
+
+/// Certify a design on the shared GPU low-priority stream when CUDA is available, else CPU ref.
+pub fn certify(cache: &mut DeviceCache, design: &agcad_dops::Design, goal: &Goal, levels: u32, cap: u32, prefer_cuda: bool) -> Result<[f64; agcad_dops::abi::OBS], String> {
+    if let Some(dev) = prefer_cuda.then(|| cache.cuda_device()).flatten() {
+        agcad_dops::studio::certify(dev, design, goal, levels, cap).map_err(|e| e.to_string())
+    } else {
+        agcad_dops::studio::certify(agcad_driver_cpu::CpuDevice::new(), design, goal, levels, cap).map_err(|e| e.to_string())
+    }
 }
 
 /// Run on CUDA (cached graph WHILE) when available and requested, else on the CPU reference.
 pub fn run(cache: &mut DeviceCache, design: &agcad_dops::Design, goal: &Goal, cfg: StudioConfig, top_k: usize, prefer_cuda: bool) -> Result<RolloutRun, String> {
     let t0 = std::time::Instant::now();
-    if prefer_cuda {
-        if let Ok(dev) = agcad_driver_cuda::CudaDevice::open(0) {
-            let key = (cfg.configs, cfg.nodes, cfg.records, cfg.max_rounds, cfg.levels, cfg.cap, design.params.len(), cfg.policy, cfg.island);
-            let reused = matches!(&cache.cuda, Some((k, _)) if *k == key);
-            if reused {
-                cache.cuda.as_mut().unwrap().1.reset(design, goal).map_err(|e| e.to_string())?;
-            } else {
-                let st = Studio::new(dev, design, goal, cfg).map_err(|e| e.to_string())?;
-                cache.cuda = Some((key, agcad_dops::GraphRollout::new(st).map_err(|e| e.to_string())?));
-            }
-            let gr = &cache.cuda.as_ref().unwrap().1;
-            gr.run().map_err(|e| e.to_string())?;
-            let summary = gr.studio.results(top_k).map_err(|e| e.to_string())?;
-            return Ok(RolloutRun { summary, device: "cuda", mode: if reused { "graph (device-driven WHILE, cached)" } else { "graph (device-driven WHILE)" }, wall_ms: t0.elapsed().as_secs_f64() * 1e3 });
+    if let Some(dev) = prefer_cuda.then(|| cache.cuda_device()).flatten() {
+        let key = (cfg.configs, cfg.nodes, cfg.records, cfg.max_rounds, cfg.levels, cfg.cap, design.params.len(), cfg.policy, cfg.island);
+        let reused = matches!(&cache.cuda, Some((k, _)) if *k == key);
+        if reused {
+            cache.cuda.as_mut().unwrap().1.reset(design, goal).map_err(|e| e.to_string())?;
+        } else {
+            let st = Studio::new(dev, design, goal, cfg).map_err(|e| e.to_string())?;
+            cache.cuda = Some((key, agcad_dops::GraphRollout::new(st).map_err(|e| e.to_string())?));
         }
+        let gr = &cache.cuda.as_ref().unwrap().1;
+        gr.run().map_err(|e| e.to_string())?;
+        let summary = gr.studio.results(top_k).map_err(|e| e.to_string())?;
+        return Ok(RolloutRun { summary, device: "cuda", mode: if reused { "graph (device-driven WHILE, cached)" } else { "graph (device-driven WHILE)" }, wall_ms: t0.elapsed().as_secs_f64() * 1e3 });
     }
     let st = Studio::new(agcad_driver_cpu::CpuDevice::new(), design, goal, cfg).map_err(|e| e.to_string())?;
     st.run_host_loop().map_err(|e| e.to_string())?;
@@ -223,15 +238,19 @@ impl Implicit {
     }
 }
 
-/// Certify a device-only survivor and extract its mesh (spacing ≈ largest extent / 200).
-pub fn deliver_implicit(design: &agcad_dops::Design, goal: &Goal, reason: &str, prefer_cuda: bool) -> Result<Implicit, String> {
+/// Certify a device-only survivor and extract its mesh on the shared device (spacing ≈ largest extent / 200).
+pub fn deliver_implicit(cache: &mut DeviceCache, design: &agcad_dops::Design, goal: &Goal, reason: &str, prefer_cuda: bool) -> Result<Implicit, String> {
     use agcad_dops::abi::ob;
     let run = |certified: [f64; agcad_dops::abi::OBS], m: Result<agcad_dops::mesh::ImplicitMesh, String>| m.map(|mesh| Implicit { mesh, certified, reason: reason.to_string() });
-    let cert = agcad_dops::studio::certify(agcad_driver_cpu::CpuDevice::new(), design, goal, 7, 1 << 18).map_err(|e| e.to_string())?;
+    let cuda = prefer_cuda.then(|| cache.cuda_device()).flatten();
+    let cert = match &cuda {
+        Some(dev) => agcad_dops::studio::certify(dev.clone(), design, goal, 7, 1 << 18).map_err(|e| e.to_string())?,
+        None => agcad_dops::studio::certify(agcad_driver_cpu::CpuDevice::new(), design, goal, 7, 1 << 18).map_err(|e| e.to_string())?,
+    };
     let lo = [cert[ob::BOX_LO], cert[ob::BOX_LO + 1], cert[ob::BOX_LO + 2]];
     let hi = [lo[0] + cert[5], lo[1] + cert[6], lo[2] + cert[7]];
     let h = (cert[5].max(cert[6]).max(cert[7]) / 200.0).max(0.05);
-    let m = match prefer_cuda.then(|| agcad_driver_cuda::CudaDevice::open(0).ok()).flatten() {
+    let m = match cuda {
         Some(dev) => agcad_dops::mesh::extract_mesh(dev, design, lo, hi, h),
         None => agcad_dops::mesh::extract_mesh(agcad_driver_cpu::CpuDevice::new(), design, lo, hi, h),
     };
@@ -269,24 +288,32 @@ pub fn parse_dfm(args: &Value, g: &Goal) -> Option<DfmSpec> {
 }
 
 /// The survivor's surface mesh: its exact solid, or the certified implicit mesh.
-pub fn survivor_mesh(d: &agcad_dops::Design, goal: &Goal, prefer_cuda: bool) -> Result<agcad_geo::tessellate::Mesh, String> {
+pub fn survivor_mesh(cache: &mut DeviceCache, d: &agcad_dops::Design, goal: &Goal, prefer_cuda: bool) -> Result<agcad_geo::tessellate::Mesh, String> {
     match to_layered(d) {
         Ok(s) => Ok(agcad_geo::tessellate::tessellate(&s.brep(), &Default::default())),
-        Err(_) => Ok(deliver_implicit(d, goal, "dfm", prefer_cuda)?.mesh.mesh),
+        Err(_) => Ok(deliver_implicit(cache, d, goal, "dfm", prefer_cuda)?.mesh.mesh),
     }
 }
 
 /// Iso render (PNG) of a design: its exact solid, or the certified implicit mesh for
-/// device-only designs.
-pub fn render_design(d: &agcad_dops::Design, obs: &[f64], goal: &Goal, prefer_cuda: bool) -> Result<Vec<u8>, String> {
-    use agcad_harness::render::{png, rasterize, Mode, View};
+/// device-only designs. Reuses the session's shared `CudaDevice` for OptiX / GPU rasterization.
+pub fn render_design(cache: &mut DeviceCache, d: &agcad_dops::Design, obs: &[f64], goal: &Goal, prefer_cuda: bool) -> Result<Vec<u8>, String> {
+    use agcad_harness::render::{png, rasterize, rasterize_device, Mode, View};
     let mesh = match to_layered(d) {
         Ok(s) => agcad_geo::tessellate::tessellate(&s.brep(), &Default::default()),
-        Err(reason) => { let _ = (obs, reason); deliver_implicit(d, goal, "render", prefer_cuda)?.mesh.mesh }
+        Err(reason) => { let _ = (obs, reason); deliver_implicit(cache, d, goal, "render", prefer_cuda)?.mesh.mesh }
     };
     let (w, h) = (256, 256);
-    // ray-traced (shadows) on RTX GPUs; the rasterizer otherwise
-    if let Ok(t) = agcad_raytrace::OptixTracer::new(&mesh) { if let Ok(p) = agcad_raytrace::analysis::render(&t, &mesh, w, h) { return Ok(p); } }
+    if let Some(dev) = prefer_cuda.then(|| cache.cuda_device()).flatten() {
+        if let Ok(t) = agcad_raytrace::OptixTracer::new_on(dev.clone(), &mesh) {
+            if let Ok(p) = agcad_raytrace::analysis::render(&t, &mesh, w, h) { return Ok(p); }
+        }
+        if let Ok(s) = agcad_driver::AgDevice::stream(&*dev, agcad_driver::Priority::Low) {
+            if let Ok(rgb) = rasterize_device(&*dev, &s, &mesh, View::Iso, Mode::Shaded, w, h) {
+                return Ok(png(&rgb, w, h));
+            }
+        }
+    }
     Ok(png(&rasterize(&mesh, View::Iso, Mode::Shaded, w, h), w, h))
 }
 

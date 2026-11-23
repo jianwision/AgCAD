@@ -127,14 +127,21 @@ This is the loop **LLM observes → sets a goal → GPU model plans and executes
 
   **Global cell budget** (`max_cells`): memory follows the budget instead of configs × cap. 4096 configurations at cap 65 536 / 512³ finest run in 2.7 s under a 32 M-cell budget; before, this exceeded VRAM at 12 s per round.
 
-  Ruled out by measurement: near-cubic root cells. They made plate bounds 3× wider, because the thin-z cells bound the dominant faces best. The fix will be orientation-aware anisotropic splitting.
-- **Next:**
-  - a learned structural policy over feature-tape tokens, one token per node (CANTO-style native tokenization), trained from rollout traces; CMA-ES then tunes its parameters;
-  - anisotropic refinement in the global worklist (today it is only within the per-cell tightening);
-  - shared-memory tapes;
-  - open shells and multi-slab offsets (the general offset path);
-  - an OCCT parity fuzz for `offset_inward`;
-  - a Pareto front of survivors with renders back to the LLM.
+  Ruled out by measurement: near-cubic root cells. They made plate bounds 3× wider, because the thin-z cells bound the dominant faces best.
+- **Phase 1 & Phase 2 (GPU residency, anisotropic worklist, shared-memory tapes, NanoVDB/DC, resident `CuModel`, GPU surfacing & rasterizer):**
+  - **Shared session `CudaDevice` & zero-copy residency:** `DeviceCache::cuda_device()` shares one CUDA context across rollouts, `apply_survivor` certification (fixing the hardcoded `CpuDevice` fallback), FEA, `deliver_implicit`, `OptixTracer::new_on` / `trace_device`, `loft_device`, and `ResidentMlp`. `CudaDevice::open` catches missing `libcuda` cleanly.
+  - **Host-interaction telemetry (`AG-05-005`):** `TransferCounters` / `TransferStats` (`Control | Report | Export | Geometry`) tracked on `AgDevice` (`CudaDevice` + `CpuDevice`).
+  - **Compiler & precision (`AG-08-002`):** `agcad-rtc::codegen` supports `PrecisionMode::{F64, Df64, F32}` (exact Dekker `df64` helpers) + `gradient_kernel_source` (GPU reverse-mode adjoints); `driver-cuda::nvrtc` fixes arch string interning and adds `CompileMode::LtoIr` (`-dlto`) caching.
+  - **Orientation-aware global-worklist anisotropic splitting (`dops.cu` + `reference.rs`):** 64-bit worklist packs `(cfg, mask, sx, sy, sz, ix, iy, iz)` with zero extra memory; face-interval sensitivity splits 2/4/8 children per cell. Quick flange bounds tightened **±23.9 % → ±3.43 %**, certified flange **±0.3 % → ±0.1 %**, plate **±0.19 % → ±0.128 %**, union **±0.12 % → ±0.070 %**, shell **±0.24 % → ±0.133 %**, thin plate (cap 4096) **±42.4 % → ±19.9 %**.
+  - **Shared-memory feature tapes (`dops.cu`):** `ag_ad_classify` and `fill_kernel` stage uniform-config `CNode` tapes into `__shared__` memory (bitwise identical to CPU).
+  - **Resident `CuModel` & `MAX_PARAMS = 32`:** `ResidentMlp` uploads weights once and runs capture-safe inside the rollout loop (`ag_dop_pack_obs` → `ag_mlp_layer` → `policy::CUMODEL` / `policy::HYBRID`) with zero in-loop host transfers; `device_rollout` accepts `policy: "cumodel" | "hybrid" | "cmaes" | "mock"` and `aniso`.
+  - **NanoVDB + Dual Contouring (`geo::vdb`, `dops::mesh`):** sparse 8³-leaf narrow-band `NanoVdbGrid` with binary serialization and feature-preserving Hermite QEF Dual Contouring (`extract_nanovdb`, `extract_dual_contour`).
+  - **Open & multi-slab exact shells (`geo::layered`):** `LayeredSolid::shell_open` and `shell_multi_slab`.
+  - **GPU NURBS grid eval, batched study mass, GPU rasterizer:** `ag_nurbs_eval_grid` (`loft.cu` + `loft_device`), `study::evaluate_mass_device` (`ag_mesh_terms`), and pixel-parallel `ag_rasterize` (`harness/cu/render.cu` + `render::rasterize_device`).
+- **Next (Phase 3–4):**
+  - GPU exact B-rep kernel (filtered predicates, co-surface 2D booleans, GPU SSI marching, OptiX-classified topology builders, GPU STEP encoder);
+  - learned CANTO-style feature-tape structural policy trained from rollout traces via Candle Expert-Iteration/DAgger;
+  - Reynolds-transport shape gradients inside `ag_ad_fill` + on-device MOEA/D Pareto islands.
 
 ## Op coverage (293 catalog ops)
 

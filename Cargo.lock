@@ -69,6 +69,7 @@ dependencies = [
  "agcad-ir",
  "agcad-kernels",
  "agcad-kernels-cuda",
+ "agcad-model",
  "agcad-runtime",
  "agcad-std",
  "bytemuck",

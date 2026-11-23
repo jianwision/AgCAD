@@ -13,7 +13,7 @@ pub mod evaluate;
 pub mod file;
 pub mod knowledge;
 mod loft;
-mod loft_device;
+pub mod loft_device;
 mod loft_sections;
 mod loft_network;
 mod surface_spline;

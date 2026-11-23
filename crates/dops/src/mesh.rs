@@ -143,6 +143,64 @@ pub fn march_tets(f: &[f32], dims: [u32; 3], lo: [f64; 3], h: f64) -> ImplicitMe
     ImplicitMesh { mesh, h, deviation: h * 3f64.sqrt(), volume, area }
 }
 
+/// Sample the design's SDF on the device into a sparse NanoVDB-layout narrow-band grid
+/// (`agcad_geo::vdb::NanoVdbGrid`, spec 02 / review F5).
+pub fn extract_nanovdb<D: KernelExt>(
+    dev: Arc<D>,
+    design: &Design,
+    lo: [f64; 3],
+    hi: [f64; 3],
+    h: f64,
+    band_voxels: f64,
+) -> DriverResult<agcad_geo::vdb::NanoVdbGrid> {
+    let lo_pad = [lo[0] - 2.0 * h, lo[1] - 2.0 * h, lo[2] - 2.0 * h];
+    let dims = [0, 1, 2].map(|k| (((hi[k] + 2.0 * h - lo_pad[k]) / h).ceil() as u32).max(1) + 1);
+    let nn = dims.iter().map(|&n| n as usize).product::<usize>();
+    if nn > 64_000_000 { return Err(EnqueueError::InvalidConfig(format!("mesh grid {dims:?} too large: increase the spacing")).into()); }
+    let d = &*dev;
+    let s = d.stream(Priority::Low)?;
+    let lib = d.load_library(&dops_library())?;
+    let (cn, tabs) = design.compile();
+    let up = |bytes: &[u8]| -> DriverResult<D::Buffer> { let b = d.alloc_bytes(&s, bytes.len().max(16))?; d.upload_from_host_async(&s, bytes, &b, 0)?; Ok(b) };
+    let tape = up(bytemuck::cast_slice(&cn))?;
+    let tables = up(bytemuck::cast_slice(&tabs))?;
+    let out = d.alloc_bytes(&s, nn * 4)?;
+    let a = upload_params(d, &s, &MeshArgs { tape: tape.device_ptr(), tables: tables.device_ptr(), out: out.device_ptr(), _pad0: 0, lo: lo_pad, h, count: design.nodes.len() as u32, dims })?;
+    d.launch(&s, lib, "ag_mesh_sample", &LaunchConfig::linear((nn as u64).min(8192 * 256), 256), &a.buffer)?;
+    let mut pin = d.pinned(nn * 4)?;
+    d.download_packed_async(&s, &[Region { buf: &out, offset: 0, bytes: nn * 4 }], &mut pin)?;
+    d.sync(&s)?;
+    let f: Vec<f32> = bytemuck::pod_collect_to_vec(&pin.as_bytes()[..nn * 4]);
+    let (nx, ny, nz) = (dims[0] as usize, dims[1] as usize, dims[2] as usize);
+    let hi_pad = [lo_pad[0] + (nx - 1) as f64 * h, lo_pad[1] + (ny - 1) as f64 * h, lo_pad[2] + (nz - 1) as f64 * h];
+    let bg = (band_voxels * h).max(4.0 * h) as f32;
+    Ok(agcad_geo::vdb::NanoVdbGrid::from_sdf(lo_pad, hi_pad, h, band_voxels, |x, y, z| {
+        let ix = ((x - lo_pad[0]) / h).round() as isize;
+        let iy = ((y - lo_pad[1]) / h).round() as isize;
+        let iz = ((z - lo_pad[2]) / h).round() as isize;
+        if ix < 0 || iy < 0 || iz < 0 || ix >= nx as isize || iy >= ny as isize || iz >= nz as isize {
+            bg
+        } else {
+            f[(iz as usize * ny + iy as usize) * nx + ix as usize]
+        }
+    }))
+}
+
+/// Feature-preserving Dual Contouring extraction over a device-sampled NanoVDB grid
+/// (preserves sharp edges and corners on drafted / filleted / shelled implicit bodies).
+pub fn extract_dual_contour<D: KernelExt>(
+    dev: Arc<D>,
+    design: &Design,
+    lo: [f64; 3],
+    hi: [f64; 3],
+    h: f64,
+) -> DriverResult<ImplicitMesh> {
+    let grid = extract_nanovdb(dev, design, lo, hi, h, 3.0)?;
+    let mesh = grid.dual_contour();
+    let (volume, area, _) = mesh.mass_properties();
+    Ok(ImplicitMesh { mesh, h, deviation: h * 3f64.sqrt(), volume, area })
+}
+
 /// CPU reference twin of `ag_mesh_sample`: SDF at grid nodes.
 pub unsafe fn ag_mesh_sample(params: *const u8, _: &LaunchConfig) {
     let a: MeshArgs = unsafe { core::ptr::read_unaligned(params as *const MeshArgs) };

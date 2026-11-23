@@ -44,7 +44,21 @@ fn closed_shell_of_a_box_and_a_holed_plate() {
     let v = agcad_geo::tessellate::tessellate(&s.to_brep(), &Default::default()).mass_properties().0;
     let want = (6000.0 - PI * 64.0) * 10.0 - (97.0 * 57.0 - PI * 9.5 * 9.5) * 7.0;
     assert!((v - want).abs() / want < 1e-3, "{v} vs {want} (tessellated arcs)");
-    // multi-slab bodies are refused (not approximated)
+    // multi-slab bodies are refused by shell_closed (single-slab exact path)
     let step = b.boolean(&LayeredSolid::extrusion(Frame::WORLD, &Profile::rectangle(0.0, 0.0, 50.0, 60.0), 10.0, 20.0), BoolOp2::Union);
     assert!(step.shell_closed(2.0).is_err());
+
+    // open shell (top cap removed): open-top box with 2 mm walls and 2 mm floor
+    let open = b.shell_open(2.0, true, false).unwrap();
+    let open_brep = open.to_brep();
+    assert!(open_brep.validate().valid);
+    let open_v = agcad_geo::tessellate::tessellate(&open_brep, &Default::default()).mass_properties().0;
+    assert!((open_v - (60000.0 - 96.0 * 56.0 * 8.0)).abs() < 1e-6, "open shell vol {open_v}");
+
+    // multi-slab stepped enclosure shelled open at the bottom
+    let multi = step.shell_multi_slab(2.0, false, true).unwrap();
+    let multi_brep = multi.to_brep();
+    assert!(multi_brep.validate().valid, "{:?}", multi_brep.validate().problems);
+    let multi_v = multi.volume();
+    assert!(multi_v > 0.0 && multi_v < step.volume(), "multi-slab shell vol {multi_v} vs solid {}", step.volume());
 }

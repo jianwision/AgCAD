@@ -106,20 +106,98 @@ pub fn model_library() -> LibrarySource {
     LibrarySource { name: "ag_model", cuda_source: Some(agcad_kernels_cuda::bundle(include_str!("../cu/mlp.cu"), &[])), cpu_kernels: MODEL_CPU, options: vec![] }
 }
 
+/// Persistent, capture-safe device-resident MLP (`Spec 08 § Models`): weights, biases,
+/// intermediate activation buffers and parameter blocks are uploaded **once** at creation time
+/// so every [`ResidentMlp::forward_into`] call performs zero allocations and zero host
+/// transfers and can execute directly inside a captured CUDA Graph `WHILE` body.
+pub struct ResidentMlp<D: KernelExt> {
+    lib: LibraryId,
+    configs: u32,
+    n_in: usize,
+    n_out: usize,
+    layers: Vec<ResidentLayer<D>>,
+}
+
+struct ResidentLayer<D: KernelExt> {
+    n_in: u32,
+    n_out: u32,
+    relu: u32,
+    w: D::Buffer,
+    b: D::Buffer,
+    y: D::Buffer,
+    /// Pre-uploaded parameter block when input pointer is fixed (layers >= 1, or cached obs).
+    params: Option<(u64, agcad_kernels::params::ParamUpload<D>)>,
+}
+
+impl<D: KernelExt> ResidentMlp<D> {
+    pub fn load(dev: &D, s: &D::Stream, lib: LibraryId, mlp: &Mlp, configs: u32) -> DriverResult<Self> {
+        let up = |v: &[f32]| -> DriverResult<D::Buffer> {
+            let b = dev.alloc_bytes(s, v.len().max(1) * 4)?;
+            dev.upload_tagged_async(s, TransferKind::Control, bytemuck::cast_slice(v), &b, 0)?;
+            Ok(b)
+        };
+        let mut layers = Vec::with_capacity(mlp.layers.len());
+        let mut prev_ptr: Option<u64> = None;
+        for (li, (n_in, n_out, w, b)) in mlp.layers.iter().enumerate() {
+            let wb = up(w)?;
+            let bb = up(b)?;
+            let y = dev.alloc_bytes(s, (configs as usize * *n_out).max(1) * 4)?;
+            let relu = (li + 1 < mlp.layers.len()) as u32;
+            let params = if let Some(xptr) = prev_ptr {
+                let prm = MlpLayerParams { x: xptr, w: wb.device_ptr(), b: bb.device_ptr(), y: y.device_ptr(), configs, n_in: *n_in as u32, n_out: *n_out as u32, relu };
+                Some((xptr, upload_params(dev, s, &prm)?))
+            } else {
+                None
+            };
+            prev_ptr = Some(y.device_ptr());
+            layers.push(ResidentLayer { n_in: *n_in as u32, n_out: *n_out as u32, relu, w: wb, b: bb, y, params });
+        }
+        let n_in = mlp.layers.first().map(|l| l.0).unwrap_or(0);
+        let n_out = mlp.layers.last().map(|l| l.1).unwrap_or(0);
+        Ok(ResidentMlp { lib, configs, n_in, n_out, layers })
+    }
+
+    /// Bind layer 0 to a fixed device observation buffer (makes subsequent [`Self::launch`]
+    /// calls 100% allocation-free and host-transfer-free for CUDA graph capture).
+    pub fn bind_input(&mut self, dev: &D, s: &D::Stream, obs: &D::Buffer) -> DriverResult<()> {
+        let xptr = obs.device_ptr();
+        if let Some(l0) = self.layers.first_mut() {
+            if l0.params.as_ref().is_some_and(|(p, _)| *p == xptr) { return Ok(()); }
+            let prm = MlpLayerParams { x: xptr, w: l0.w.device_ptr(), b: l0.b.device_ptr(), y: l0.y.device_ptr(), configs: self.configs, n_in: l0.n_in, n_out: l0.n_out, relu: l0.relu };
+            l0.params = Some((xptr, upload_params(dev, s, &prm)?));
+        }
+        Ok(())
+    }
+
+    /// Enqueue the full forward pass using pre-bound input/layer buffers (zero alloc, zero host IO).
+    pub fn launch(&self, dev: &D, s: &D::Stream) -> DriverResult<()> {
+        for l in &self.layers {
+            let Some((_, ref p)) = l.params else {
+                return Err(EnqueueError::InvalidConfig("ResidentMlp: call bind_input before launch".into()).into());
+            };
+            dev.launch(s, self.lib, "ag_mlp_layer", &LaunchConfig::linear(self.configs as u64 * l.n_out as u64, 128), &p.buffer)?;
+        }
+        Ok(())
+    }
+
+    /// Bind (if needed) and launch; returns the device output buffer `[configs × n_out]` f32.
+    pub fn forward_into(&mut self, dev: &D, s: &D::Stream, obs: &D::Buffer) -> DriverResult<&D::Buffer> {
+        self.bind_input(dev, s, obs)?;
+        self.launch(dev, s)?;
+        Ok(self.output())
+    }
+
+    pub fn output(&self) -> &D::Buffer { &self.layers.last().expect("at least one layer").y }
+    pub fn n_in(&self) -> usize { self.n_in }
+    pub fn n_out(&self) -> usize { self.n_out }
+    pub fn configs(&self) -> u32 { self.configs }
+}
+
 /// Device forward over `configs` observations; returns the output buffer.
 pub fn forward_device<D: KernelExt>(dev: &D, s: &D::Stream, lib: LibraryId, mlp: &Mlp, obs: &D::Buffer, configs: u32) -> DriverResult<D::Buffer> {
-    let up = |v: &[f32]| -> DriverResult<D::Buffer> { let b = dev.alloc_bytes(s, v.len().max(1) * 4)?; dev.upload_from_host_async(s, bytemuck::cast_slice(v), &b, 0)?; Ok(b) };
-    let mut x_owned: Option<D::Buffer> = None;
-    for (li, (n_in, n_out, w, b)) in mlp.layers.iter().enumerate() {
-        let (wb, bb) = (up(w)?, up(b)?);
-        let y = dev.alloc_bytes(s, configs as usize * n_out * 4)?;
-        let xptr = x_owned.as_ref().map(|x| x.device_ptr()).unwrap_or(obs.device_ptr());
-        let prm = MlpLayerParams { x: xptr, w: wb.device_ptr(), b: bb.device_ptr(), y: y.device_ptr(), configs, n_in: *n_in as u32, n_out: *n_out as u32, relu: (li + 1 < mlp.layers.len()) as u32 };
-        let p = upload_params(dev, s, &prm)?;
-        dev.launch(s, lib, "ag_mlp_layer", &LaunchConfig::linear(configs as u64 * *n_out as u64, 128), &p.buffer)?;
-        x_owned = Some(y);
-    }
-    Ok(x_owned.expect("at least one layer"))
+    let mut rm = ResidentMlp::load(dev, s, lib, mlp, configs)?;
+    rm.forward_into(dev, s, obs)?;
+    Ok(rm.layers.pop().expect("at least one layer").y)
 }
 
 /// Parameter-delta policy head: output `k` adjusts parameter `params[k]` by `scale[k] * y`,
@@ -182,5 +260,14 @@ mod tests {
         let y = forward_device(&*dev, &s, lib, &mlp, &ob, 2).unwrap();
         let got: Vec<f32> = bytemuck::pod_collect_to_vec(&y.as_slice()[..8]);
         assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), host.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+
+        // ResidentMlp: bind once, then launch repeatedly with zero host transfers
+        let mut rm = ResidentMlp::load(&*dev, &s, lib, &mlp, 2).unwrap();
+        rm.bind_input(&*dev, &s, &ob).unwrap();
+        dev.reset_transfer_stats();
+        rm.launch(&*dev, &s).unwrap();
+        assert_eq!(dev.transfer_stats().total(), 0, "capture-safe launch must do zero host transfers");
+        let got2: Vec<f32> = bytemuck::pod_collect_to_vec(&rm.output().as_slice()[..8]);
+        assert_eq!(got2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), host.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
     }
 }

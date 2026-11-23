@@ -164,7 +164,8 @@ fn stiffness_requirement_is_checked_on_survivors() {
 fn device_only_survivor_is_delivered_as_certified_implicit() {
     use agcad_dops::examples::{box_goal, shelled_box};
     let d = shelled_box(2.0);
-    let im = agcad_server::device::deliver_implicit(&d, &box_goal(), "part.shell (device-only)", false).unwrap();
+    let mut cache = agcad_server::device::DeviceCache::default();
+    let im = agcad_server::device::deliver_implicit(&mut cache, &d, &box_goal(), "part.shell (device-only)", false).unwrap();
     let s = im.summary();
     assert_eq!(s["evidence"], "implicit-certified");
     assert_eq!(s["mesh"]["watertight"], true, "{s}");

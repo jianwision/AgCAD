@@ -69,6 +69,7 @@ pub struct CpuEvent(Instant);
 pub struct CpuDevice {
     caps: Caps,
     libraries: Mutex<Vec<LibrarySource>>,
+    transfers: TransferCounters,
 }
 
 impl CpuDevice {
@@ -91,6 +92,7 @@ impl CpuDevice {
                 total_memory: u64::MAX,
             },
             libraries: Mutex::new(Vec::new()),
+            transfers: TransferCounters::default(),
         })
     }
 }
@@ -159,6 +161,10 @@ impl AgDevice for CpuDevice {
     fn elapsed_ms(&self, a: &CpuEvent, b: &CpuEvent) -> Result<f32, DeviceFault> {
         Ok(b.0.saturating_duration_since(a.0).as_secs_f32() * 1000.0)
     }
+
+    fn transfer_stats(&self) -> TransferStats { self.transfers.snapshot() }
+    fn reset_transfer_stats(&self) { self.transfers.reset(); }
+    fn record_transfer(&self, kind: TransferKind, bytes: usize) { self.transfers.record(kind, bytes); }
 }
 
 impl KernelExt for CpuDevice {

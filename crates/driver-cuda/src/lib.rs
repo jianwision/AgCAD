@@ -25,6 +25,7 @@ pub struct CudaDevice {
     arch: String,
     poisoned: AtomicBool,
     libraries: Mutex<Vec<LoadedLibrary>>,
+    transfers: TransferCounters,
 }
 
 struct LoadedLibrary {
@@ -134,8 +135,13 @@ fn attr(dev: sys::CUdevice, a: sys::CUdevice_attribute) -> i32 {
 
 impl CudaDevice {
     /// Open device `ordinal`; fill [`Caps`] from device attributes (A3-2).
+    /// Returns `Err` cleanly (never panics) if `libcuda` is absent on this machine.
     pub fn open(ordinal: usize) -> DriverResult<Arc<Self>> {
-        let ctx = CudaContext::new(ordinal).map_err(fault::driver)?;
+        let ctx = match std::panic::catch_unwind(|| CudaContext::new(ordinal)) {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => return Err(fault::driver(e)),
+            Err(_) => return Err(DriverError::Enqueue(EnqueueError::Unsupported("CUDA driver library not found"))),
+        };
         ctx.bind_to_thread().map_err(fault::driver)?;
         let name = ctx.name().unwrap_or_else(|_| "CUDA device".into());
         let dev = result::device::get(ordinal as i32).map_err(fault::driver)?;
@@ -164,7 +170,7 @@ impl CudaDevice {
             total_memory: total,
         };
         let arch = format!("sm_{major}{minor}");
-        Ok(Arc::new(CudaDevice { ctx, caps, arch, poisoned: AtomicBool::new(false), libraries: Mutex::new(Vec::new()) }))
+        Ok(Arc::new(CudaDevice { ctx, caps, arch, poisoned: AtomicBool::new(false), libraries: Mutex::new(Vec::new()), transfers: TransferCounters::default() }))
     }
 
     pub fn arch(&self) -> &str { &self.arch }
@@ -331,6 +337,10 @@ impl AgDevice for CudaDevice {
         fault::check(unsafe { sys::cuEventElapsedTime(&mut ms, a.raw, b.raw) }).map_err(|e| fault::fault(e, None))?;
         Ok(ms)
     }
+
+    fn transfer_stats(&self) -> TransferStats { self.transfers.snapshot() }
+    fn reset_transfer_stats(&self) { self.transfers.reset(); }
+    fn record_transfer(&self, kind: TransferKind, bytes: usize) { self.transfers.record(kind, bytes); }
 }
 
 impl KernelExt for CudaDevice {

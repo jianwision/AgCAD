@@ -21,8 +21,8 @@ pub const NVALS: usize = 16;
 pub const OBS: usize = 32;
 /// u64 accumulators per configuration (see `cnt`).
 pub const CS: usize = 20;
-/// Maximum parameters per configuration.
-pub const MAX_PARAMS: usize = 8;
+/// Maximum parameters per configuration (Phase 2: lifted from 8 to 32).
+pub const MAX_PARAMS: usize = 32;
 /// Maximum pattern instances evaluated per feature.
 pub const MAX_PATTERN: u32 = 64;
 
@@ -202,6 +202,10 @@ pub struct Goal {
 pub mod policy {
     pub const MOCK: u32 = 0;
     pub const CMAES: u32 = 1;
+    /// Device-resident neural policy (`ResidentMlp` inside the CUDA Graph WHILE loop).
+    pub const CUMODEL: u32 = 2;
+    /// Hybrid: `ResidentMlp` continuous/structural guidance blended with CMA-ES islands.
+    pub const HYBRID: u32 = 3;
 }
 /// Largest CMA-ES island (population λ).
 pub const MAX_ISLAND: usize = 64;
@@ -376,6 +380,10 @@ pub struct DopsArgs {
     pub pool: u64,
     /// CUgraphConditionalHandle of the enclosing WHILE node (0 = host-driven loop).
     pub cond_handle: u64,
+    /// Packed f32 observation tensor `[configs × OBS]` for `ResidentMlp` (zero host copy).
+    pub obs_f32: u64,
+    /// Device output buffer `[configs × policy_n_out]` written by `ResidentMlp`.
+    pub policy_out: u64,
     pub configs: u32,
     pub nodes: u32,
     pub params: u32,
@@ -399,13 +407,17 @@ pub struct DopsArgs {
     pub cfg_offset: u32,
     /// Interval evaluations per terminal boundary cell for bound tightening (0 = off).
     pub tighten: u32,
-    /// `policy::MOCK` or `policy::CMAES`; `island` = λ (configurations per CMA-ES island).
+    /// `policy::MOCK`, `policy::CMAES`, `policy::CUMODEL`, or `policy::HYBRID`; `island` = λ.
     pub policy: u32,
     pub island: u32,
     /// 1 if the base design has general features (sketch / revolve / mirror / draft / rounded
     /// caps): their tapes are evaluated by a separate CUDA launch; edits introducing them are
     /// rejected otherwise.
     pub general_ok: u32,
+    /// 1 = orientation-aware anisotropic splitting in the global worklist (2/4/8 children).
+    pub aniso: u32,
+    /// Output width per configuration of `policy_out` (`ResidentMlp::n_out`).
+    pub policy_n_out: u32,
     pub ops: OpTable,
 }
 

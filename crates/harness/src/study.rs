@@ -266,6 +266,42 @@ pub fn run(part: &PartState, registry: &Registry, kernel: &dyn ExactKernel, req:
     }))
 }
 
+/// Batched device mass properties `(volume, area, centroid)` for every configuration's mesh
+/// in a single GPU pass via `ag_mesh_terms` + deterministic segmented reductions (CUDA ≡ CPU).
+pub fn evaluate_mass_device<D: agcad_driver::KernelExt>(
+    dev: &D,
+    s: &D::Stream,
+    meshes: &[agcad_geo::tessellate::Mesh],
+) -> agcad_driver::DriverResult<Vec<(f64, f64, [f64; 3])>> {
+    use agcad_driver::*;
+    if meshes.is_empty() { return Ok(Vec::new()); }
+    let lib = dev.load_library(&agcad_kernels_cuda::primitives_library())?;
+    let mut positions: Vec<f64> = Vec::new();
+    let mut tris: Vec<u32> = Vec::new();
+    let mut offsets: Vec<u32> = Vec::with_capacity(meshes.len() + 1);
+    offsets.push(0);
+    for m in meshes {
+        let base = (positions.len() / 3) as u32;
+        for p in &m.positions { positions.extend([p.x, p.y, p.z]); }
+        for t in &m.triangles { tris.extend([base + t[0], base + t[1], base + t[2]]); }
+        offsets.push((tris.len() / 3) as u32);
+    }
+    let n_tris = *offsets.last().unwrap();
+    let pb = dev.alloc_bytes(s, (positions.len() * 8).max(16))?;
+    let tb = dev.alloc_bytes(s, (tris.len() * 4).max(16))?;
+    let ob = dev.alloc_bytes(s, offsets.len() * 4)?;
+    if !positions.is_empty() { dev.upload_from_host_async(s, bytemuck::cast_slice(&positions), &pb, 0)?; }
+    if !tris.is_empty() { dev.upload_from_host_async(s, bytemuck::cast_slice(&tris), &tb, 0)?; }
+    dev.upload_from_host_async(s, bytemuck::cast_slice(&offsets), &ob, 0)?;
+    let sums_buf = agcad_kernels::primitives::mesh_mass_sums(dev, s, lib, &pb, &tb, n_tris, &ob, meshes.len() as u32)?;
+    let bytes = meshes.len() * agcad_kernels::primitives::MESH_TERMS * 8;
+    let mut pin = dev.pinned(bytes.max(1))?;
+    dev.download_packed_async(s, &[Region { buf: &sums_buf, offset: 0, bytes }], &mut pin)?;
+    dev.sync(s)?;
+    let sums: Vec<f64> = bytemuck::pod_collect_to_vec(&pin.as_bytes()[..bytes]);
+    Ok((0..meshes.len()).map(|i| agcad_kernels::primitives::mass_properties_from_sums(&sums, meshes.len(), i)).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +312,22 @@ mod tests {
         let ev: Vec<Evaluated> = [3.0, 1.0, 1.0, f64::NAN, 2.0].iter().enumerate().map(|(i, &s)| Evaluated { configuration: i, score: s, checks: vec![], feasible: !s.is_nan() }).collect();
         assert_eq!(rank(&ev, 3), vec![1, 2, 4]);
         assert!((kendall_tau(&[1.0, 2.0, 3.0], &[10.0, 20.0, 30.0]) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn batched_device_mass_matches_host_meshes() {
+        use agcad_driver::*;
+        let meshes: Vec<_> = [10.0, 20.0, 30.0].into_iter().map(|w| {
+            let b = agcad_geo::layered::LayeredSolid::extrusion(agcad_geo::math::Frame::WORLD, &agcad_geo::builders::Profile::rectangle(0.0, 0.0, w, 12.0), 0.0, 8.0).to_brep();
+            agcad_geo::tessellate::tessellate(&b, &Default::default())
+        }).collect();
+        let dev = agcad_driver_cpu::CpuDevice::new();
+        let s = dev.stream(Priority::Normal).unwrap();
+        let got = evaluate_mass_device(&*dev, &s, &meshes).unwrap();
+        for (m, &(v, a, c)) in meshes.iter().zip(&got) {
+            let (hv, ha, hc) = m.mass_properties();
+            assert!((v - hv).abs() < 1e-9 && (a - ha).abs() < 1e-9);
+            assert!((c[0] - hc.x).abs() < 1e-9 && (c[1] - hc.y).abs() < 1e-9 && (c[2] - hc.z).abs() < 1e-9);
+        }
     }
 }
